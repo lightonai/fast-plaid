@@ -1,0 +1,33 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-toml
+      - id: check-yaml
+
+  - repo: https://github.com/charliermarsh/ruff-pre-commit
+    rev: v0.11.7
+    hooks:
+      - id: ruff
+        pass_filenames: false
+        args:
+          - --fix
+          - python
+      - id: ruff-format
+        pass_filenames: false
+        args:
+          - python
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: f40886d
+    hooks:
+      - id: mypy
+        exclude: ^scripts
+        additional_dependencies: [types-PyYAML, types-requests]
+  
+  - repo: https://github.com/pappasam/toml-sort
+    rev: v0.24.2
+    hooks:
+      - id: toml-sort-fix

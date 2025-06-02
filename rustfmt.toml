@@ -1,0 +1,7 @@
+edition = "2021"
+max_width = 100
+hard_tabs = false
+tab_spaces = 4
+match_block_trailing_comma = true
+match_arm_leading_pipes = "Preserve"
+newline_style = "Unix"

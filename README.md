@@ -13,7 +13,7 @@
 &nbsp;
 
 <div align="center">
-    <b>FastPlaid</b> is a high-performance engine for multi-vector search based on [Santhanam, Keshav, et al.](https://arxiv.org/abs/2205.09707).
+    <b>FastPlaid</b> is a high-performance search engine for multi-vector.
 </div>
 
 &nbsp;
@@ -96,6 +96,8 @@ print(scores)
 
 
 ## Citation
+
+FastPlaid is based on the original PLAID: [Santhanam, Keshav, et al.](https://arxiv.org/abs/2205.09707).
 
 You can cite **FastPlaid** in your work as follows:
 

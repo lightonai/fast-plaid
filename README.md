@@ -33,12 +33,6 @@ Traditional vector search relies on single, fixed-size embeddings (dense vectors
 
 ```bash
 pip install fast-plaid
----
-
-## 💻 Installation
-
-```bash
-pip install fast-plaid
 ```
 
 ---

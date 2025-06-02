@@ -1,7 +1,7 @@
 import os
 import subprocess
 
-VISIBLE_DEVICES = [3, 4, 5, 6, 7]
+VISIBLE_DEVICES = [7]
 
 datasets = [
     "nfcorpus",

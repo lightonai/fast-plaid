@@ -71,7 +71,7 @@ queries_embeddings = torch.Tensor(np.array(queries_embeddings))
 documents_embeddings = [torch.tensor(doc_emb) for doc_emb in documents_embeddings]
 queries_embeddings = torch.cat(tensors=[queries_embeddings], dim=0)
 
-index = search.FastPlaid(index=dataset_name)
+index = search.FastPlaid(index=os.path.join("benchmark", dataset_name), device="cuda")
 print(f"🏗️  Building index for {dataset_name}...")
 start_index = time.time()
 index.create(documents_embeddings=documents_embeddings, kmeans_niters=4)
@@ -81,7 +81,7 @@ print(f"\t✅ {dataset_name} indexing: {indexing_time:.2f} seconds")
 
 print(f"🔍 Searching on {dataset_name}...")
 start_search = time.time()
-scores = index.search(queries_embeddings=queries_embeddings, k=100)
+scores = index.search(queries_embeddings=queries_embeddings, top_k=100)
 end_search = time.time()
 search_time = end_search - start_search
 queries_per_second = num_queries / search_time if search_time > 0 else 0
@@ -90,7 +90,7 @@ print(
 )
 
 queries_embeddings = torch.cat(
-    ([queries_embeddings] * ((1000 // queries_embeddings.shape[0]) + 1))[:3000]
+    ([queries_embeddings] * ((5000 // queries_embeddings.shape[0]) + 1))[:5000]
 )
 
 print(f"🔍 50_000 queries on {dataset_name}...")

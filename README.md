@@ -5,9 +5,9 @@
 <p align="center"><img width=500 src="https://github.com/lightonai/fast-plaid/blob/6184631dd9b9609efac8ce43e3e15be2efbb5355/docs/logo.png"/></p>
 
 <div align="center">
-    <a href="https://github.com/lightonai/fast-plaid/tree/main"><img src="https://img.shields.io/badge/rust-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white" alt="rust"></a>
-    <a href="https://github.com/lightonai/fast-plaid/tree/main"><img src="https://img.shields.io/badge/PyO₃-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white" alt="PyO₃"></a>
-    <a href="https.github.com/lightonai/fast-plaid/tree/main"><img src="https://img.shields.io/badge/tch--rs-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white" alt="tch-rs"></a>
+    <a href="https://github.com/rust-lang/rust"><img src="https://img.shields.io/badge/rust-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white" alt="rust"></a>
+    <a href="https://github.com/pyo3"><img src="https://img.shields.io/badge/PyO₃-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white" alt="PyO₃"></a>
+    <a href="https://github.com/LaurentMazare/tch-rs"><img src="https://img.shields.io/badge/tch--rs-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white" alt="tch-rs"></a>
 </div>
 
 &nbsp;
@@ -22,7 +22,7 @@
 
 Traditional vector search relies on single, fixed-size embeddings (dense vectors) for documents and queries. While powerful, this approach can lose nuanced, token-level details.
 
-**Multi-vector search**, used in models like ColBERT or ColPali, replaces a single document or image vector with a set of per-token vectors. This enables a "late interaction" mechanism, where fine-grained similarity is calculated term-by-term to boost retrieval accuracy.
+* **Multi-vector search**, used in models like ColBERT or ColPali, replaces a single document or image vector with a set of per-token vectors. This enables a "late interaction" mechanism, where fine-grained similarity is calculated term-by-term to boost retrieval accuracy.
 
 * **Higher Accuracy:** By matching on a finer, token-level granularity, FastPlaid can capture relevance that single-vector models miss.
 * **Performance:** Written in Rust, it offers blazing-fast indexing and search speeds.
@@ -43,20 +43,19 @@ Get started with creating an index and performing a search in just a few lines o
 
 ```python
 import torch
+
 from fast_plaid import search
 
 fast_plaid = search.FastPlaid(index="fast_plaid_index")
 
 embedding_dim = 128
 
-docs_embeddings = [torch.randn(50, embedding_dim) for _ in range(100)]
-
-fast_plaid.create(documents_embeddings=docs_embeddings)
-
-queries_embeddings = torch.randn(2, 50, embedding_dim, dtype=torch.float16)
+fast_plaid.create(
+    documents_embeddings=[torch.randn(50, embedding_dim) for _ in range(100)]
+)
 
 scores = fast_plaid.search(
-    queries_embeddings=queries_embeddings,
+    queries_embeddings=torch.randn(2, 50, embedding_dim, dtype=torch.float16),
     top_k=10,
 )
 

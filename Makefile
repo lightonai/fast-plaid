@@ -5,4 +5,4 @@ install:
 	uv run pip install -e ".[dev]"
 
 test:
-	uv run benchmark.py
+	uv run benchmark/benchmark.py

@@ -1,18 +1,16 @@
 <div align="center">
-<h1>FastPlaid\</h1>
+  <h1>FastPlaid</h1>
 </div>
 
-<p align="center">
-<img src="[https://img.shields.io/pypi/v/fast-plaid?style=for-the-badge](https://img.shields.io/pypi/v/fast-plaid?style=for-the-badge)" alt="PyPI version">
-<img src="[https://img.shields.io/pypi/pyversions/fast-plaid?style=for-the-badge](https://img.shields.io/pypi/pyversions/fast-plaid?style=for-the-badge)" alt="Python versions">
-<img src="[https://img.shields.io/badge/Made%20with-Rust-orange?style=for-the-badge\&logo=rust](https://img.shields.io/badge/Made%20with-Rust-orange?style=for-the-badge&logo=rust)" alt="Made with Rust">
-</p>
+<p align="center"><img width=500 src="https://raw.githubusercontent.com/lightonai/fast-plaid/refs/heads/main/docs/logo.png"/></p>
+
+<div align="center">
+  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square" alt="license"></a>
+</div>
 
 A high-performance document retrieval toolkit using a ColBERT-style late interaction model, implemented in Rust with Python bindings.
 
------
-
-## ⚙️ Installation
+# ⚙️ Installation
 
 Install the package directly from PyPI:
 
@@ -20,9 +18,7 @@ Install the package directly from PyPI:
 pip install fast-plaid
 ```
 
------
-
-## 🚀 Quick Start
+# 🚀 Quick Start
 
 Here's how to get started with creating an index and performing a search in just a few lines of Python.
 

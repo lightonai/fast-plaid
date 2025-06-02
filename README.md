@@ -22,6 +22,8 @@ Install the package directly from PyPI:
 pip install fast-plaid
 ```
 
+---
+
 ## ⚡️ Quick Start
 
 Here's how to get started with creating an index and performing a search in just a few lines of Python.

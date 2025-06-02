@@ -16,8 +16,6 @@ A high-performance document retrieval toolkit using a ColBERT-style late interac
 
 ## 💻 Installation
 
-Install the package directly from PyPI:
-
 ```bash
 pip install fast-plaid
 ```

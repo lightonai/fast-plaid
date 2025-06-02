@@ -143,4 +143,17 @@ target/
 tmp/
 *.lock
 evaluation_datasets/
+
+# BEIR Datasets
+nfcorpus/
 scifact/
+arguana/
+scidocs/
+fiqa/
+trec-covid/
+webis-touche2020/
+quora/
+nq/
+dbpedia-entity/
+hotpotqa/
+msmarco/

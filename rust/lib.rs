@@ -13,6 +13,12 @@ use tch::{Device, Kind};
 // Standard library imports.
 use std::ffi::CString;
 
+// Conditional imports for cross-platform dynamic library loading.
+#[cfg(windows)]
+use winapi::um::errhandlingapi::GetLastError;
+#[cfg(windows)]
+use winapi::um::libloaderapi::LoadLibraryA;
+
 // Internal module imports.
 use crate::index::create::create_index;
 use search::load::load_index;
@@ -26,18 +32,46 @@ fn anyhow_to_pyerr(err: anyhow::Error) -> PyErr {
     PyValueError::new_err(err.to_string())
 }
 
-/// Dynamically loads the native Torch shared library (e.g., `libtorch.so`).
+/// Dynamically loads the native Torch shared library (e.g., `libtorch.so` or `torch.dll`).
 ///
 /// This is a workaround to ensure Torch's symbols are available in memory,
 /// which can prevent linking errors when `tch-rs` is used within a
 /// Python extension module.
 fn call_torch(torch_path: String) -> Result<(), anyhow::Error> {
-    let torch_path_cstr = CString::new(torch_path)
+    let torch_path_cstr = CString::new(torch_path.clone())
         .map_err(|e| anyhow!("Failed to create CString for libtorch path: {}", e))?;
 
-    // The library handle is intentionally ignored. We only need to load it
-    // into the process memory space.
-    let _lib_handle = unsafe { libc::dlopen(torch_path_cstr.as_ptr(), libc::RTLD_LAZY) };
+    #[cfg(unix)]
+    {
+        let handle = unsafe { libc::dlopen(torch_path_cstr.as_ptr(), libc::RTLD_LAZY) };
+        if handle.is_null() {
+            return Err(anyhow!(
+                "Failed to load Torch library '{}' via dlopen. Check the path and permissions.",
+                torch_path
+            ));
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let handle = unsafe { LoadLibraryA(torch_path_cstr.as_ptr()) };
+        if handle.is_null() {
+            let error_code = unsafe { GetLastError() };
+            return Err(anyhow!(
+                "Failed to load Torch library '{}' via LoadLibraryA. Windows error code: {}",
+                torch_path,
+                error_code
+            ));
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        return Err(anyhow!(
+            "Dynamic library loading is not supported on this operating system."
+        ));
+    }
+
     Ok(())
 }
 

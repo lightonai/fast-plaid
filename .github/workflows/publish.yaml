@@ -1,0 +1,79 @@
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build_wheels:
+    name: Build wheels for Python ${{ matrix.python-version }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Prepare Python Version for CIBW_BUILD
+        id: prepare_python_version
+        shell: bash
+        run: |
+          PYTHON_VERSION_NO_DOT=$(echo "${{ matrix.python-version }}" | tr -d '.')
+          echo "PYTHON_VERSION_NO_DOT=$PYTHON_VERSION_NO_DOT" >> $GITHUB_OUTPUT
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.23.3
+        env:
+          CIBW_BUILD: "cp${{ steps.prepare_python_version.outputs.PYTHON_VERSION_NO_DOT }}-*"
+          CIBW_SKIP: "*-manylinux_i686 *-musllinux_* *-win32"
+          CIBW_BUILD_VERBOSITY: 1
+          LIBTORCH_BYPASS_VERSION_CHECK: 1
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_MANYLINUX_ARM64_IMAGE: manylinux_2_28
+          CIBW_ENVIRONMENT: |
+            PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cpu/torch_stable.html"
+          CIBW_PIP_ARGS: --no-cache-dir
+          CIBW_BEFORE_BUILD: "pip install torch==2.7.0 numpy maturin delvewheel"
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
+            LD_LIBRARY_PATH=$(python -c 'import torch, os; print(os.path.join(os.path.dirname(torch.__file__), "lib"))'):$LD_LIBRARY_PATH auditwheel repair -w {dest_dir} {wheel} --exclude libtorch.so --exclude libtorch_cpu.so --exclude libtorch_python.so
+          CIBW_REPAIR_WHEEL_COMMAND_MACOS: >
+            DYLD_LIBRARY_PATH=$(python -c 'import torch, os; print(os.path.join(os.path.dirname(torch.__file__), "lib"))') delocate-wheel -w {dest_dir} -v {wheel} --exclude libtorch.dylib --exclude libtorch_cpu.dylib --exclude libtorch_python.dylib
+          CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: >-
+            FOR /F "usebackq tokens=*" %i IN (`python -c "import torch, os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))"`) DO (set "PATH=%i;%PATH%" && delvewheel repair -w {dest_dir} {wheel} --no-dll torch.dll --no-dll torch_cpu.dll --no-dll torch_python.dll)
+
+      - name: Upload wheels to artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: ./wheelhouse/*.whl
+
+  publish:
+    name: Publish to PyPI
+    needs: build_wheels
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*-py*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@v1.12.4
+        with:
+          user: __token__
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          skip-existing: true

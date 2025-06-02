@@ -1,29 +1,42 @@
 [build-system]
-requires = ["torch >= 2.6.0", "maturin >= 1.5.1"]
+requires = [
+  "maturin >= 1.8.6",
+  "numpy >= 1.26.4",
+  "setuptools >= 78.1.1",
+  "torch >= 2.7.0"
+]
 build-backend = "maturin"
 
 [project]
 name = "fast_plaid"
 version = "1.0.0"
 description = "Fast Plaid."
-authors = [{name = "Raphael Sourty", email = "raphael.sourty@lighton.ai"}]
+authors = [
+  {name = "Raphael Sourty, LightOn", email = "raphael.sourty@lighton.ai"}
+]
 keywords = []
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Rust",
   "Operating System :: OS Independent"
 ]
-requires-python = ">=3.10"
-dependencies = ["fastkmeans >= 0.5.0", "joblib>=1.5.1", "torch >= 2.6.0"]
+requires-python = ">=3.9"
+dependencies = [
+  "fastkmeans >= 0.5.0",
+  "joblib>=1.5.1",
+  "torch >= 2.7.0",
+  "maturin >= 1.8.6",
+  "numpy >= 1.26.4",
+  "setuptools >= 78.1.1"
+]
 
 [project.optional-dependencies]
 dev = [
-  "maturin >= 1.5.1",
+  "maturin >= 1.8.6",
   "pytest-cov >= 5.0.0",
   "pytest >= 7.4.4",
   "ruff >= 0.1.15",
   "pre-commit >= 3.0.0",
-  "numpy >= 1.26.4",
   "pylate >= 1.2.0",
   "beir>=2.1.0",
   "ranx>=0.3.20"

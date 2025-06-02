@@ -24,6 +24,10 @@ pyo3-tch = "0.20.0"
 rand = "0.9.1"
 regex = "1.11.1"
 
+# Windows-specific dependencies
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3.9", features = ["libloaderapi", "errhandlingapi"] }
+
 [profile.dev]
 opt-level = 0
 

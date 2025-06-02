@@ -13,7 +13,7 @@
 &nbsp;
 
 <div align="center">
-    <b>FastPlaid</b> is a high-performance search engine for multi-vector.
+    <b>FastPlaid</b> is a high-performance engine for multi-vector.
 </div>
 
 &nbsp;
@@ -48,7 +48,7 @@ import torch
 
 from fast_plaid import search
 
-fast_plaid = search.FastPlaid(index="fast_plaid_index")
+fast_plaid = search.FastPlaid(index="index")
 
 embedding_dim = 128
 

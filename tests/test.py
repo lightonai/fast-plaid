@@ -9,26 +9,25 @@ def test():
     """Ensure that the Fast-PLAiD search index can be created and queried correctly."""
     index_name = "test_index"
 
-    # Clean up previous index directory
     if os.path.exists(index_name):
         shutil.rmtree(index_name)
     os.makedirs(index_name, exist_ok=True)
 
-    # Initialise the search index
     index = search.FastPlaid(
         index=index_name,
+        device="cpu",
     )
 
-    documents_embeddings = [torch.randn(300, 128) for _ in range(100)]
+    documents_embeddings = [torch.randn(300, 128, device="cpu") for _ in range(100)]
 
-    queries_embeddings = torch.randn(10, 30, 128)
+    queries_embeddings = torch.randn(10, 30, 128, device="cpu")
 
     index.create(
         documents_embeddings=documents_embeddings,
         kmeans_niters=4,
     )
 
-    results = index.search(queries_embeddings=queries_embeddings, k=10)
+    results = index.search(queries_embeddings=queries_embeddings, top_k=10)
 
     assert len(results) == 10, (
         f"Expected 10 sets of query results, but got {len(results)}"

@@ -267,7 +267,7 @@ pub fn colbert_score_reduce(token_scores: &Tensor, attention_mask: &Tensor) -> T
 /// * `batch_size` - The batch size used for processing documents during scoring.
 /// * `n_docs_for_full_score` - The number of top documents from the approximate scoring phase to re-rank with full scoring.
 /// * `nbits_param` - The number of bits used in the quantization codec.
-/// * `top_k_results` - The final number of top results to return.
+/// * `top_k` - The final number of top results to return.
 /// * `device` - The `tch::Device` (e.g., `Device::Cuda(0)`) on which to perform computations.
 ///
 /// # Returns
@@ -288,7 +288,7 @@ pub fn search(
     batch_size: i64,
     n_docs_for_full_score: i64,
     nbits_param: i64,
-    top_k_results: usize,
+    top_k: usize,
     device: Device,
 ) -> anyhow::Result<(Vec<i64>, Vec<f32>)> {
     let (pids, scores) = tch::no_grad(|| {
@@ -426,7 +426,7 @@ pub fn search(
         let pids_vec: Vec<i64> = sorted_pids.try_into()?;
         let scores_vec: Vec<f32> = sorted_scores.try_into()?;
 
-        let result_count = top_k_results.min(pids_vec.len());
+        let result_count = top_k.min(pids_vec.len());
         Ok((
             pids_vec[..result_count].to_vec(),
             scores_vec[..result_count].to_vec(),

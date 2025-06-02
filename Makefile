@@ -1,5 +1,5 @@
 lint:
-	uv run pre-commit run --files python/**/**.py pyproject.toml Makefile
+	uv run --extra dev pre-commit run --files python/**/**.py pyproject.toml Makefile
 
 install:
 	uv run pip install -e ".[dev]"

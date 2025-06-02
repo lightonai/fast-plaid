@@ -18,18 +18,28 @@ def _load_torch_path(device: str) -> str:
     """Find the path to the shared library for PyTorch with CUDA."""
     search_paths = [
         os.path.join(os.path.dirname(torch.__file__), "lib", f"libtorch_{device}.so"),
+        os.path.join(os.path.dirname(torch.__file__), "**", f"libtorch_{device}.so"),
         os.path.join(os.path.dirname(torch.__file__), "lib", "libtorch_cuda.so"),
         os.path.join(os.path.dirname(torch.__file__), "**", "libtorch_cuda.dylib"),
         os.path.join(os.path.dirname(torch.__file__), "lib", "libtorch_cpu.so"),
+        os.path.join(os.path.dirname(torch.__file__), "**", "libtorch.so"),
+        os.path.join(os.path.dirname(torch.__file__), "**", "libtorch.dylib"),
+        os.path.join(os.path.dirname(torch.__file__), "lib", f"torch_{device}.dll"),
+        os.path.join(os.path.dirname(torch.__file__), "lib", "torch.dll"),
+        os.path.join(os.path.dirname(torch.__file__), "lib", f"c10_{device}.dll"),
+        os.path.join(os.path.dirname(torch.__file__), "lib", "c10.dll"),
+        os.path.join(os.path.dirname(torch.__file__), "**", f"torch_{device}.dll"),
+        os.path.join(os.path.dirname(torch.__file__), "**", "torch.dll"),
     ]
+
     for path_pattern in search_paths:
         found_libs = glob.glob(path_pattern, recursive=True)
         if found_libs:
             return found_libs[0]
 
     error = """
-    Could not find libtorch_cuda.so or libtorch_cuda.dylib.
-    Please ensure PyTorch with CUDA support is correctly installed.
+    Could not find torch binary.
+    Please ensure PyTorch is installed.
     """
     raise TorchWithCudaNotFoundError(error) from IndexError
 
@@ -80,7 +90,7 @@ def compute_kmeans(
         d=dim,
         k=num_partitions,
         niter=kmeans_niters,
-        gpu=True,
+        gpu=device != "cpu",
         verbose=False,
         seed=42,
         max_points_per_centroid=max_points_per_centroid,

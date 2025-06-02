@@ -8,8 +8,7 @@
 <div align="center">
   <a href="https://github.com/lightonai/fast-plaid/tree/main"><img src="https://img.shields.io/badge/rust-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white" alt="rust"></a>
   <a href="https://github.com/lightonai/fast-plaid/tree/main"><img src="https://img.shields.io/badge/PyO₃-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white" alt="PyO₃"></a>
-  <a href="https://github.com/lightonai/fast-plaid/tree/main"><img src="https://img.shields.io/badge/tch-rs-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white" alt="tch-rs"></a>
-  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square" alt="license"></a>
+  <a href="https://github.com/lightonai/fast-plaid/tree/main"><img src="https://img.shields.io/badge/tch\-rs-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white" alt="tch-rs"></a>
 </div>
 
 &nbsp;

@@ -22,10 +22,12 @@
 
 Traditional vector search relies on single, fixed-size embeddings (dense vectors) for documents and queries. While powerful, this approach can lose nuanced, token-level details.
 
-* **Multi-vector search**, used in models like ColBERT or ColPali, replaces a single document or image vector with a set of per-token vectors. This enables a "late interaction" mechanism, where fine-grained similarity is calculated term-by-term to boost retrieval accuracy.
+* **Multi-vector search**, used in models like [ColBERT](https://github.com/lightonai/pylate) or [ColPali](https://github.com/illuin-tech/colpali), replaces a single document or image vector with a set of per-token vectors. This enables a "late interaction" mechanism, where fine-grained similarity is calculated term-by-term to boost retrieval accuracy.
 
 * **Higher Accuracy:** By matching on a finer, token-level granularity, FastPlaid can capture relevance that single-vector models miss.
 * **Performance:** Written in Rust, it offers blazing-fast indexing and search speeds.
+
+* **PLAID**: PLAID stands for "Per-Token Late Interaction Dense Search" designed by [Santhanam, Keshav, et al.](https://arxiv.org/abs/2205.09707)
 
 &nbsp;
 
@@ -90,4 +92,26 @@ print(scores)
         (9, 1280.863037109375),
     ],
 ]
+```
+
+
+## Citation
+
+You can cite FastPlaid in your work as follows:
+
+```bibtex
+@misc{fastplaid2025,
+  author = {Sourty, Raphaël},
+  title = {FastPlaid: A High-Performance Engine for Multi-Vector Search},
+  year = {2025},
+  url = {https://github.com/lightonai/fast-plaid}
+}
+
+@inproceedings{santhanam2022plaid,
+  title={{PLAID}: an efficient engine for late interaction retrieval},
+  author={Santhanam, Keshav and Khattab, Omar and Potts, Christopher and Zaharia, Matei},
+  booktitle={Proceedings of the 31st ACM International Conference on Information \& Knowledge Management},
+  pages={1747--1756},
+  year={2022}
+}
 ```

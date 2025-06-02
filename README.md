@@ -2,7 +2,7 @@
   <h1>FastPlaid</h1>
 </div>
 
-<p align="center"><img width=500 src="https://raw.githubusercontent.com/lightonai/fast-plaid/refs/heads/main/docs/logo.png"/></p>
+<p align="center"><img width=500 src="https://github.com/lightonai/fast-plaid/blob/6184631dd9b9609efac8ce43e3e15be2efbb5355/docs/logo.png"/></p>
 
 <div align="center">
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square" alt="license"></a>

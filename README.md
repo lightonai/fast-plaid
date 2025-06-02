@@ -13,7 +13,7 @@
 &nbsp;
 
 <div align="center">
-**FastPlaid** is a high-performance engine for multi-vector search.
+    <b>FastPlaid</b> is a high-performance engine for multi-vector search.
 </div>
 
 ---

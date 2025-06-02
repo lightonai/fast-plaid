@@ -18,13 +18,11 @@
 
 ---
 
-## What is FastPlaid?
+## ⚡️ Overview
 
 Traditional vector search relies on single, fixed-size embeddings (dense vectors) for documents and queries. While powerful, this approach can lose nuanced, token-level details.
 
 **Multi-vector search**, used in models like ColBERT or ColPali, replaces a single document or image vector with a set of per-token vectors. This enables a "late interaction" mechanism, where fine-grained similarity is calculated term-by-term to boost retrieval accuracy.
-
-### Why is it Useful?
 
 * **Higher Accuracy:** By matching on a finer, token-level granularity, FastPlaid can capture relevance that single-vector models miss.
 * **Performance:** Written in Rust, it offers blazing-fast indexing and search speeds.

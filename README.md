@@ -16,7 +16,7 @@
     <b>FastPlaid</b> is a high-performance engine for multi-vector search.
 </div>
 
----
+&nbsp;
 
 ## ⚡️ Overview
 
@@ -27,7 +27,7 @@ Traditional vector search relies on single, fixed-size embeddings (dense vectors
 * **Higher Accuracy:** By matching on a finer, token-level granularity, FastPlaid can capture relevance that single-vector models miss.
 * **Performance:** Written in Rust, it offers blazing-fast indexing and search speeds.
 
----
+&nbsp;
 
 ## 💻 Installation
 
@@ -35,7 +35,7 @@ Traditional vector search relies on single, fixed-size embeddings (dense vectors
 pip install fast-plaid
 ```
 
----
+&nbsp;
 
 ## ⚡️ Quick Start
 

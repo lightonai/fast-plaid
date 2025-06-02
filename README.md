@@ -10,7 +10,7 @@
 
 A high-performance document retrieval toolkit using a ColBERT-style late interaction model, implemented in Rust with Python bindings.
 
-# ⚙️ Installation
+## ⚙️ Installation
 
 Install the package directly from PyPI:
 
@@ -18,7 +18,7 @@ Install the package directly from PyPI:
 pip install fast-plaid
 ```
 
-# 🚀 Quick Start
+## 🚀 Quick Start
 
 Here's how to get started with creating an index and performing a search in just a few lines of Python.
 

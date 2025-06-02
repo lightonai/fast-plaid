@@ -52,12 +52,14 @@ fast_plaid = search.FastPlaid(index="fast_plaid_index")
 
 embedding_dim = 128
 
+# Index 100 documents, each with 300 tokens, each token is a 128-dim vector
 fast_plaid.create(
-    documents_embeddings=[torch.randn(50, embedding_dim) for _ in range(100)]
+    documents_embeddings=[torch.randn(300, embedding_dim) for _ in range(100)] 
 )
 
+# Search for 2 queries, each with 50 tokens, each token is a 128-dim vector
 scores = fast_plaid.search(
-    queries_embeddings=torch.randn(2, 50, embedding_dim, dtype=torch.float16),
+    queries_embeddings=torch.randn(2, 50, embedding_dim),
     top_k=10,
 )
 

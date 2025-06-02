@@ -27,7 +27,7 @@ Traditional vector search relies on single, fixed-size embeddings (dense vectors
 * **Higher Accuracy:** By matching on a finer, token-level granularity, FastPlaid can capture relevance that single-vector models miss.
 * **Performance:** Written in Rust, it offers blazing-fast indexing and search speeds.
 
-* **PLAID**: PLAID stands for "Per-Token Late Interaction Dense Search" designed by [Santhanam, Keshav, et al.](https://arxiv.org/abs/2205.09707)
+* **PLAID:** stands for "Per-Token Late Interaction Dense Search" [Santhanam, Keshav, et al.](https://arxiv.org/abs/2205.09707)
 
 &nbsp;
 
@@ -97,7 +97,7 @@ print(scores)
 
 ## Citation
 
-You can cite FastPlaid in your work as follows:
+You can cite **FastPlaid** in your work as follows:
 
 ```bibtex
 @misc{fastplaid2025,

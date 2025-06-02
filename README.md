@@ -4,7 +4,6 @@
 
 <p align="center"><img width=500 src="https://github.com/lightonai/fast-plaid/blob/6184631dd9b9609efac8ce43e3e15be2efbb5355/docs/logo.png"/></p>
 
-
 <div align="center">
     <a href="https://github.com/lightonai/fast-plaid/tree/main"><img src="https://img.shields.io/badge/rust-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white" alt="rust"></a>
     <a href="https://github.com/lightonai/fast-plaid/tree/main"><img src="https://img.shields.io/badge/PyO₃-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white" alt="PyO₃"></a>
@@ -13,8 +12,27 @@
 
 &nbsp;
 
-A high-performance document retrieval toolkit using a ColBERT-style late interaction model, implemented in Rust with Python bindings.
+**FastPlaid is a high-performance engine for multi-vector search.
 
+---
+
+## What is FastPlaid?
+
+Traditional vector search relies on single, fixed-size embeddings (dense vectors) for documents and queries. While powerful, this approach can lose nuanced, token-level details.
+
+**Multi-vector search**, used in models like ColBERT or ColPali, replaces a single document or image vector with a set of per-token vectors. This enables a "late interaction" mechanism, where fine-grained similarity is calculated term-by-term to boost retrieval accuracy.
+
+### Why is it Useful?
+
+* **Higher Accuracy:** By matching on a finer, token-level granularity, FastPlaid can capture relevance that single-vector models miss.
+* **Performance:** Written in Rust, it offers blazing-fast indexing and search speeds.
+
+---
+
+## 💻 Installation
+
+```bash
+pip install fast-plaid
 ---
 
 ## 💻 Installation
@@ -27,7 +45,7 @@ pip install fast-plaid
 
 ## ⚡️ Quick Start
 
-Here's how to get started with creating an index and performing a search in just a few lines of Python.
+Get started with creating an index and performing a search in just a few lines of Python.
 
 ```python
 import torch

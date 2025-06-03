@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from collections import defaultdict
 
 
@@ -142,7 +144,7 @@ def evaluate(
             match["id"]: match["score"]
             for rank, match in enumerate(iterable=query_matchs)
         }
-        for query, query_matchs in zip(queries, scores, strict=False)
+        for query, query_matchs in zip(queries, scores)
     }
 
     run = Run(run=run_dict)

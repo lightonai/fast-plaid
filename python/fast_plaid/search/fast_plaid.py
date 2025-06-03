@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import glob
 import math
 import os
@@ -165,7 +167,7 @@ def search_on_device(  # noqa: PLR0913
     return [
         [
             (passage_id, score)
-            for score, passage_id in zip(score.scores, score.passage_ids, strict=False)
+            for score, passage_id in zip(score.scores, score.passage_ids)
         ]
         for score in scores
     ]
@@ -336,7 +338,7 @@ class FastPlaid:
                     show_progress=step == 0 and show_progress,
                 )
                 for step, (device, dev_queries) in enumerate(
-                    zip(self.devices, queries_embeddings_splits, strict=False)
+                    zip(self.devices, queries_embeddings_splits)
                 )
             ]
 
@@ -380,7 +382,7 @@ class FastPlaid:
                 step == 0 and show_progress,
             )
             for step, (device, dev_queries) in enumerate(
-                zip(self.devices, queries_embeddings, strict=False)
+                zip(self.devices, queries_embeddings)
             )
         ]
 

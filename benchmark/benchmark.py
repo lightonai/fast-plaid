@@ -176,7 +176,7 @@ end = time.time()
 heavy_search_time = end - start
 queries_per_second = large_queries_embeddings.shape[0] / heavy_search_time
 
-for (query_id, query), query_scores in zip(queries.items(), scores, strict=False):
+for (query_id, query), query_scores in zip(queries.items(), scores):
     for score in query_scores:
         if score["id"] == query_id:
             # Remove the query_id from the score

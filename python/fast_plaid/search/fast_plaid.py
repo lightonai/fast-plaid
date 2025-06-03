@@ -226,6 +226,7 @@ class FastPlaid:
         documents_embeddings: list[torch.Tensor],
         kmeans_niters: int = 4,
         max_points_per_centroid: int = 256,
+        nbits: int = 4,
     ) -> "FastPlaid":
         """Create and saves the FastPlaid index.
 
@@ -237,6 +238,8 @@ class FastPlaid:
             Number of iterations for the K-means algorithm.
         max_points_per_centroid:
             The maximum number of points per centroid for K-means.
+        nbits:
+            Number of bits to use for quantization (default is 4).
 
         """
         self._prepare_index_directory(index_path=self.index)
@@ -256,6 +259,7 @@ class FastPlaid:
             torch_path=self.torch_path,
             device=self.devices[0],
             embedding_dim=dim,
+            nbits=nbits,
             embeddings=documents_embeddings,
             centroids=centroids,
         )

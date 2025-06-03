@@ -12,10 +12,10 @@ datasets = [
     "trec-covid",
     "webis-touche2020",
     "quora",
-    "nq",
-    "dbpedia-entity",
-    "hotpotqa",
-    "msmarco",
+    # "nq",
+    # "dbpedia-entity",
+    # "hotpotqa",
+    # "msmarco",
 ]
 
 if not VISIBLE_DEVICES:

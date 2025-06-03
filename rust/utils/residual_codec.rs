@@ -115,10 +115,16 @@ impl ResidualCodec {
 
         Ok(Self {
             nbits: nbits_param,
-            centroids: centroids_tensor_initial.to_device(device),
-            avg_residual: avg_residual_tensor_initial.to_device(device),
-            bucket_cutoffs: bucket_cutoffs_tensor_initial.map(|t| t.to_device(device)),
-            bucket_weights: bucket_weights_tensor_initial.map(|t| t.to_device(device)),
+            centroids: centroids_tensor_initial
+                .to_device(device)
+                .to_kind(Kind::Half),
+            avg_residual: avg_residual_tensor_initial
+                .to_device(device)
+                .to_kind(Kind::Half),
+            bucket_cutoffs: bucket_cutoffs_tensor_initial
+                .map(|t| t.to_device(device).to_kind(Kind::Half)),
+            bucket_weights: bucket_weights_tensor_initial
+                .map(|t| t.to_device(device).to_kind(Kind::Half)),
             bit_helper: bit_helper_tensor,
             byte_reversed_bits_map: byte_map_tensor,
             decomp_indices_lookup: opt_decomp_lookup_table,

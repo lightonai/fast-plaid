@@ -292,13 +292,9 @@ pub fn search(
     device: Device,
 ) -> anyhow::Result<(Vec<i64>, Vec<f32>)> {
     let (pids, scores) = tch::no_grad(|| {
-        let query_embeddings_typed = query_embeddings.to_kind(Kind::Float);
+        let query_embeddings_unsqueezed = query_embeddings.unsqueeze(0);
 
-        let query_embeddings_unsqueezed = query_embeddings_typed.unsqueeze(0);
-
-        let query_centroid_scores = codec
-            .centroids
-            .matmul(&query_embeddings_typed.transpose(0, 1));
+        let query_centroid_scores = codec.centroids.matmul(&query_embeddings.transpose(0, 1));
 
         let selected_ivf_cells_indices = if n_ivf_probe == 1 {
             query_centroid_scores.argmax(0, true).permute(&[1, 0])

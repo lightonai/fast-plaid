@@ -139,6 +139,7 @@ fn create(
     torch_path: String,
     device: String,
     embedding_dim: i64,
+    nbits: i64,
     embeddings: Vec<PyTensor>,
     centroids: PyTensor,
 ) -> PyResult<()> {
@@ -146,9 +147,14 @@ fn create(
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
 
     let device = get_device(&device)?;
-    let centroids = centroids.to_device(device).to_kind(Kind::Float);
+    let centroids = centroids.to_device(device).to_kind(Kind::Half);
 
-    create_index(&embeddings, &index, embedding_dim, 4, device, centroids)
+    let embeddings: Vec<_> = embeddings
+        .into_iter()
+        .map(|tensor| tensor.to_device(device).to_kind(Kind::Half))
+        .collect();
+
+    create_index(&embeddings, &index, embedding_dim, nbits, device, centroids)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to create index: {}", e)))
 }
 
@@ -183,9 +189,12 @@ fn load_and_search(
     call_torch(torch_path)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
 
+    let query_tensor = queries_embeddings
+        .to_device(Device::Cpu)
+        .to_kind(Kind::Half);
+
     let device = get_device(&device)?;
     let loaded_index = load_index(&index, device).map_err(anyhow_to_pyerr)?;
-    let query_tensor = queries_embeddings.to_device(Device::Cpu);
 
     let results = search_index(
         &query_tensor,

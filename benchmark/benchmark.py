@@ -47,11 +47,12 @@ model = models.ColBERT(
 
 shutil.rmtree(dataset_name, ignore_errors=True)
 os.makedirs(dataset_name, exist_ok=True)
+shutil.rmtree(f"{dataset_name}_pylate", ignore_errors=True)
 
 print(f"📚 Loading BEIR dataset: {dataset_name}")
 documents, queries, qrels, documents_ids = evaluation.load_beir(
     dataset_name=dataset_name,
-    split="test",
+    split="dev" if "msmarco" in dataset_name else "test",
 )
 num_queries = len(queries)
 
@@ -81,24 +82,20 @@ print(f"\t✅ {dataset_name} indexing: {indexing_time:.2f} seconds")
 
 print(f"🔍 Searching on {dataset_name}...")
 start_search = time.time()
-scores = index.search(queries_embeddings=queries_embeddings, top_k=100)
+scores = index.search(queries_embeddings=queries_embeddings, top_k=20)
 end_search = time.time()
 search_time = end_search - start_search
-queries_per_second = num_queries / search_time if search_time > 0 else 0
-print(
-    f"\t✅ {dataset_name} search: {search_time:.2f} seconds ({queries_per_second:.2f} QPS)"
-)
 
-queries_embeddings = torch.cat(
-    ([queries_embeddings] * ((5000 // queries_embeddings.shape[0]) + 1))[:5000]
+large_queries_embeddings = torch.cat(
+    ([queries_embeddings] * ((1000 // queries_embeddings.shape[0]) + 1))[:1000]
 )
 
 print(f"🔍 50_000 queries on {dataset_name}...")
 start_search = time.time()
-_ = index.search(queries_embeddings=queries_embeddings)
+_ = index.search(queries_embeddings=large_queries_embeddings)
 end_search = time.time()
 heavy_search_time = end_search - start_search
-queries_per_second = queries_embeddings.shape[0] / heavy_search_time
+queries_per_second = large_queries_embeddings.shape[0] / heavy_search_time
 print(
     f"\t✅ {dataset_name} search: {heavy_search_time:.2f} seconds ({queries_per_second:.2f} QPS)"
 )
@@ -143,3 +140,70 @@ with open(output_filepath, "w") as f:
     json.dump(output_data, f, indent=4)
 
 print(f"🎉 Finished evaluation for dataset: {dataset_name}\n")
+
+# Pylate
+
+from pylate import evaluation, indexes, retrieve
+
+index = indexes.PLAID(
+    override=True,
+    index_name=f"{dataset_name}_pylate",
+    embedding_size=96,
+    nbits=4,
+)
+
+retriever = retrieve.ColBERT(index=index)
+
+start = time.time()
+index.add_documents(
+    documents_ids=[document["id"] for document in documents],
+    documents_embeddings=documents_embeddings,
+)
+end = time.time()
+indexing_time = end - start
+print(f"🏗️  Pylate index on {dataset_name}: {end - start:.2f} seconds")
+
+start = time.time()
+scores = retriever.retrieve(queries_embeddings=queries_embeddings, k=20)
+end = time.time()
+search_time = end - start
+print(f"🔍 Pylate search on {dataset_name}: {search_time:.2f} seconds")
+
+
+start = time.time()
+_ = retriever.retrieve(queries_embeddings=large_queries_embeddings, k=20)
+end = time.time()
+heavy_search_time = end - start
+queries_per_second = large_queries_embeddings.shape[0] / heavy_search_time
+
+for (query_id, query), query_scores in zip(queries.items(), scores, strict=False):
+    for score in query_scores:
+        if score["id"] == query_id:
+            # Remove the query_id from the score
+            query_scores.remove(score)
+
+evaluation_scores = evaluation.evaluate(
+    scores=scores,
+    qrels=qrels,
+    queries=list(queries.values()),
+    metrics=["map", "ndcg@10", "ndcg@100", "recall@10", "recall@100"],
+)
+
+print(f"\n--- 📈 Final Scores for {dataset_name} (Pylate) ---")
+print(evaluation_scores)
+
+output_data = {
+    "dataset": dataset_name,
+    "indexing": round(indexing_time, 3),
+    "search": round(search_time, 3),
+    "qps": round(queries_per_second, 2),
+    "size": len(documents),
+    "queries": num_queries,
+    "scores": evaluation_scores,
+}
+
+output_filepath = os.path.join(output_dir, f"{dataset_name}_pylate.json")
+with open(output_filepath, "w") as f:
+    json.dump(output_data, f, indent=4)
+
+print(f"💾 Exporting Pylate results to {output_filepath}")

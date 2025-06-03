@@ -1,5 +1,4 @@
 use anyhow::{anyhow, Context, Result};
-use pyo3_tch::PyTensor;
 use rand::prelude::SliceRandom;
 use regex::Regex;
 use serde::Serialize;
@@ -153,10 +152,10 @@ fn compress_into_codes(embs: &Tensor, centroids: &Tensor) -> Tensor {
 ///
 /// A 1D tensor of `Uint8` bytes.
 pub fn packbits(res: &Tensor) -> Tensor {
-    let bits_mat = res.reshape(&[-1, 8]).to_kind(Kind::Float);
+    let bits_mat = res.reshape(&[-1, 8]).to_kind(Kind::Half);
     let weights = Tensor::from_slice(&[128i64, 64, 32, 16, 8, 4, 2, 1])
         .to_device(res.device())
-        .to_kind(Kind::Float);
+        .to_kind(Kind::Half);
     let packed = bits_mat.matmul(&weights).to_kind(Kind::Uint8);
     packed
 }
@@ -182,7 +181,7 @@ pub fn packbits(res: &Tensor) -> Tensor {
 /// A `Result` indicating success or failure. On success, the `idx_path`
 /// directory will contain all the necessary index files.
 pub fn create_index(
-    documents_embeddings: &Vec<PyTensor>,
+    documents_embeddings: &Vec<Tensor>,
     idx_path: &str,
     embedding_dim: i64,
     nbits: i64,
@@ -216,7 +215,7 @@ pub fn create_index(
     }
 
     let sample_embs = Tensor::cat(&sample_tensors_vec, 0)
-        .to_kind(Kind::Float)
+        .to_kind(Kind::Half)
         .to_device(device);
 
     let mut est_total_embs_f64 = (n_passages as f64) * avg_doc_len;
@@ -238,7 +237,7 @@ pub fn create_index(
     let initial_codec = ResidualCodec::load(
         nbits,
         centroids.copy(),
-        Tensor::zeros(&[embedding_dim], (Kind::Float, device)),
+        Tensor::zeros(&[embedding_dim], (Kind::Half, device)),
         None,
         None,
         device,
@@ -252,15 +251,15 @@ pub fn create_index(
     }
     let heldout_recon_embs = Tensor::cat(&recon_embs_vec, 0);
 
-    let heldout_res_raw = &heldout_samples - &heldout_recon_embs;
+    let heldout_res_raw = (&heldout_samples - &heldout_recon_embs).to_kind(Kind::Float); // Here float on purpose
     let avg_res_per_dim = heldout_res_raw
         .abs()
-        .mean_dim(Some(&[0i64][..]), false, Kind::Float)
+        .mean_dim(Some(&[0i64][..]), false, Kind::Float) // Here float on purpose
         .to_device(device);
 
     let n_options = 2_i32.pow(nbits as u32);
     let quantiles_base =
-        Tensor::arange_start(0, n_options.into(), (Kind::Float, device)) * (1.0 / n_options as f64);
+        Tensor::arange_start(0, n_options.into(), (Kind::Float, device)) * (1.0 / n_options as f64); // Here float on purpose
 
     let cutoff_quantiles = quantiles_base.narrow(0, 1, n_options as i64 - 1);
     let weight_quantiles = &quantiles_base + (0.5 / n_options as f64);
@@ -307,7 +306,7 @@ pub fn create_index(
             .collect();
         let chk_doclens: Vec<i64> = chk_embs_vec.iter().map(|e| e.size()[0]).collect();
         let chk_embs_tensor = Tensor::cat(&chk_embs_vec, 0)
-            .to_kind(Kind::Float)
+            .to_kind(Kind::Half)
             .to_device(device);
 
         let mut chk_codes_list: Vec<Tensor> = Vec::new();

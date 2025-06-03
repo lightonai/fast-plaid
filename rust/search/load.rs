@@ -72,16 +72,16 @@ pub fn load_index(index_dir_path_str: &str, device: Device) -> Result<LoadedInde
     let num_chunks_metadata: usize = app_metadata.num_chunks;
 
     let centroids_initial_data = Tensor::read_npy(index_dir_path.join("centroids.npy"))?
-        .to_kind(Kind::Float)
+        .to_kind(Kind::Half)
         .to_device(device);
     let avg_residual_initial_data = Tensor::read_npy(index_dir_path.join("avg_residual.npy"))?
-        .to_kind(Kind::Float)
+        .to_kind(Kind::Half)
         .to_device(device);
     let bucket_cutoffs_initial_data = Tensor::read_npy(index_dir_path.join("bucket_cutoffs.npy"))?
-        .to_kind(Kind::Float)
+        .to_kind(Kind::Half)
         .to_device(device);
     let bucket_weights_initial_data = Tensor::read_npy(index_dir_path.join("bucket_weights.npy"))?
-        .to_kind(Kind::Float)
+        .to_kind(Kind::Half)
         .to_device(device);
 
     let index_dimension = centroids_initial_data.size()[1];

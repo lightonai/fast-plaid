@@ -22,13 +22,13 @@
 
 Traditional vector search relies on single, fixed-size embeddings (dense vectors) for documents and queries. While powerful, this approach can lose nuanced, token-level details.
 
-* **Multi-vector search**, used in models like [ColBERT](https://github.com/lightonai/pylate) or [ColPali](https://github.com/illuin-tech/colpali), replaces a single document or image vector with a set of per-token vectors. This enables a "late interaction" mechanism, where fine-grained similarity is calculated term-by-term to boost retrieval accuracy.
+- **Multi-vector search**, used in models like [ColBERT](https://github.com/lightonai/pylate) or [ColPali](https://github.com/illuin-tech/colpali), replaces a single document or image vector with a set of per-token vectors. This enables a "late interaction" mechanism, where fine-grained similarity is calculated term-by-term to boost retrieval accuracy.
 
-* **Higher Accuracy:** By matching at a granular, token-level, FastPlaid captures subtle relevance that single-vector models simply miss.
+- **Higher Accuracy:** By matching at a granular, token-level, FastPlaid captures subtle relevance that single-vector models simply miss.
 
-* **PLAID:** stands for *Per-Token Late Interaction Dense Search*.
+- **PLAID:** stands for _Per-Token Late Interaction Dense Search_.
 
-* **Blazing Performance**: Engineered in Rust and optimized for **GPUs**.
+- **Blazing Performance**: Engineered in Rust and optimized for **GPUs**.
 
 &nbsp;
 
@@ -55,7 +55,7 @@ embedding_dim = 128
 
 # Index 100 documents, each with 300 tokens, each token is a 128-dim vector.
 fast_plaid.create(
-    documents_embeddings=[torch.randn(300, embedding_dim) for _ in range(100)] 
+    documents_embeddings=[torch.randn(300, embedding_dim) for _ in range(100)]
 )
 
 # Search for 2 queries, each with 50 tokens, each token is a 128-dim vector
@@ -68,7 +68,6 @@ print(scores)
 ```
 
 The output will be a list of lists, where each inner list contains tuples of (document_index, similarity_score) for the top top_k results for each query:
-
 
 ```python
 [
@@ -97,13 +96,13 @@ The output will be a list of lists, where each inner list contains tuples of (do
 ]
 ```
 
-*FastPlaid does not support index updates. Once an index is created, it is immutable. If you need to add or remove documents, you must create a new index. FastPlaid is optimized for GPUs but is compatible with CPUs.*
+_FastPlaid does not support index updates. Once an index is created, it is immutable. If you need to add or remove documents, you must create a new index. FastPlaid is optimized for GPUs but is compatible with CPUs._
 
 &nbsp;
 
 ## 📊 Benchmarks
 
-FastPlaid significantly outperforms the original PLAID engine across various datasets, delivering comparable accuracy with faster indexing and query speeds. 
+FastPlaid significantly outperforms the original PLAID engine across various datasets, delivering comparable accuracy with faster indexing and query speeds.
 
 ```python
                                    NDCG@10  Indexing Time (s) Queries per seconds (QPS)
@@ -133,7 +132,7 @@ webis-touche2020 382545 PLAID         0.25             128.11                   
                         FastPlaid     0.24              74.50             70.15 (+120%)
 ```
 
-*All benchmarks were performed on an H100 GPU. It's important to note that PLAID relies on Just-In-Time (JIT) compilation. This means the very first execution can exhibit longer runtimes. To ensure our performance analysis is representative, we've excluded these initial JIT-affected runs from the reported results. In contrast, FastPlaid does not employ JIT compilation, so its performance on the first run is directly indicative of its typical execution speed.*
+_All benchmarks were performed on an H100 GPU. It's important to note that PLAID relies on Just-In-Time (JIT) compilation. This means the very first execution can exhibit longer runtimes. To ensure our performance analysis is representative, we've excluded these initial JIT-affected runs from the reported results. In contrast, FastPlaid does not employ JIT compilation, so its performance on the first run is directly indicative of its typical execution speed._
 
 &nbsp;
 

@@ -86,7 +86,9 @@ def compute_kmeans(
 
     num_partitions = int(2 ** math.floor(math.log2(16 * math.sqrt(num_partitions))))
 
-    samples = torch.cat(tensors=samples).cpu().numpy()
+    samples = torch.cat(tensors=samples)
+    if samples.is_cuda:
+        samples = samples.to(device="cpu", dtype=torch.float16)
 
     kmeans = FastKMeans(
         d=dim,
@@ -98,7 +100,7 @@ def compute_kmeans(
         max_points_per_centroid=max_points_per_centroid,
     )
 
-    kmeans.train(data=samples)
+    kmeans.train(data=samples.numpy())
 
     centroids = torch.from_numpy(
         kmeans.centroids,

@@ -3,7 +3,7 @@ requires = [
   "maturin >= 1.8.6",
   "numpy >= 1.26.4",
   "setuptools >= 78.1.1",
-  "torch == 2.7.0",
+  "torch == 2.7.0"
 ]
 build-backend = "maturin"
 
@@ -12,13 +12,13 @@ name = "fast_plaid"
 version = "1.0.2"
 description = "Fast Plaid."
 authors = [
-  { name = "Raphael Sourty, LightOn", email = "raphael.sourty@lighton.ai" },
+  {name = "Raphael Sourty, LightOn", email = "raphael.sourty@lighton.ai"}
 ]
 keywords = []
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Rust",
-  "Operating System :: OS Independent",
+  "Operating System :: OS Independent"
 ]
 requires-python = ">=3.9"
 dependencies = [
@@ -27,7 +27,7 @@ dependencies = [
   "torch >= 2.6.0",
   "maturin >= 1.8.6",
   "numpy >= 1.26.4",
-  "setuptools >= 78.1.1",
+  "setuptools >= 78.1.1"
 ]
 
 [project.optional-dependencies]
@@ -39,7 +39,7 @@ dev = [
   "pre-commit >= 3.0.0",
   "pylate >= 1.2.0",
   "beir>=2.1.0",
-  "ranx>=0.3.20",
+  "ranx>=0.3.20"
 ]
 
 [project.urls]
@@ -60,20 +60,20 @@ module-name = "fast_plaid.fast_plaid_rust"
 filterwarnings = [
   "ignore::DeprecationWarning",
   "ignore::RuntimeWarning",
-  "ignore::UserWarning",
+  "ignore::UserWarning"
 ]
 addopts = [
   "--doctest-modules",
   "--verbose",
   "-ra",
   "--cov-config=.coveragerc",
-  "-m not web and not slow",
+  "-m not web and not slow"
 ]
 doctest_optionflags = ["NORMALIZE_WHITESPACE", "NUMBER"]
 norecursedirs = ["build", "docs", "node_modules"]
 markers = [
   "web: tests that require using the Internet",
-  "slow: tests that take a long time to run",
+  "slow: tests that take a long time to run"
 ]
 
 [tool.ruff]
@@ -136,7 +136,7 @@ ignore = [
   "TRY201",
   "PTH112",
   "B905",
-  "UP037",
+  "UP037"
 ]
 select = ["ALL"]
 fixable = ["ALL"]

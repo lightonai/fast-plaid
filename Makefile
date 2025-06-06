@@ -1,5 +1,6 @@
 lint:
 	cargo clean
+	uv pip install torch==2.7.0
 	uv run --extra dev pre-commit run --files python/**/**.py pyproject.toml Makefile
 
 install:

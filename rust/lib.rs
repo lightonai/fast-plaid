@@ -21,6 +21,7 @@ use winapi::um::libloaderapi::LoadLibraryA;
 
 // Internal module imports.
 use crate::index::create::create_index;
+use crate::index::update::update_index;
 use search::load::load_index;
 use search::search::{search_index, QueryResult, SearchParameters};
 
@@ -128,6 +129,7 @@ fn initialize_torch(_py: Python<'_>, torch_path: String) -> PyResult<()> {
 ///     torch_path (str): Path to the Torch shared library (e.g., `libtorch.so`).
 ///     device (str): The compute device to use for index creation (e.g., "cpu", "cuda:0").
 ///     embedding_dim (int): The dimensionality of the embeddings.
+///     nbits (int): The number of bits to use for residual quantization.
 ///     embeddings (list[torch.Tensor]): A list of 2D tensors, where each tensor
 ///         is a batch of document embeddings.
 ///     centroids (torch.Tensor): A 2D tensor of shape `[num_centroids, embedding_dim]`
@@ -156,6 +158,40 @@ fn create(
 
     create_index(&embeddings, &index, embedding_dim, nbits, device, centroids)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to create index: {}", e)))
+}
+
+/// Updates an existing FastPlaid index with new documents.
+///
+/// This function loads the configuration from an existing index, processes the
+/// new document embeddings, and adds them to the index without rebuilding it
+/// from scratch.
+///
+/// Args:
+///     index (str): The directory path of the index to update.
+///     torch_path (str): Path to the Torch shared library (e.g., `libtorch.so`).
+///     device (str): The compute device to use (e.g., "cpu", "cuda:0").
+///     embeddings (list[torch.Tensor]): A list of 2D tensors containing the
+///         new document embeddings to add to the index.
+#[pyfunction]
+fn update(
+    _py: Python<'_>,
+    index: String,
+    torch_path: String,
+    device: String,
+    embeddings: Vec<PyTensor>,
+) -> PyResult<()> {
+    call_torch(torch_path)
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
+
+    let device = get_device(&device)?;
+
+    let embeddings: Vec<_> = embeddings
+        .into_iter()
+        .map(|tensor| tensor.to_device(device).to_kind(Kind::Half))
+        .collect();
+
+    update_index(&embeddings, &index, device)
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to update index: {}", e)))
 }
 
 /// Loads an index and performs a search in a single, high-level operation.
@@ -211,9 +247,9 @@ fn load_and_search(
 /// A high-performance document retrieval toolkit using a ColBERT-style late
 /// interaction model, implemented in Rust with Python bindings.
 ///
-/// This module provides functions for creating and searching indexes, along with
-/// the necessary data classes `SearchParameters` and `QueryResult` to interact
-/// with the library from Python.
+/// This module provides functions for creating, updating, and searching indexes,
+/// along with the necessary data classes `SearchParameters` and `QueryResult`
+/// to interact with the library from Python.
 #[pymodule]
 #[pyo3(name = "fast_plaid_rust")]
 fn python_module(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -224,6 +260,7 @@ fn python_module(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Add functions to the Python module.
     m.add_function(wrap_pyfunction!(initialize_torch, m)?)?;
     m.add_function(wrap_pyfunction!(create, m)?)?;
+    m.add_function(wrap_pyfunction!(update, m)?)?; // <-- Added update function
     m.add_function(wrap_pyfunction!(load_and_search, m)?)?;
 
     Ok(())

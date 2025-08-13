@@ -46,12 +46,13 @@ def _load_torch_path(device: str) -> str:
     raise TorchWithCudaNotFoundError(error) from IndexError
 
 
-def compute_kmeans(
+def compute_kmeans(  # noqa: PLR0913
     documents_embeddings: list[torch.Tensor],
     dim: int,
     device: str,
     kmeans_niters: int,
     max_points_per_centroid: int,
+    n_samples_kmeans: int | None = None,
 ) -> torch.Tensor:
     """Compute K-means centroids for document embeddings.
 
@@ -67,18 +68,29 @@ def compute_kmeans(
         Number of iterations for the K-means algorithm.
     max_points_per_centroid:
         The maximum number of points per centroid for K-means.
+    n_samples_kmeans:
+        Number of samples to use for K-means. If None, it will be calculated based on
+        the number of documents.
 
     """
     num_passages = len(documents_embeddings)
 
-    k = min(1 + int(16 * math.sqrt(120 * num_passages)), num_passages)
+    if n_samples_kmeans is None:
+        n_samples_kmeans = min(
+            1 + int(16 * math.sqrt(120 * num_passages)),
+            num_passages,
+        )
+
+    n_samples_kmeans = min(num_passages, n_samples_kmeans)
 
     sampled_pids = random.sample(
-        population=range(k),
-        k=k,
+        population=range(n_samples_kmeans),
+        k=n_samples_kmeans,
     )
 
-    samples = [documents_embeddings[pid] for pid in set(sampled_pids)]
+    samples: list[torch.Tensor] = [
+        documents_embeddings[pid] for pid in set(sampled_pids)
+    ]
 
     num_partitions = (
         sum([sample.shape[0] for sample in samples]) / len(samples)
@@ -86,9 +98,9 @@ def compute_kmeans(
 
     num_partitions = int(2 ** math.floor(math.log2(16 * math.sqrt(num_partitions))))
 
-    samples = torch.cat(tensors=samples)
-    if samples.is_cuda:
-        samples = samples.to(device="cpu", dtype=torch.float16)
+    tensors = torch.cat(tensors=samples)
+    if tensors.is_cuda:
+        tensors = tensors.to(device="cpu", dtype=torch.float16)
 
     kmeans = FastKMeans(
         d=dim,
@@ -100,7 +112,7 @@ def compute_kmeans(
         max_points_per_centroid=max_points_per_centroid,
     )
 
-    kmeans.train(data=samples.numpy())
+    kmeans.train(data=tensors.numpy())
 
     centroids = torch.from_numpy(
         kmeans.centroids,
@@ -125,7 +137,7 @@ def search_on_device(  # noqa: PLR0913
     index: str,
     torch_path: str,
     show_progress: bool,
-) -> list[list[dict]]:
+) -> list[list[tuple[int, float]]]:
     """Perform a search on a single specified device.
 
     Args:
@@ -206,7 +218,15 @@ class FastPlaid:
         if device is None and torch.cuda.is_available():
             self.devices = ["cuda"]
         elif not torch.cuda.is_available():
-            self.devices = ["cpu"] * os.cpu_count()
+            cpu_count = os.cpu_count()
+            if cpu_count is None:
+                error = """
+                No CPU cores available. Please check your system configuration.
+                >>> import os; print(os.cpu_count())
+                Returns None.
+                """
+                raise RuntimeError(error)
+            self.devices = ["cpu"] * cpu_count
         elif isinstance(device, str):
             self.devices = [device]
         elif isinstance(device, list):
@@ -231,6 +251,7 @@ class FastPlaid:
         kmeans_niters: int = 4,
         max_points_per_centroid: int = 256,
         nbits: int = 4,
+        n_samples_kmeans: int | None = None,
     ) -> "FastPlaid":
         """Create and saves the FastPlaid index.
 
@@ -244,6 +265,9 @@ class FastPlaid:
             The maximum number of points per centroid for K-means.
         nbits:
             Number of bits to use for quantization (default is 4).
+        n_samples_kmeans:
+            Number of samples to use for K-means. If None, it will be calculated based
+            on the number of documents.
 
         """
         self._prepare_index_directory(index_path=self.index)
@@ -256,6 +280,7 @@ class FastPlaid:
             kmeans_niters=kmeans_niters,
             device=self.devices[0],
             max_points_per_centroid=max_points_per_centroid,
+            n_samples_kmeans=n_samples_kmeans,
         )
 
         fast_plaid_rust.create(
@@ -266,6 +291,39 @@ class FastPlaid:
             nbits=nbits,
             embeddings=documents_embeddings,
             centroids=centroids,
+        )
+
+        return self
+
+    def update(
+        self,
+        documents_embeddings: list[torch.Tensor],
+    ) -> "FastPlaid":
+        """Update an existing FastPlaid index with new documents.
+
+        This method adds new embeddings to the index without re-training the quantizer,
+        making it much faster than re-creating the index from scratch.
+
+        Args:
+        ----
+        documents_embeddings:
+            A list of new document embedding tensors to add to the index.
+
+        """
+        if not os.path.exists(self.index) or not os.path.exists(
+            os.path.join(self.index, "metadata.json")
+        ):
+            error = f"""
+            Index directory '{self.index}' does not exist or is invalid.
+            Please create an index first using the .create() method.
+            """
+            raise FileNotFoundError(error)
+
+        fast_plaid_rust.update(
+            index=self.index,
+            torch_path=self.torch_path,
+            device=self.devices[0],
+            embeddings=documents_embeddings,
         )
 
         return self
@@ -299,7 +357,7 @@ class FastPlaid:
         n_full_scores: int = 8192,
         n_ivf_probe: int = 8,
         show_progress: bool = True,
-    ) -> list[list[dict]]:
+    ) -> list[list[tuple[int, float]]]:
         """Search the index for the given query embeddings.
 
         Args:

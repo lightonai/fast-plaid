@@ -38,6 +38,13 @@ Traditional vector search relies on single, fixed-size embeddings (dense vectors
 pip install fast-plaid
 ```
 
+FastPlaid is built with the `torch` version `2.8.0`. To use FastPlaid with a lower version of `torch`, you can build `fast-plaid` from source.
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+pip install git+https://github.com/lightonai/fast-plaid.git
+```
+
 &nbsp;
 
 ## ⚡️ Quick Start
@@ -293,7 +300,7 @@ The **`search` method** lets you query the created index with your query embeddi
         n_full_scores: int = 8192,
         n_ivf_probe: int = 8,
         show_progress: bool = True,
-    ) -> list[list[dict]]:
+    ) -> list[list[tuple[int, float]]]:
 ```
 
 ```

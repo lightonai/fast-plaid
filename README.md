@@ -96,7 +96,32 @@ The output will be a list of lists, where each inner list contains tuples of (do
 ]
 ```
 
-_FastPlaid does not support index updates. Once an index is created, it is immutable. If you need to add or remove documents, you must create a new index. FastPlaid is optimized for GPUs but is compatible with CPUs._
+## 🗂️ Update an Index
+
+```python
+import torch
+
+from fast_plaid import search
+
+fast_plaid = search.FastPlaid(index="index") # Load an existing index
+
+embedding_dim = 128
+
+fast_plaid.update(
+    documents_embeddings=[torch.randn(300, embedding_dim) for _ in range(100)]
+)
+
+scores = fast_plaid.search(
+    queries_embeddings=torch.randn(2, 50, embedding_dim),
+    top_k=10,
+)
+
+print(scores)
+```
+
+It is highly recommended to create your initial index with a large and representative sample of your data for optimal performance and accuracy. The **`.create()` method** establishes the fundamental structure of the index by calculating centroids that are specifically tailored to the distribution of this initial dataset.
+
+The **`.update()` method**, designed for efficiency, **does not re-compute these centroids**. Instead, it places new documents into the existing structure. If you frequently update the index with large volumes of data that have a different statistical distribution than the original set, you may experience "drift." This means the fixed centroids become less representative of the total collection, potentially leading to sub-optimal data partitioning and a gradual decline in retrieval accuracy over time. Therefore, building a robust initial index is key to its long-term health. If you find that your data distribution changes significantly, consider periodically re-creating the index with a new, representative sample to maintain optimal performance or avoid using the `.update()` method and rely on the **`.create()` method** which will delete the existing index and re-create it from scratch.
 
 &nbsp;
 
@@ -207,6 +232,7 @@ The **`create` method** builds the multi-vector index from your document embeddi
         kmeans_niters: int = 4,
         max_points_per_centroid: int = 256,
         nbits: int = 4,
+        n_samples_kmeans: int | None = None,
     ) -> "FastPlaid":
 ```
 
@@ -227,6 +253,31 @@ nbits: int = 4 (optional)
     The number of bits to use for product quantization.
     This parameter controls the compression of your embeddings, impacting both index size and search speed.
     Lower values mean more compression and potentially faster searches but can reduce accuracy.
+
+n_samples_kmeans: int | None = None (optional)
+    The number of samples to use for K-means clustering.
+    If `None`, it defaults to a value based on the number of documents.
+    This parameter can be adjusted to balance between speed, memory usage and 
+    clustering quality. If you have a large dataset, you might want to set this to a 
+    smaller value to speed up the indexing process and save some memory.
+```
+
+### Updating the Index
+
+The **`update` method** provides an efficient way to add new documents to an existing index without rebuilding it from scratch. This is significantly faster than calling .create() again, as it reuses the existing quantization configuration and only processes the new documents. The centroids and quantization parameters remain unchanged, **this might lead to a slight decrease in accuracy compared to a full re-indexing**.
+
+```python
+    def update(
+        self,
+        documents_embeddings: list[torch.Tensor],
+    ) -> "FastPlaid":
+```
+
+```
+documents_embeddings: list[torch.Tensor]
+    A list where each element is a PyTorch tensor representing the multi-vector embedding for a single document.
+    Each document's embedding should have a shape of `(num_tokens, embedding_dimension)`.
+    This method will add these new embeddings to the existing index.
 ```
 
 ### Searching the Index
@@ -269,3 +320,11 @@ n_ivf_probe: int = 8 (optional)
 show_progress: bool = True (optional)
     If set to `True`, a progress bar will be displayed during the search operation.
 ```
+
+## Contributing
+
+Any contributions to FastPlaid are welcome! If you have ideas for improvements, bug fixes, or new features, please open an issue or submit a pull request. We are particularly interested in:
+
+- Re-computing centroids when using the `.update()` method to maintain optimal performance.
+- Additional algorithms for multi-vector search.
+- New search outputs formats for better integration with existing systems.

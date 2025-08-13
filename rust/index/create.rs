@@ -16,9 +16,9 @@ use crate::utils::residual_codec::ResidualCodec;
 /// Holds metadata for a chunk of the index, including the number of
 /// passages and the total number of embeddings.
 #[derive(Serialize)]
-struct Metadata {
-    num_passages: usize,
-    num_embeddings: usize,
+pub struct Metadata {
+    pub num_passages: usize,
+    pub num_embeddings: usize,
 }
 
 /// Optimizes an Inverted File (IVF) index by removing duplicate passage IDs (PIDs)
@@ -130,7 +130,7 @@ pub fn optimize_ivf(
 /// # Returns
 ///
 /// A 1D tensor of codes (indices of the nearest centroids).
-fn compress_into_codes(embs: &Tensor, centroids: &Tensor) -> Tensor {
+pub fn compress_into_codes(embs: &Tensor, centroids: &Tensor) -> Tensor {
     let mut codes = Vec::new();
     let batch_sz = (1 << 29) / centroids.size()[0] as i64;
     for mut emb_batch in embs.split(batch_sz, 0) {

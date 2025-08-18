@@ -10,6 +10,7 @@ use tch::{Device, Kind, Tensor};
 use crate::index::create::{compress_into_codes, optimize_ivf, packbits, Metadata};
 
 use crate::utils::residual_codec::ResidualCodec;
+use crate::utils::metadata_db::MetadataDB;
 
 const DEFAULT_PROC_CHUNK_SIZE: usize = 25_000;
 
@@ -34,6 +35,7 @@ pub fn update_index(
     documents_embeddings: &Vec<Tensor>,
     idx_path: &str,
     device: Device,
+    documents_metadata: Option<Vec<serde_json::Value>>,
 ) -> Result<()> {
     let _grad_guard = tch::no_grad_guard();
 
@@ -227,6 +229,59 @@ pub fn update_index(
     });
     let final_meta_file = fs::File::create(&main_meta_path)?;
     serde_json::to_writer_pretty(BufWriter::new(final_meta_file), &final_meta_json)?;
+
+    // Update metadata database if metadata is provided
+    if let Some(metadata) = documents_metadata {
+        let n_new_docs = documents_embeddings.len();
+        if metadata.len() != n_new_docs {
+            return Err(anyhow!(
+                "Number of metadata entries ({}) doesn't match number of new documents ({})",
+                metadata.len(),
+                n_new_docs
+            ));
+        }
+
+        // Get the passage ID offset from existing data
+        let passage_id_offset = total_passages - n_new_docs;
+
+        // Check if metadata DB exists, create if not
+        let metadata_db = MetadataDB::new(idx_path)?;
+
+        // Build centroid mappings for new documents
+        let mut centroid_mappings = Vec::new();
+        
+        for new_chunk_idx in start_chunk_idx..(start_chunk_idx + n_new_chunks) {
+            let codes_fpath = idx_path_obj.join(format!("{}.codes.npy", new_chunk_idx));
+            let codes_from_file = Tensor::read_npy(&codes_fpath)?.to_device(device);
+            let codes_vec: Vec<i64> = codes_from_file.try_into()?;
+
+            let chk_doclens_fpath = idx_path_obj.join(format!("doclens.{}.json", new_chunk_idx));
+            let dl_file = File::open(chk_doclens_fpath)?;
+            let chk_doclens: Vec<i64> = serde_json::from_reader(BufReader::new(dl_file))?;
+
+            let mut emb_offset = 0;
+            let mut passage_id_in_chunk = 0;
+            for &doc_len in &chk_doclens {
+                let global_passage_id = passage_id_offset as i64 + 
+                    (new_chunk_idx - start_chunk_idx) as i64 * DEFAULT_PROC_CHUNK_SIZE as i64 + 
+                    passage_id_in_chunk;
+                
+                // Map each embedding in this document to its centroid
+                for emb_idx in 0..doc_len {
+                    let code_idx = emb_offset + emb_idx as usize;
+                    if code_idx < codes_vec.len() {
+                        let centroid_id = codes_vec[code_idx];
+                        centroid_mappings.push((centroid_id, global_passage_id));
+                    }
+                }
+                emb_offset += doc_len as usize;
+                passage_id_in_chunk += 1;
+            }
+        }
+
+        metadata_db.update_documents(&metadata, &centroid_mappings, passage_id_offset as i64)
+            .context("Failed to update metadata database")?;
+    }
 
     Ok(())
 }

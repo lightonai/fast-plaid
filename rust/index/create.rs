@@ -12,6 +12,7 @@ use std::path::Path;
 use tch::{Device, Kind, Tensor};
 
 use crate::utils::residual_codec::ResidualCodec;
+use crate::utils::metadata_db::MetadataDB;
 
 /// Holds metadata for a chunk of the index, including the number of
 /// passages and the total number of embeddings.
@@ -187,6 +188,7 @@ pub fn create_index(
     nbits: i64,
     device: Device,
     centroids: Tensor,
+    documents_metadata: Option<Vec<serde_json::Value>>,
 ) -> Result<()> {
     let _grad_guard = tch::no_grad_guard();
 
@@ -451,6 +453,68 @@ pub fn create_index(
     let final_meta_file = fs::File::create(&final_meta_fpath)?;
     let final_writer = BufWriter::new(final_meta_file);
     serde_json::to_writer_pretty(final_writer, &final_meta_json)?;
+
+    // Store metadata and centroid mappings in DuckDB if metadata is provided
+    if let Some(metadata) = documents_metadata {
+        if metadata.len() != final_num_docs {
+            return Err(anyhow!(
+                "Number of metadata entries ({}) doesn't match number of documents ({})",
+                metadata.len(),
+                final_num_docs
+            ));
+        }
+
+        let metadata_db = MetadataDB::new(idx_path)
+            .context("Failed to create metadata database")?;
+
+        // Build centroid to passage mappings
+        let mut centroid_mappings = Vec::new();
+        let mut passage_id = 0i64;
+
+        // We need to recreate the mapping from the all_codes tensor
+        for chk_idx in 0..n_chunks {
+            let codes_fpath = Path::new(idx_path).join(format!("{}.codes.npy", chk_idx));
+            let codes_from_file = Tensor::read_npy(&codes_fpath)?.to_device(device);
+            let codes_vec: Vec<i64> = codes_from_file.try_into()?;
+
+            let chk_meta_fpath = Path::new(idx_path).join(format!("{}.metadata.json", chk_idx));
+            let meta_f_r = File::open(&chk_meta_fpath)?;
+            let buf_reader = BufReader::new(meta_f_r);
+            let json_val: serde_json::Value = serde_json::from_reader(buf_reader)?;
+            
+            if let Some(meta_obj) = json_val.as_object() {
+                let num_passages = meta_obj
+                    .get("num_passages")
+                    .and_then(|v| v.as_u64())
+                    .ok_or_else(|| anyhow!("'num_passages' not found in chunk metadata"))? as usize;
+
+                // Read document lengths to map embeddings back to passages
+                let chk_doclens_fpath = Path::new(idx_path).join(format!("doclens.{}.json", chk_idx));
+                let dl_file = File::open(chk_doclens_fpath)?;
+                let dl_reader = BufReader::new(dl_file);
+                let chk_doclens: Vec<i64> = serde_json::from_reader(dl_reader)?;
+
+                let mut emb_offset = 0;
+                for (doc_idx, &doc_len) in chk_doclens.iter().enumerate() {
+                    let global_passage_id = passage_id + doc_idx as i64;
+                    
+                    // Map each embedding in this document to its centroid
+                    for emb_idx in 0..doc_len {
+                        let code_idx = emb_offset + emb_idx as usize;
+                        if code_idx < codes_vec.len() {
+                            let centroid_id = codes_vec[code_idx];
+                            centroid_mappings.push((centroid_id, global_passage_id));
+                        }
+                    }
+                    emb_offset += doc_len as usize;
+                }
+                passage_id += num_passages as i64;
+            }
+        }
+
+        metadata_db.store_documents(&metadata, &centroid_mappings)
+            .context("Failed to store metadata and centroid mappings")?;
+    }
 
     Ok(())
 }

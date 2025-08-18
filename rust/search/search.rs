@@ -8,6 +8,7 @@ use crate::search::load::LoadedIndex;
 use crate::search::padding::direct_pad_sequences;
 use crate::search::tensor::StridedTensor;
 use crate::utils::residual_codec::ResidualCodec;
+use crate::utils::metadata_db::MetadataDB;
 
 /// Decompresses residual vectors from a packed, quantized format.
 ///
@@ -126,18 +127,28 @@ pub struct SearchParameters {
     /// Number of IVF cells to probe during the initial search.
     #[pyo3(get, set)]
     pub n_ivf_probe: usize,
+    /// Optional metadata filter query (SQL WHERE clause).
+    #[pyo3(get, set)]
+    pub filter_query: Option<String>,
 }
 
 #[pymethods]
 impl SearchParameters {
     /// Creates a new `SearchParameters` instance from Python.
     #[new]
-    fn new(batch_size: usize, n_full_scores: usize, top_k: usize, n_ivf_probe: usize) -> Self {
+    fn new(
+        batch_size: usize, 
+        n_full_scores: usize, 
+        top_k: usize, 
+        n_ivf_probe: usize,
+        filter_query: Option<String>
+    ) -> Self {
         Self {
             batch_size,
             n_full_scores,
             top_k,
             n_ivf_probe,
+            filter_query,
         }
     }
 }
@@ -164,6 +175,7 @@ pub fn search_index(
     params: &SearchParameters,
     device: Device,
     show_progress: bool,
+    index_path: &str,
 ) -> Result<Vec<QueryResult>> {
     let [num_queries, _, query_dim] = queries.size()[..] else {
         bail!(
@@ -188,6 +200,8 @@ pub fn search_index(
             index.nbits,
             params.top_k,
             device,
+            &params.filter_query,
+            index_path,
         )
         .unwrap_or_default();
 
@@ -290,11 +304,38 @@ pub fn search(
     nbits_param: i64,
     top_k: usize,
     device: Device,
+    filter_query: &Option<String>,
+    index_path: &str,
 ) -> anyhow::Result<(Vec<i64>, Vec<f32>)> {
     let (pids, scores) = tch::no_grad(|| {
         let query_embeddings_unsqueezed = query_embeddings.unsqueeze(0);
 
-        let query_centroid_scores = codec.centroids.matmul(&query_embeddings.transpose(0, 1));
+        let mut query_centroid_scores = codec.centroids.matmul(&query_embeddings.transpose(0, 1));
+
+        // Apply centroid pre-filtering if metadata filter is provided
+        if let Some(filter_query_str) = filter_query {
+            if MetadataDB::exists_and_has_data(index_path) {
+                let metadata_db = MetadataDB::new(index_path)?;
+                let allowed_centroids = metadata_db.get_centroids_for_filter(filter_query_str)?;
+                
+                if !allowed_centroids.is_empty() {
+                    // Create a mask for allowed centroids
+                    let num_centroids = query_centroid_scores.size()[0];
+                    let mask = Tensor::zeros(&[num_centroids], (Kind::Bool, device));
+                    
+                    for &centroid_id in &allowed_centroids {
+                        if centroid_id >= 0 && centroid_id < num_centroids {
+                            let _ = mask.i(centroid_id).fill_(1);
+                        }
+                    }
+                    
+                    // Set scores of disallowed centroids to negative infinity
+                    let neg_inf_scalar = f64::NEG_INFINITY;
+                    let expanded_mask = mask.unsqueeze(1).expand(&query_centroid_scores.size(), true);
+                    query_centroid_scores = query_centroid_scores.masked_fill(&expanded_mask.logical_not(), neg_inf_scalar);
+                }
+            }
+        }
 
         let selected_ivf_cells_indices = if n_ivf_probe == 1 {
             query_centroid_scores.argmax(0, true).permute(&[1, 0])
@@ -419,8 +460,28 @@ pub fn search(
         let (sorted_scores, sorted_indices) = reduced_scores.sort(0, true);
         let sorted_pids = passage_ids_to_rerank.index_select(0, &sorted_indices);
 
-        let pids_vec: Vec<i64> = sorted_pids.try_into()?;
-        let scores_vec: Vec<f32> = sorted_scores.try_into()?;
+        let mut pids_vec: Vec<i64> = sorted_pids.try_into()?;
+        let mut scores_vec: Vec<f32> = sorted_scores.try_into()?;
+
+        // Apply final passage filtering if metadata filter is provided
+        if let Some(filter_query_str) = filter_query {
+            if MetadataDB::exists_and_has_data(index_path) {
+                let metadata_db = MetadataDB::new(index_path)?;
+                let filtered_pids = metadata_db.filter_passages(&pids_vec, filter_query_str)?;
+                let filtered_pids_set: std::collections::HashSet<i64> = filtered_pids.into_iter().collect();
+                
+                // Keep only results that match the filter
+                let mut filtered_results = Vec::new();
+                for (pid, score) in pids_vec.iter().zip(scores_vec.iter()) {
+                    if filtered_pids_set.contains(pid) {
+                        filtered_results.push((*pid, *score));
+                    }
+                }
+                
+                pids_vec = filtered_results.iter().map(|(pid, _)| *pid).collect();
+                scores_vec = filtered_results.iter().map(|(_, score)| *score).collect();
+            }
+        }
 
         let result_count = top_k.min(pids_vec.len());
         Ok((

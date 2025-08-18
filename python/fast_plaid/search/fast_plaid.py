@@ -137,6 +137,7 @@ def search_on_device(  # noqa: PLR0913
     index: str,
     torch_path: str,
     show_progress: bool,
+    filter_query: str | None = None,
 ) -> list[list[tuple[int, float]]]:
     """Perform a search on a single specified device.
 
@@ -167,6 +168,7 @@ def search_on_device(  # noqa: PLR0913
         n_full_scores=n_full_scores,
         top_k=top_k,
         n_ivf_probe=n_ivf_probe,
+        filter_query=filter_query,
     )
 
     scores = fast_plaid_rust.load_and_search(
@@ -252,6 +254,7 @@ class FastPlaid:
         max_points_per_centroid: int = 256,
         nbits: int = 4,
         n_samples_kmeans: int | None = None,
+        documents_metadata: list[dict] | None = None,
     ) -> "FastPlaid":
         """Create and saves the FastPlaid index.
 
@@ -268,6 +271,10 @@ class FastPlaid:
         n_samples_kmeans:
             Number of samples to use for K-means. If None, it will be calculated based
             on the number of documents.
+        documents_metadata:
+            Optional list of metadata dictionaries for each document. If provided,
+            enables filtering capabilities during search. Must have same length as
+            documents_embeddings.
 
         """
         self._prepare_index_directory(index_path=self.index)
@@ -283,6 +290,18 @@ class FastPlaid:
             n_samples_kmeans=n_samples_kmeans,
         )
 
+        # Convert metadata dictionaries to JSON strings if provided
+        metadata_json_strings = None
+        if documents_metadata is not None:
+            import json
+            if len(documents_metadata) != len(documents_embeddings):
+                error = f"""
+                Number of metadata entries ({len(documents_metadata)}) 
+                doesn't match number of documents ({len(documents_embeddings)}).
+                """
+                raise ValueError(error)
+            metadata_json_strings = [json.dumps(meta) for meta in documents_metadata]
+
         fast_plaid_rust.create(
             index=self.index,
             torch_path=self.torch_path,
@@ -291,6 +310,7 @@ class FastPlaid:
             nbits=nbits,
             embeddings=documents_embeddings,
             centroids=centroids,
+            documents_metadata=metadata_json_strings,
         )
 
         return self
@@ -298,6 +318,7 @@ class FastPlaid:
     def update(
         self,
         documents_embeddings: list[torch.Tensor],
+        documents_metadata: list[dict] | None = None,
     ) -> "FastPlaid":
         """Update an existing FastPlaid index with new documents.
 
@@ -308,6 +329,9 @@ class FastPlaid:
         ----
         documents_embeddings:
             A list of new document embedding tensors to add to the index.
+        documents_metadata:
+            Optional list of metadata dictionaries for each new document. If provided,
+            must have same length as documents_embeddings.
 
         """
         if not os.path.exists(self.index) or not os.path.exists(
@@ -319,11 +343,24 @@ class FastPlaid:
             """
             raise FileNotFoundError(error)
 
+        # Convert metadata dictionaries to JSON strings if provided
+        metadata_json_strings = None
+        if documents_metadata is not None:
+            import json
+            if len(documents_metadata) != len(documents_embeddings):
+                error = f"""
+                Number of metadata entries ({len(documents_metadata)}) 
+                doesn't match number of new documents ({len(documents_embeddings)}).
+                """
+                raise ValueError(error)
+            metadata_json_strings = [json.dumps(meta) for meta in documents_metadata]
+
         fast_plaid_rust.update(
             index=self.index,
             torch_path=self.torch_path,
             device=self.devices[0],
             embeddings=documents_embeddings,
+            documents_metadata=metadata_json_strings,
         )
 
         return self
@@ -357,6 +394,7 @@ class FastPlaid:
         n_full_scores: int = 8192,
         n_ivf_probe: int = 8,
         show_progress: bool = True,
+        filter_query: str | None = None,
     ) -> list[list[tuple[int, float]]]:
         """Search the index for the given query embeddings.
 
@@ -374,6 +412,9 @@ class FastPlaid:
             Number of inverted file probes to use.
         show_progress:
             Whether to show progress during the search.
+        filter_query:
+            Optional SQL WHERE clause to filter documents by metadata.
+            Example: "metadata->>'category' = 'science'"
 
         """
         if not self.multiple_gpus and len(self.devices) > 1:
@@ -396,6 +437,7 @@ class FastPlaid:
                     index=self.index,
                     torch_path=self.torch_path,
                     show_progress=step == 0 and show_progress,
+                    filter_query=filter_query,
                 )
                 for step, (device, dev_queries) in enumerate(
                     zip(self.devices, queries_embeddings_splits)
@@ -421,6 +463,7 @@ class FastPlaid:
                 index=self.index,
                 torch_path=self.torch_path,
                 show_progress=True and show_progress,
+                filter_query=filter_query,
             )
 
         queries_embeddings = torch.split(
@@ -440,6 +483,7 @@ class FastPlaid:
                 self.index,
                 self.torch_path,
                 step == 0 and show_progress,
+                filter_query,
             )
             for step, (device, dev_queries) in enumerate(
                 zip(self.devices, queries_embeddings)

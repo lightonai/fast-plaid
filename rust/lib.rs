@@ -134,6 +134,8 @@ fn initialize_torch(_py: Python<'_>, torch_path: String) -> PyResult<()> {
 ///         is a batch of document embeddings.
 ///     centroids (torch.Tensor): A 2D tensor of shape `[num_centroids, embedding_dim]`
 ///         used for vector quantization.
+///     documents_metadata (list[str] | None): Optional list of JSON strings containing
+///         metadata for each document. If provided, must have the same length as embeddings.
 #[pyfunction]
 fn create(
     _py: Python<'_>,
@@ -144,6 +146,7 @@ fn create(
     nbits: i64,
     embeddings: Vec<PyTensor>,
     centroids: PyTensor,
+    documents_metadata: Option<Vec<String>>,
 ) -> PyResult<()> {
     call_torch(torch_path)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
@@ -156,7 +159,20 @@ fn create(
         .map(|tensor| tensor.to_device(device).to_kind(Kind::Half))
         .collect();
 
-    create_index(&embeddings, &index, embedding_dim, nbits, device, centroids)
+    // Parse metadata JSON strings if provided
+    let parsed_metadata = if let Some(metadata_strings) = documents_metadata {
+        let mut parsed = Vec::new();
+        for (i, json_str) in metadata_strings.iter().enumerate() {
+            let metadata_value: serde_json::Value = serde_json::from_str(json_str)
+                .map_err(|e| PyRuntimeError::new_err(format!("Failed to parse metadata for document {}: {}", i, e)))?;
+            parsed.push(metadata_value);
+        }
+        Some(parsed)
+    } else {
+        None
+    };
+
+    create_index(&embeddings, &index, embedding_dim, nbits, device, centroids, parsed_metadata)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to create index: {}", e)))
 }
 
@@ -172,6 +188,8 @@ fn create(
 ///     device (str): The compute device to use (e.g., "cpu", "cuda:0").
 ///     embeddings (list[torch.Tensor]): A list of 2D tensors containing the
 ///         new document embeddings to add to the index.
+///     documents_metadata (list[str] | None): Optional list of JSON strings containing
+///         metadata for each new document. If provided, must have the same length as embeddings.
 #[pyfunction]
 fn update(
     _py: Python<'_>,
@@ -179,6 +197,7 @@ fn update(
     torch_path: String,
     device: String,
     embeddings: Vec<PyTensor>,
+    documents_metadata: Option<Vec<String>>,
 ) -> PyResult<()> {
     call_torch(torch_path)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
@@ -190,7 +209,20 @@ fn update(
         .map(|tensor| tensor.to_device(device).to_kind(Kind::Half))
         .collect();
 
-    update_index(&embeddings, &index, device)
+    // Parse metadata JSON strings if provided
+    let parsed_metadata = if let Some(metadata_strings) = documents_metadata {
+        let mut parsed = Vec::new();
+        for (i, json_str) in metadata_strings.iter().enumerate() {
+            let metadata_value: serde_json::Value = serde_json::from_str(json_str)
+                .map_err(|e| PyRuntimeError::new_err(format!("Failed to parse metadata for document {}: {}", i, e)))?;
+            parsed.push(metadata_value);
+        }
+        Some(parsed)
+    } else {
+        None
+    };
+
+    update_index(&embeddings, &index, device, parsed_metadata)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to update index: {}", e)))
 }
 
@@ -238,6 +270,7 @@ fn load_and_search(
         search_parameters,
         device,
         show_progress,
+        &index,
     )
     .map_err(anyhow_to_pyerr)?;
 

@@ -18,6 +18,15 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Prepare pyproject.toml
+        shell: bash
+        run: |
+          echo "Deleting existing pyproject.toml (if any)..."
+          rm -f pyproject.toml
+          echo "Renaming ci.toml to pyproject.toml..."
+          mv ci.toml pyproject.toml
+          echo "File preparation complete."
+
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:

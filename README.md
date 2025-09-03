@@ -132,6 +132,50 @@ The **`.update()` method**, designed for efficiency, **does not re-compute these
 
 &nbsp;
 
+## 🔎 Filtering
+
+You can restrict your search to a specific subset of documents by using the `subset` parameter in the `.search()` method. This is useful for implementing metadata filtering or searching within a pre-defined collection.
+
+The `subset` parameter accepts a list of IDs. These IDs correspond directly to the order of insertion, starting from 0. For example, if you index 100 documents with `.create()`, they will have IDs `0` through `99`. If you then add `50` more documents with `.update()`, they will be assigned the subsequent IDs `100` through `149`.
+
+You can provide a single list of IDs to apply the same filter to all queries, or a list of lists to specify a different filter for each query.
+
+```python
+import torch
+from fast_plaid import search
+
+
+fast_plaid = search.FastPlaid(index="index") # Load an existing index
+
+# Apply a single filter to all queries
+# Search for the top 5 results only within documents [2, 5, 10, 15, 18]
+scores = fast_plaid.search(
+    queries_embeddings=torch.randn(2, 50, 128), # 2 queries
+    top_k=5,
+    subset=[2, 5, 10, 15, 18]
+)
+
+print(scores)
+
+# Apply a different filter for each query
+# Query 1: search within documents [0, 1, 2, 3, 4]
+# Query 2: search within documents [10, 11, 12, 13, 14]
+scores = fast_plaid.search(
+    queries_embeddings=torch.randn(2, 50, 128), # 2 queries
+    top_k=5,
+    subset=[
+        [0, 1, 2, 3, 4],
+        [10, 11, 12, 13, 14]
+    ]
+)
+
+print(scores)
+```
+
+Providing a `subset` filter can significantly speed up the search process, especially when the subset is much smaller than the total number of indexed documents.
+
+&nbsp;
+
 ## 📊 Benchmarks
 
 FastPlaid significantly outperforms the original PLAID engine across various datasets, delivering comparable accuracy with faster indexing and query speeds.
@@ -165,6 +209,26 @@ webis-touche2020 382545 PLAID         0.25             128.11                   
 ```
 
 _All benchmarks were performed on an H100 GPU. It's important to note that PLAID relies on Just-In-Time (JIT) compilation. This means the very first execution can exhibit longer runtimes. To ensure our performance analysis is representative, we've excluded these initial JIT-affected runs from the reported results. In contrast, FastPlaid does not employ JIT compilation, so its performance on the first run is directly indicative of its typical execution speed._
+
+&nbsp;
+
+## ⚖️ Settings Trade-offs
+
+### Indexing
+
+```python
+Parameter         Default     Speed                        Accuracy                     Description
+nbits             4           lower  = faster              lower  = less precise        product quantization bits
+kmeans_niters     4           higher = slower indexing     higher = better clusters     K-means iterations
+```
+
+### Search
+
+```python
+Parameter         Default     Speed               Accuracy                    Description
+n_ivf_probe       8           higher = slower     higher = better recall      cluster probes per query
+n_full_scores     4096        higher = slower     higher = better ranking     candidates for full scoring
+```
 
 &nbsp;
 
@@ -264,8 +328,8 @@ nbits: int = 4 (optional)
 n_samples_kmeans: int | None = None (optional)
     The number of samples to use for K-means clustering.
     If `None`, it defaults to a value based on the number of documents.
-    This parameter can be adjusted to balance between speed, memory usage and 
-    clustering quality. If you have a large dataset, you might want to set this to a 
+    This parameter can be adjusted to balance between speed, memory usage and
+    clustering quality. If you have a large dataset, you might want to set this to a
     smaller value to speed up the indexing process and save some memory.
 ```
 
@@ -297,9 +361,10 @@ The **`search` method** lets you query the created index with your query embeddi
         queries_embeddings: torch.Tensor,
         top_k: int = 10,
         batch_size: int = 1 << 18,
-        n_full_scores: int = 8192,
+        n_full_scores: int = 4096,
         n_ivf_probe: int = 8,
         show_progress: bool = True,
+        subset: list[list[int]] | list[int] | None = None,
     ) -> list[list[tuple[int, float]]]:
 ```
 
@@ -315,7 +380,7 @@ batch_size: int = 1 << 18 (optional)
     The internal batch size used for processing queries.
     A larger batch size might improve throughput on powerful GPUs but can consume more memory.
 
-n_full_scores: int = 8192 (optional)
+n_full_scores: int = 4096 (optional)
     The number of candidate documents for which full (re-ranked) scores are computed.
     This is a crucial parameter for accuracy; higher values lead to more accurate results but increase computation.
 
@@ -326,6 +391,13 @@ n_ivf_probe: int = 8 (optional)
 
 show_progress: bool = True (optional)
     If set to `True`, a progress bar will be displayed during the search operation.
+
+subset: list[list[int]] | list[int] | None = None (optional)
+    An optional list of lists of integers or a single list of integers. If provided, the search
+    for each query will be restricted to the document IDs in the corresponding inner list.
+    - If a single list is provided, the same filter will be applied to all queries.
+    - If a list of lists is provided, each inner list corresponds to the filter for each query.
+    - Document IDs correspond to the order of insertion, starting from 0.
 ```
 
 ## Contributing

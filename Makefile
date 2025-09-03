@@ -5,12 +5,12 @@ lint:
 
 install:
 	cargo clean
-	uv pip install torch==2.7.0
+	uv pip install torch==2.8.0
 	uv run pip install -e ".[dev]"
 
 test:
 	cargo clean
-	uv run benchmark/benchmark.py
+	uv run tests/test.py
 
 evaluate:
 	uv run benchmark/launch.py

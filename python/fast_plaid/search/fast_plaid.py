@@ -137,6 +137,7 @@ def search_on_device(  # noqa: PLR0913
     index: str,
     torch_path: str,
     show_progress: bool,
+    subset: list[list[int]] | None = None,
 ) -> list[list[tuple[int, float]]]:
     """Perform a search on a single specified device.
 
@@ -160,6 +161,8 @@ def search_on_device(  # noqa: PLR0913
         Path to the PyTorch shared library.
     show_progress:
         Whether to show progress during the search.
+    subset:
+        An optional list of lists to restrict the search space for each query.
 
     """
     search_params_obj = fast_plaid_rust.SearchParameters(
@@ -176,6 +179,7 @@ def search_on_device(  # noqa: PLR0913
         queries_embeddings=queries_embeddings,
         search_parameters=search_params_obj,
         show_progress=show_progress,
+        subset=subset,
     )
 
     return [
@@ -349,14 +353,15 @@ class FastPlaid:
             except OSError as e:
                 raise e
 
-    def search(  # noqa: PLR0913
+    def search(  # noqa: PLR0913, C901
         self,
         queries_embeddings: torch.Tensor,
         top_k: int = 10,
         batch_size: int = 1 << 18,
-        n_full_scores: int = 8192,
+        n_full_scores: int = 4096,
         n_ivf_probe: int = 8,
         show_progress: bool = True,
+        subset: list[list[int]] | list[int] | None = None,
     ) -> list[list[tuple[int, float]]]:
         """Search the index for the given query embeddings.
 
@@ -374,16 +379,47 @@ class FastPlaid:
             Number of inverted file probes to use.
         show_progress:
             Whether to show progress during the search.
+        subset:
+            An optional list of lists of integers. If provided, the search
+            for each query will be restricted to the document IDs in the
+            corresponding inner list.
 
         """
+        num_queries = queries_embeddings.shape[0]
+
+        if subset is not None:
+            if isinstance(subset, int):
+                subset = [subset] * num_queries
+
+            if isinstance(subset, list) and len(subset) == 0:
+                subset = None
+
+            if isinstance(subset, list) and isinstance(subset[0], int):
+                subset = [subset] * num_queries
+
+        if subset is not None and len(subset) != num_queries:
+            error = """
+            The length of the subset must match the number of queries. You can
+            provide either a single subset for all queries or a list of subsets
+            with the same length as the number of queries.
+            """
+            raise ValueError(error)
+
         if not self.multiple_gpus and len(self.devices) > 1:
+            split_size = (num_queries // len(self.devices)) + 1
             queries_embeddings_splits = torch.split(
                 tensor=queries_embeddings,
-                split_size_or_sections=(
-                    queries_embeddings.shape[0] // len(self.devices)
-                )
-                + 1,
+                split_size_or_sections=split_size,
             )
+
+            subset_splits: list[list[list[int]] | None] = [None] * len(
+                queries_embeddings_splits
+            )
+            if subset is not None:
+                subset_splits = [
+                    subset[i * split_size : (i + 1) * split_size]
+                    for i in range(len(queries_embeddings_splits))
+                ]
 
             tasks = [
                 delayed(function=search_on_device)(
@@ -396,9 +432,10 @@ class FastPlaid:
                     index=self.index,
                     torch_path=self.torch_path,
                     show_progress=step == 0 and show_progress,
+                    subset=dev_subset,
                 )
-                for step, (device, dev_queries) in enumerate(
-                    zip(self.devices, queries_embeddings_splits)
+                for step, (device, dev_queries, dev_subset) in enumerate(
+                    zip(self.devices, queries_embeddings_splits, subset_splits)
                 )
             ]
 
@@ -421,13 +458,21 @@ class FastPlaid:
                 index=self.index,
                 torch_path=self.torch_path,
                 show_progress=True and show_progress,
+                subset=subset,
             )
 
-        queries_embeddings = torch.split(
+        split_size = (num_queries // len(self.devices)) + 1
+        queries_embeddings_splits = torch.split(
             tensor=queries_embeddings,
-            split_size_or_sections=(queries_embeddings.shape[0] // len(self.devices))
-            + 1,
+            split_size_or_sections=split_size,
         )
+
+        subset_splits = [None] * len(queries_embeddings_splits)
+        if subset is not None:
+            subset_splits = [
+                subset[i * split_size : (i + 1) * split_size]
+                for i in range(len(queries_embeddings_splits))
+            ]
 
         args_for_starmap = [
             (
@@ -440,9 +485,10 @@ class FastPlaid:
                 self.index,
                 self.torch_path,
                 step == 0 and show_progress,
+                dev_subset,
             )
-            for step, (device, dev_queries) in enumerate(
-                zip(self.devices, queries_embeddings)
+            for step, (device, dev_queries, dev_subset) in enumerate(
+                zip(self.devices, queries_embeddings_splits, subset_splits)
             )
         ]
 

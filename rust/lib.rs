@@ -208,6 +208,8 @@ fn update(
 ///         shape `[num_queries, embedding_dim]`.
 ///     search_parameters (SearchParameters): A configuration object specifying
 ///         search behavior, such as `k` and `nprobe`.
+///     subset (list[list[int]], optional): A list where each inner list contains
+///         the document IDs to restrict the search to for the corresponding query.
 ///
 /// Returns:
 ///     list[QueryResult]: A list of result objects, each containing the
@@ -221,6 +223,7 @@ fn load_and_search(
     queries_embeddings: PyTensor,
     search_parameters: &SearchParameters,
     show_progress: bool,
+    subset: Option<Vec<Vec<i64>>>,
 ) -> PyResult<Vec<QueryResult>> {
     call_torch(torch_path)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
@@ -238,6 +241,7 @@ fn load_and_search(
         search_parameters,
         device,
         show_progress,
+        subset,
     )
     .map_err(anyhow_to_pyerr)?;
 
@@ -260,7 +264,7 @@ fn python_module(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Add functions to the Python module.
     m.add_function(wrap_pyfunction!(initialize_torch, m)?)?;
     m.add_function(wrap_pyfunction!(create, m)?)?;
-    m.add_function(wrap_pyfunction!(update, m)?)?; // <-- Added update function
+    m.add_function(wrap_pyfunction!(update, m)?)?;
     m.add_function(wrap_pyfunction!(load_and_search, m)?)?;
 
     Ok(())

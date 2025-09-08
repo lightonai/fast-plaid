@@ -153,6 +153,7 @@ impl SearchParameters {
 /// * `index` - The `LoadedIndex` containing all necessary index components.
 /// * `params` - `SearchParameters` for search configuration.
 /// * `device` - The `tch::Device` for computation.
+/// * `subset` - An optional list of document ID lists to restrict the search for each query.
 ///
 /// # Returns
 ///
@@ -164,6 +165,7 @@ pub fn search_index(
     params: &SearchParameters,
     device: Device,
     show_progress: bool,
+    subset: Option<Vec<Vec<i64>>>,
 ) -> Result<Vec<QueryResult>> {
     let [num_queries, _, query_dim] = queries.size()[..] else {
         bail!(
@@ -174,6 +176,14 @@ pub fn search_index(
 
     let search_closure = |idx| {
         let query_embedding = queries.i(idx).to(device);
+
+        // Handle the per-query subset list
+        let query_subset = subset.as_ref().and_then(|s| s.get(idx as usize));
+        let subset_tensor = query_subset.map(|ids| {
+            Tensor::from_slice(ids)
+                .to_device(device)
+                .to_kind(Kind::Int64)
+        });
 
         let (passage_ids, scores) = search(
             &query_embedding,
@@ -188,6 +198,7 @@ pub fn search_index(
             index.nbits,
             params.top_k,
             device,
+            subset_tensor.as_ref(),
         )
         .unwrap_or_default();
 
@@ -248,6 +259,53 @@ pub fn colbert_score_reduce(token_scores: &Tensor, attention_mask: &Tensor) -> T
     max_scores_per_token.sum_dim_intlist(-1, false, Kind::Float)
 }
 
+/// Intersects two tensors of integer IDs, returning a new tensor with the common elements.
+///
+/// This function implements an efficient intersection algorithm for tensors on a `tch` device.
+/// It works by concatenating the two input tensors, sorting the result, and then identifying
+/// adjacent duplicate elements, which correspond to the elements present in both original tensors.
+///
+/// # Preconditions
+///
+/// * The `pids` tensor must be sorted and contain unique elements.
+///
+/// # Arguments
+///
+/// * `pids` - A 1D tensor of passage IDs, assumed to be sorted and unique.
+/// * `subset` - A 1D tensor of passage IDs to intersect with `pids`. This tensor does not
+///   need to be sorted or unique, as this function will handle it.
+/// * `device` - The `tch::Device` on which to create an empty tensor if the result is empty.
+///
+/// # Returns
+///
+/// A new 1D `Tensor` containing only the elements that are present in both `pids` and `subset`,
+/// sorted in ascending order.
+fn filter_pids_with_subset(pids: &Tensor, subset: &Tensor, device: Device) -> Tensor {
+    if subset.numel() == 0 || pids.numel() == 0 {
+        return Tensor::empty(&[0], (Kind::Int64, device));
+    }
+
+    let (sorted_subset, _) = subset.sort(0, false);
+    let (unique_sorted_subset, _, _) = sorted_subset.unique_consecutive(false, false, 0);
+
+    let concatenated = Tensor::cat(&[pids, &unique_sorted_subset], 0);
+
+    let (sorted_cat, _) = concatenated.sort(0, false);
+    let size = sorted_cat.size()[0];
+
+    if size < 2 {
+        return Tensor::empty(&[0], (Kind::Int64, device));
+    }
+
+    let duplicates_mask = sorted_cat
+        .narrow(0, 0, size - 1)
+        .eq_tensor(&sorted_cat.narrow(0, 1, size - 1));
+
+    sorted_cat
+        .narrow(0, 1, size - 1)
+        .masked_select(&duplicates_mask)
+}
+
 /// Performs a multi-stage search for a query against a quantized document index.
 ///
 /// This function implements a multi-step search process common in efficient vector retrieval systems:
@@ -269,6 +327,7 @@ pub fn colbert_score_reduce(token_scores: &Tensor, attention_mask: &Tensor) -> T
 /// * `nbits_param` - The number of bits used in the quantization codec.
 /// * `top_k` - The final number of top results to return.
 /// * `device` - The `tch::Device` (e.g., `Device::Cuda(0)`) on which to perform computations.
+/// * `subset` - An optional tensor of document IDs to restrict the search to.
 ///
 /// # Returns
 /// A `Result` containing a tuple of two vectors: the top `k` passage IDs (`Vec<i64>`) and their
@@ -290,6 +349,7 @@ pub fn search(
     nbits_param: i64,
     top_k: usize,
     device: Device,
+    subset: Option<&Tensor>,
 ) -> anyhow::Result<(Vec<i64>, Vec<f32>)> {
     let (pids, scores) = tch::no_grad(|| {
         let query_embeddings_unsqueezed = query_embeddings.unsqueeze(0);
@@ -312,8 +372,13 @@ pub fn search(
         let (retrieved_passage_ids_ivf, _) =
             ivf_index_strided.lookup(&unique_ivf_cells_to_probe, device);
         let (sorted_passage_ids_ivf, _) = retrieved_passage_ids_ivf.sort(0, false);
-        let (unique_passage_ids_after_ivf, _, _) =
+        let (mut unique_passage_ids_after_ivf, _, _) =
             sorted_passage_ids_ivf.unique_consecutive(false, false, 0);
+
+        if let Some(subset_tensor) = subset {
+            unique_passage_ids_after_ivf =
+                filter_pids_with_subset(&unique_passage_ids_after_ivf, subset_tensor, device);
+        }
 
         if unique_passage_ids_after_ivf.numel() == 0 {
             return Ok((vec![], vec![]));

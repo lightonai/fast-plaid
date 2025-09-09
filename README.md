@@ -38,12 +38,42 @@ Traditional vector search relies on single, fixed-size embeddings (dense vectors
 pip install fast-plaid
 ```
 
-FastPlaid is built with the `torch` version `2.8.0`. To use FastPlaid with a lower version of `torch`, you can build `fast-plaid` from source.
+## PyTorch Compatibility
 
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-pip install git+https://github.com/lightonai/fast-plaid.git
+FastPlaid is available in multiple versions to support different PyTorch versions:
+
+| FastPlaid Version | PyTorch Version | Installation Command |
+|-------------------|-----------------|---------------------|
+| 1.2.0.280         | 2.8.0          | `pip install fast-plaid==1.2.0.280` |
+| 1.2.0.271         | 2.7.1          | `pip install fast-plaid==1.2.0.271` |
+| 1.2.0.270         | 2.8.0          | `pip install fast-plaid==1.2.0.270` |
+| 1.2.0.260         | 2.6.0          | `pip install fast-plaid==1.2.0.260` |
+
+### Adding FastPlaid as a Dependency
+
+You can add FastPlaid to your project dependencies with version ranges to ensure compatibility:
+
+**For requirements.txt:**
 ```
+fast-plaid>=1.2.0.260,<=1.2.0.280
+```
+
+**For pyproject.toml:**
+```toml
+[project]
+dependencies = [
+    "fast-plaid>=1.2.0.260,<=1.2.0.280"
+]
+```
+
+**For setup.py:**
+```python
+install_requires=[
+    "fast-plaid>=1.2.0.260,<=1.2.0.280"
+]
+```
+
+Choose the appropriate version range based on your PyTorch requirements.
 
 &nbsp;
 

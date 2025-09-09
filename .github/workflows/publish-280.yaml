@@ -1,12 +1,9 @@
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
 
 jobs:
   build_wheels:
-    name: Build wheels for Python ${{ matrix.python-version }} on ${{ matrix.os }}
+    name: Build wheels for Python ${{ matrix.python-version }} on ${{ matrix.os }} - v1.2.0.280
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -23,8 +20,8 @@ jobs:
         run: |
           echo "Deleting existing pyproject.toml (if any)..."
           rm -f pyproject.toml
-          echo "Renaming ci.toml to pyproject.toml..."
-          mv ci.toml pyproject.toml
+          echo "Using ci-280.toml as pyproject.toml..."
+          cp ci-280.toml pyproject.toml
           echo "File preparation complete."
 
       - name: Set up Python ${{ matrix.python-version }}
@@ -69,7 +66,7 @@ jobs:
           path: ./wheelhouse/*.whl
 
   publish:
-    name: Publish to PyPI
+    name: Publish v1.2.0.280 to PyPI
     needs: build_wheels
     runs-on: ubuntu-latest
     permissions:

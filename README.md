@@ -218,6 +218,7 @@ _All benchmarks were performed on an H100 GPU. It's important to note that PLAID
 
 ```python
 Parameter         Default     Speed                        Accuracy                     Description
+n_samples_kmeans  None        lower = faster               lower = less precise         Number of samples to compute centroids
 nbits             4           lower  = faster              lower  = less precise        product quantization bits
 kmeans_niters     4           higher = slower indexing     higher = better clusters     K-means iterations
 ```

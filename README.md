@@ -46,7 +46,7 @@ FastPlaid is available in multiple versions to support different PyTorch version
 |-------------------|-----------------|---------------------|
 | 1.2.0.280         | 2.8.0          | `pip install fast-plaid==1.2.0.280` |
 | 1.2.0.271         | 2.7.1          | `pip install fast-plaid==1.2.0.271` |
-| 1.2.0.270         | 2.8.0          | `pip install fast-plaid==1.2.0.270` |
+| 1.2.0.270         | 2.7.0          | `pip install fast-plaid==1.2.0.270` |
 | 1.2.0.260         | 2.6.0          | `pip install fast-plaid==1.2.0.260` |
 
 ### Adding FastPlaid as a Dependency

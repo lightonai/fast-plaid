@@ -92,10 +92,8 @@ def compute_kmeans(  # noqa: PLR0913
         documents_embeddings[pid] for pid in set(sampled_pids)
     ]
 
-    num_partitions = (
-        sum([sample.shape[0] for sample in samples]) / len(samples)
-    ) * len(documents_embeddings)
-
+    total_tokens = sum([sample.shape[0] for sample in samples])
+    num_partitions = (total_tokens / len(samples)) * len(documents_embeddings)
     num_partitions = int(2 ** math.floor(math.log2(16 * math.sqrt(num_partitions))))
 
     tensors = torch.cat(tensors=samples)
@@ -104,7 +102,7 @@ def compute_kmeans(  # noqa: PLR0913
 
     kmeans = FastKMeans(
         d=dim,
-        k=num_partitions,
+        k=min(num_partitions, total_tokens),
         niter=kmeans_niters,
         gpu=device != "cpu",
         verbose=False,
@@ -251,7 +249,7 @@ class FastPlaid:
 
     def create(
         self,
-        documents_embeddings: list[torch.Tensor],
+        documents_embeddings: list[torch.Tensor] | torch.Tensor,
         kmeans_niters: int = 4,
         max_points_per_centroid: int = 256,
         nbits: int = 4,
@@ -274,6 +272,16 @@ class FastPlaid:
             on the number of documents.
 
         """
+        if isinstance(documents_embeddings, torch.Tensor):
+            documents_embeddings = [
+                documents_embeddings[i] for i in range(documents_embeddings.shape[0])
+            ]
+
+        documents_embeddings = [
+            embedding.squeeze(0) if embedding.dim() == 3 else embedding
+            for embedding in documents_embeddings
+        ]
+
         self._prepare_index_directory(index_path=self.index)
 
         dim = documents_embeddings[0].shape[-1]
@@ -301,7 +309,7 @@ class FastPlaid:
 
     def update(
         self,
-        documents_embeddings: list[torch.Tensor],
+        documents_embeddings: list[torch.Tensor] | torch.Tensor,
     ) -> "FastPlaid":
         """Update an existing FastPlaid index with new documents.
 
@@ -314,6 +322,16 @@ class FastPlaid:
             A list of new document embedding tensors to add to the index.
 
         """
+        if isinstance(documents_embeddings, torch.Tensor):
+            documents_embeddings = [
+                documents_embeddings[i] for i in range(documents_embeddings.shape[0])
+            ]
+
+        documents_embeddings = [
+            embedding.squeeze(0) if embedding.dim() == 3 else embedding
+            for embedding in documents_embeddings
+        ]
+
         if not os.path.exists(self.index) or not os.path.exists(
             os.path.join(self.index, "metadata.json")
         ):
@@ -355,7 +373,7 @@ class FastPlaid:
 
     def search(  # noqa: PLR0913, C901
         self,
-        queries_embeddings: torch.Tensor,
+        queries_embeddings: torch.Tensor | list[torch.Tensor],
         top_k: int = 10,
         batch_size: int = 1 << 18,
         n_full_scores: int = 4096,
@@ -385,6 +403,16 @@ class FastPlaid:
             corresponding inner list.
 
         """
+        if isinstance(queries_embeddings, list):
+            queries_embeddings = torch.nn.utils.rnn.pad_sequence(
+                sequences=[
+                    embedding[0] if embedding.dim() == 3 else embedding
+                    for embedding in queries_embeddings
+                ],
+                batch_first=True,
+                padding_value=0.0,
+            )
+
         num_queries = queries_embeddings.shape[0]
 
         if subset is not None:
@@ -395,7 +423,7 @@ class FastPlaid:
                 subset = None
 
             if isinstance(subset, list) and isinstance(subset[0], int):
-                subset = [subset] * num_queries
+                subset = [subset] * num_queries  # type: ignore
 
         if subset is not None and len(subset) != num_queries:
             error = """
@@ -417,7 +445,7 @@ class FastPlaid:
             )
             if subset is not None:
                 subset_splits = [
-                    subset[i * split_size : (i + 1) * split_size]
+                    subset[i * split_size : (i + 1) * split_size]  # type: ignore
                     for i in range(len(queries_embeddings_splits))
                 ]
 
@@ -458,7 +486,7 @@ class FastPlaid:
                 index=self.index,
                 torch_path=self.torch_path,
                 show_progress=True and show_progress,
-                subset=subset,
+                subset=subset,  # type: ignore
             )
 
         split_size = (num_queries // len(self.devices)) + 1
@@ -470,7 +498,7 @@ class FastPlaid:
         subset_splits = [None] * len(queries_embeddings_splits)
         if subset is not None:
             subset_splits = [
-                subset[i * split_size : (i + 1) * split_size]
+                subset[i * split_size : (i + 1) * split_size]  # type: ignore
                 for i in range(len(queries_embeddings_splits))
             ]
 

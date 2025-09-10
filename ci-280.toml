@@ -9,7 +9,7 @@ build-backend = "maturin"
 
 [project]
 name = "fast_plaid"
-version = "1.2.0.280"
+version = "1.2.1.280"
 description = "Fast Plaid."
 authors = [
   { name = "Raphael Sourty, LightOn", email = "raphael.sourty@lighton.ai" },
@@ -37,7 +37,7 @@ dev = [
   "pytest >= 7.4.4",
   "ruff >= 0.1.15",
   "pre-commit >= 3.0.0",
-  "pylate >= 1.2.0",
+  "pylate >= 1.2.1",
   "beir>=2.1.0",
   "ranx>=0.3.20",
 ]

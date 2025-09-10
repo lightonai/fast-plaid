@@ -3,7 +3,7 @@ on:
 
 jobs:
   build_wheels:
-    name: Build wheels for Python ${{ matrix.python-version }} on ${{ matrix.os }} - v1.2.0.280
+    name: Build wheels for Python ${{ matrix.python-version }} on ${{ matrix.os }} - v1.2.1.280
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -66,7 +66,7 @@ jobs:
           path: ./wheelhouse/*.whl
 
   publish:
-    name: Publish v1.2.0.280 to PyPI
+    name: Publish v1.2.1.280 to PyPI
     needs: build_wheels
     runs-on: ubuntu-latest
     permissions:

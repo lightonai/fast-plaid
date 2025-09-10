@@ -42,34 +42,37 @@ pip install fast-plaid
 
 FastPlaid is available in multiple versions to support different PyTorch versions:
 
-| FastPlaid Version | PyTorch Version | Installation Command |
-|-------------------|-----------------|---------------------|
-| 1.2.0.280         | 2.8.0          | `pip install fast-plaid==1.2.0.280` |
-| 1.2.0.271         | 2.7.1          | `pip install fast-plaid==1.2.0.271` |
-| 1.2.0.270         | 2.7.0          | `pip install fast-plaid==1.2.0.270` |
-| 1.2.0.260         | 2.6.0          | `pip install fast-plaid==1.2.0.260` |
+| FastPlaid Version | PyTorch Version | Installation Command                |
+| ----------------- | --------------- | ----------------------------------- |
+| 1.2.1.280         | 2.8.0           | `pip install fast-plaid==1.2.1.280` |
+| 1.2.1.271         | 2.7.1           | `pip install fast-plaid==1.2.1.271` |
+| 1.2.1.270         | 2.7.0           | `pip install fast-plaid==1.2.1.270` |
+| 1.2.1.260         | 2.6.0           | `pip install fast-plaid==1.2.1.260` |
 
 ### Adding FastPlaid as a Dependency
 
 You can add FastPlaid to your project dependencies with version ranges to ensure compatibility:
 
 **For requirements.txt:**
+
 ```
-fast-plaid>=1.2.0.260,<=1.2.0.280
+fast-plaid>=1.2.1.260,<=1.2.1.280
 ```
 
 **For pyproject.toml:**
+
 ```toml
 [project]
 dependencies = [
-    "fast-plaid>=1.2.0.260,<=1.2.0.280"
+    "fast-plaid>=1.2.1.260,<=1.2.1.280"
 ]
 ```
 
 **For setup.py:**
+
 ```python
 install_requires=[
-    "fast-plaid>=1.2.0.260,<=1.2.0.280"
+    "fast-plaid>=1.2.1.260,<=1.2.1.280"
 ]
 ```
 
@@ -330,7 +333,7 @@ The **`create` method** builds the multi-vector index from your document embeddi
 ```python
     def create(
         self,
-        documents_embeddings: list[torch.Tensor],
+        documents_embeddings: list[torch.Tensor] | torch.Tensor,
         kmeans_niters: int = 4,
         max_points_per_centroid: int = 256,
         nbits: int = 4,
@@ -339,9 +342,9 @@ The **`create` method** builds the multi-vector index from your document embeddi
 ```
 
 ```
-documents_embeddings: list[torch.Tensor]
+documents_embeddings: list[torch.Tensor] | torch.Tensor
     A list where each element is a PyTorch tensor representing the multi-vector embedding for a single document.
-    Each document's embedding should have a shape of `(num_tokens, embedding_dimension)`.
+    Each document's embedding should have a shape of `(num_tokens, embedding_dimension)`. Can also be a single tensor of shape `(num_documents, num_tokens, embedding_dimension)`.
 
 kmeans_niters: int = 4 (optional)
     The number of iterations for the K-means algorithm used during index creation.
@@ -371,7 +374,7 @@ The **`update` method** provides an efficient way to add new documents to an exi
 ```python
     def update(
         self,
-        documents_embeddings: list[torch.Tensor],
+        documents_embeddings: list[torch.Tensor] | torch.Tensor,
     ) -> "FastPlaid":
 ```
 
@@ -389,7 +392,7 @@ The **`search` method** lets you query the created index with your query embeddi
 ```python
     def search(
         self,
-        queries_embeddings: torch.Tensor,
+        queries_embeddings: torch.Tensor | list[torch.Tensor],
         top_k: int = 10,
         batch_size: int = 1 << 18,
         n_full_scores: int = 4096,
@@ -400,9 +403,10 @@ The **`search` method** lets you query the created index with your query embeddi
 ```
 
 ```
-queries_embeddings: torch.Tensor
+queries_embeddings: torch.Tensor | list[torch.Tensor]
     A PyTorch tensor representing the multi-vector embeddings of your queries.
     Its shape should be `(num_queries, num_tokens_per_query, embedding_dimension)`.
+    Can also be a list of tensors, each representing a separate query. All tensors in the list must have the same embedding dimension.
 
 top_k: int = 10 (optional)
     The number of top-scoring documents to retrieve for each query.

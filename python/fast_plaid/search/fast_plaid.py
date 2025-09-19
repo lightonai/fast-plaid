@@ -52,7 +52,9 @@ def compute_kmeans(  # noqa: PLR0913
     device: str,
     kmeans_niters: int,
     max_points_per_centroid: int,
+    seed: int,
     n_samples_kmeans: int | None = None,
+    use_triton_kmeans: bool | None = None,
 ) -> torch.Tensor:
     """Compute K-means centroids for document embeddings.
 
@@ -68,9 +70,14 @@ def compute_kmeans(  # noqa: PLR0913
         Number of iterations for the K-means algorithm.
     max_points_per_centroid:
         The maximum number of points per centroid for K-means.
+    seed:
+        Seed for the random number generator used in K-means.
     n_samples_kmeans:
         Number of samples to use for K-means. If None, it will be calculated based on
         the number of documents.
+    use_triton_kmeans:
+        Whether to use the Triton-based K-means implementation. If None, it will be
+        set to True if the device is not "cpu".
 
     """
     num_passages = len(documents_embeddings)
@@ -106,8 +113,9 @@ def compute_kmeans(  # noqa: PLR0913
         niter=kmeans_niters,
         gpu=device != "cpu",
         verbose=False,
-        seed=42,
+        seed=seed,
         max_points_per_centroid=max_points_per_centroid,
+        use_triton=use_triton_kmeans,
     )
 
     kmeans.train(data=tensors.numpy())
@@ -247,13 +255,15 @@ class FastPlaid:
             torch_path=self.torch_path,
         )
 
-    def create(
+    def create(  # noqa: PLR0913
         self,
         documents_embeddings: list[torch.Tensor] | torch.Tensor,
         kmeans_niters: int = 4,
         max_points_per_centroid: int = 256,
         nbits: int = 4,
         n_samples_kmeans: int | None = None,
+        seed: int = 42,
+        use_triton_kmeans: bool | None = None,
     ) -> "FastPlaid":
         """Create and saves the FastPlaid index.
 
@@ -270,6 +280,11 @@ class FastPlaid:
         n_samples_kmeans:
             Number of samples to use for K-means. If None, it will be calculated based
             on the number of documents.
+        seed:
+            Optional seed for the random number generator used in index creation.
+        use_triton_kmeans:
+            Whether to use the Triton-based K-means implementation. If None, it will be
+            set to True if the device is not "cpu".
 
         """
         if isinstance(documents_embeddings, torch.Tensor):
@@ -293,6 +308,8 @@ class FastPlaid:
             device=self.devices[0],
             max_points_per_centroid=max_points_per_centroid,
             n_samples_kmeans=n_samples_kmeans,
+            seed=seed,
+            use_triton_kmeans=use_triton_kmeans,
         )
 
         fast_plaid_rust.create(
@@ -303,6 +320,7 @@ class FastPlaid:
             nbits=nbits,
             embeddings=documents_embeddings,
             centroids=centroids,
+            seed=seed,
         )
 
         return self

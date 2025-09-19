@@ -1,5 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use rand::prelude::SliceRandom;
+use rand::rngs::StdRng;
+use rand::{RngCore, SeedableRng};
 use regex::Regex;
 use serde::Serialize;
 use serde_json;
@@ -175,6 +177,7 @@ pub fn packbits(res: &Tensor) -> Tensor {
 /// * `nbits` - The number of bits to use for residual quantization.
 /// * `device` - The `tch::Device` (e.g., CPU or CUDA) on which to perform computations.
 /// * `centroids` - The initial centroids for the quantization codec.
+/// * `seed` - An optional seed for the random number generator.
 ///
 /// # Returns
 ///
@@ -187,6 +190,7 @@ pub fn create_index(
     nbits: i64,
     device: Device,
     centroids: Tensor,
+    seed: Option<u64>,
 ) -> Result<()> {
     let _grad_guard = tch::no_grad_guard();
 
@@ -198,9 +202,14 @@ pub fn create_index(
     let sample_k_float = 16.0 * (120.0 * n_passages as f64).sqrt();
     let k = (1.0 + sample_k_float).min(n_passages as f64) as usize;
 
-    let mut rng = rand::rng();
+    let mut rng = if let Some(seed_value) = seed {
+        Box::new(StdRng::seed_from_u64(seed_value)) as Box<dyn RngCore>
+    } else {
+        Box::new(rand::rng()) as Box<dyn RngCore>
+    };
+
     let mut passage_indices: Vec<u32> = (0..n_passages as u32).collect();
-    passage_indices.shuffle(&mut rng);
+    passage_indices.shuffle(&mut *rng);
     let sample_pids: Vec<u32> = passage_indices.into_iter().take(k).collect();
 
     let mut sample_tensors_vec: Vec<&Tensor> = Vec::with_capacity(k);

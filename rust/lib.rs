@@ -134,6 +134,7 @@ fn initialize_torch(_py: Python<'_>, torch_path: String) -> PyResult<()> {
 ///         is a batch of document embeddings.
 ///     centroids (torch.Tensor): A 2D tensor of shape `[num_centroids, embedding_dim]`
 ///         used for vector quantization.
+///     seed (int, optional): Optional seed for the random number generator.
 #[pyfunction]
 fn create(
     _py: Python<'_>,
@@ -144,6 +145,7 @@ fn create(
     nbits: i64,
     embeddings: Vec<PyTensor>,
     centroids: PyTensor,
+    seed: Option<u64>,
 ) -> PyResult<()> {
     call_torch(torch_path)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
@@ -156,7 +158,7 @@ fn create(
         .map(|tensor| tensor.to_device(device).to_kind(Kind::Half))
         .collect();
 
-    create_index(&embeddings, &index, embedding_dim, nbits, device, centroids)
+    create_index(&embeddings, &index, embedding_dim, nbits, device, centroids, seed)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to create index: {}", e)))
 }
 

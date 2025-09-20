@@ -3,13 +3,13 @@ on:
 
 jobs:
   build_wheels:
-    name: Build wheels for Python ${{ matrix.python-version }} on ${{ matrix.os }} - 280
+    name: Build wheels for Python ${{ matrix.python-version }} on ${{ matrix.os }} - 271
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest]
-        python-version: ["3.12"]
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
 
     steps:
       - name: Checkout code

@@ -345,6 +345,8 @@ The **`create` method** builds the multi-vector index from your document embeddi
         max_points_per_centroid: int = 256,
         nbits: int = 4,
         n_samples_kmeans: int | None = None,
+        seed: int = 42,
+        use_triton_kmeans: bool | None = None,
     ) -> "FastPlaid":
 ```
 
@@ -372,6 +374,16 @@ n_samples_kmeans: int | None = None (optional)
     This parameter can be adjusted to balance between speed, memory usage and
     clustering quality. If you have a large dataset, you might want to set this to a
     smaller value to speed up the indexing process and save some memory.
+
+seed: int = 42 (optional)
+    Seed for the random number generator used in index creation.
+    Setting this ensures reproducible results across multiple runs.
+
+use_triton_kmeans: bool | None = None (optional)
+    Whether to use the Triton-based K-means implementation.
+    If `None`, it will be set to True if the device is not "cpu".
+    Triton-based implementation can provide better performance on GPUs.
+    Set to False to ensure perfectly reproducible results across runs.
 ```
 
 ### Updating the Index

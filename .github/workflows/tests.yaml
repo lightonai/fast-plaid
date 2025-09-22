@@ -1,12 +1,10 @@
 name: Tests
 
 on:
-  pull_request:
-    branches:
-      - main
   push:
     branches:
       - main
+      - "**"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -33,7 +31,11 @@ jobs:
           python-version: ${{ matrix.python-version }}
           activate-environment: true
 
-      - name: Run tests
+      - name: Install dependencies and run common tests
         run: |
           uv pip install pytest pytest-cov
           uv run pytest tests/test.py
+
+      - name: Run Ubuntu-specific tests
+        if: matrix.os == 'ubuntu-latest'
+        run: uv run pytest python/fast_plaid/filtering/filtering.py

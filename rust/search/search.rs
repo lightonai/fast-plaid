@@ -91,7 +91,7 @@ pub fn decompress_residuals(
     let norms = decompressed_embeddings
         .norm_scalaropt_dim(2.0, &[-1], true)
         .clamp_min(1e-12);
-        
+
     decompressed_embeddings / norms
 }
 
@@ -310,6 +310,102 @@ fn filter_pids_with_subset(pids: &Tensor, subset: &Tensor, device: Device) -> Te
         .masked_select(&duplicates_mask)
 }
 
+/// Finds the top `n_ivf_probe` centroid indices for each query embedding in a memory-efficient, batched manner.
+///
+/// This function avoids computing the full `[num_centroids, query_length]` score matrix. Instead,
+/// it iterates through the centroids in batches, computes scores for each batch, and iteratively
+/// updates the set of top-k scores and indices.
+///
+/// # Arguments
+///
+/// * `centroids` - The IVF centroids tensor of shape `[num_centroids, emb_dim]`.
+/// * `query_embeddings` - The query embeddings tensor of shape `[query_length, emb_dim]`.
+/// * `n_ivf_probe` - The number of IVF cells to select per query embedding.
+/// * `batch_size` - The number of centroids to process in each batch.
+/// * `device` - The `tch::Device` for computation.
+///
+/// # Returns
+///
+/// A tensor of shape `[query_length, n_ivf_probe]` containing the indices of the top IVF cells for each query token.
+fn find_top_ivf_cells_batched(
+    centroids: &Tensor,
+    query_embeddings: &Tensor,
+    n_ivf_probe: i64,
+    batch_size: i64,
+    device: Device,
+) -> Tensor {
+    if n_ivf_probe == 1 {
+        // Optimization for n_ivf_probe=1, using argmax which can be more efficient.
+        let mut max_scores = Tensor::full(
+            &[1, query_embeddings.size()[0]],
+            f64::NEG_INFINITY,
+            (Kind::Float, device),
+        );
+        let mut top_indices =
+            Tensor::zeros(&[1, query_embeddings.size()[0]], (Kind::Int64, device));
+        let query_embeddings_t = query_embeddings.transpose(0, 1);
+
+        // --- FIX APPLIED HERE ---
+        for (i, chunk) in centroids.split(batch_size, 0).into_iter().enumerate() {
+            let chunk_start_index = i as i64 * batch_size;
+            let scores = chunk.matmul(&query_embeddings_t); // [chunk_size, query_len]
+            let (chunk_max_scores, chunk_relative_indices) = scores.max_dim(0, true);
+
+            let improved_mask = chunk_max_scores.gt_tensor(&max_scores);
+            let chunk_global_indices = chunk_relative_indices + chunk_start_index;
+
+            top_indices =
+                top_indices.where_self(&improved_mask.logical_not(), &chunk_global_indices);
+            max_scores = max_scores.where_self(&improved_mask.logical_not(), &chunk_max_scores);
+        }
+        return top_indices.permute(&[1, 0]);
+    }
+
+    // Streaming top-k for n_ivf_probe > 1
+    let query_len = query_embeddings.size()[0];
+    let query_embeddings_t = query_embeddings.transpose(0, 1);
+
+    // Initialize tensors to hold the best scores and indices found so far.
+    let mut top_scores = Tensor::full(
+        &[n_ivf_probe, query_len],
+        f64::NEG_INFINITY,
+        (Kind::Float, device),
+    );
+    let mut top_indices = Tensor::zeros(&[n_ivf_probe, query_len], (Kind::Int64, device));
+
+    // --- FIX APPLIED HERE ---
+    for (i, chunk) in centroids.split(batch_size, 0).into_iter().enumerate() {
+        let chunk_start_index = i as i64 * batch_size;
+        let chunk_size = chunk.size()[0];
+
+        // Calculate scores for the current batch of centroids.
+        let score_batch = chunk.matmul(&query_embeddings_t);
+
+        // Combine with previous top scores and find the new top-k.
+        let combined_scores = Tensor::cat(&[&top_scores, &score_batch], 0);
+        let (next_top_scores, relative_indices) = combined_scores.topk(n_ivf_probe, 0, true, true);
+
+        // Create a tensor of global indices for the current batch.
+        let batch_indices = Tensor::arange_start(
+            chunk_start_index,
+            chunk_start_index + chunk_size,
+            (Kind::Int64, device),
+        )
+        .unsqueeze(-1)
+        .expand(&[chunk_size, query_len], true);
+
+        let combined_indices = Tensor::cat(&[&top_indices, &batch_indices], 0);
+
+        // Gather the global indices corresponding to the new top scores.
+        let next_top_indices = combined_indices.gather(0, &relative_indices, false);
+
+        top_scores = next_top_scores;
+        top_indices = next_top_indices;
+    }
+
+    top_indices.permute(&[1, 0])
+}
+
 /// Performs a multi-stage search for a query against a quantized document index.
 ///
 /// This function implements a multi-step search process common in efficient vector retrieval systems:
@@ -358,16 +454,13 @@ pub fn search(
     let (pids, scores) = tch::no_grad(|| {
         let query_embeddings_unsqueezed = query_embeddings.unsqueeze(0);
 
-        let query_centroid_scores = codec.centroids.matmul(&query_embeddings.transpose(0, 1));
-
-        let selected_ivf_cells_indices = if n_ivf_probe == 1 {
-            query_centroid_scores.argmax(0, true).permute(&[1, 0])
-        } else {
-            query_centroid_scores
-                .topk(n_ivf_probe, 0, true, false)
-                .1
-                .permute(&[1, 0])
-        };
+        let selected_ivf_cells_indices = find_top_ivf_cells_batched(
+            &codec.centroids,
+            query_embeddings,
+            n_ivf_probe,
+            batch_size,
+            device,
+        );
 
         let flat_selected_ivf_cells = selected_ivf_cells_indices.flatten(0, -1).contiguous();
         let (unique_ivf_cells_to_probe, _, _) =
@@ -392,6 +485,8 @@ pub fn search(
         let total_pids_for_approx = unique_passage_ids_after_ivf.size()[0];
         let num_approx_batches = (total_pids_for_approx + batch_size - 1) / batch_size;
 
+        let query_embeddings_t = query_embeddings.transpose(0, 1);
+
         for batch_idx in 0..num_approx_batches {
             let batch_start = batch_idx * batch_size;
             let batch_end = ((batch_idx + 1) * batch_size).min(total_pids_for_approx);
@@ -412,8 +507,11 @@ pub fn search(
                 continue;
             }
 
-            let batch_approx_scores =
-                query_centroid_scores.index_select(0, &batch_packed_codes.to_kind(Kind::Int64));
+            let batch_centroids = codec
+                .centroids
+                .index_select(0, &batch_packed_codes.to_kind(Kind::Int64));
+            let batch_approx_scores = batch_centroids.matmul(&query_embeddings_t);
+
             let (padded_approx_scores, mask) =
                 direct_pad_sequences(&batch_approx_scores, &batch_doc_lengths, 0.0, device)?;
             approx_score_chunks.push(colbert_score_reduce(&padded_approx_scores, &mask));

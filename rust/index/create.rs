@@ -92,11 +92,18 @@ pub fn optimize_ivf(
         pid_counter += 1;
     }
 
+    let emb_to_pid_device = if device.is_cuda() {
+        Device::Cpu
+    } else {
+        device
+    };
     let emb_to_pid = Tensor::from_slice(&emb_to_pid_vec)
-        .to_device(device)
+        .to_device(emb_to_pid_device)
         .to_kind(Kind::Int64);
 
-    let pids_in_ivf = emb_to_pid.index_select(0, ivf);
+    let pids_in_ivf = emb_to_pid.index_select(0, &ivf.to_device(emb_to_pid_device));
+    let pids_in_ivf = pids_in_ivf.to_device(device); // Move back to the original device
+
     let mut unique_pids_list: Vec<Tensor> = Vec::new();
     let mut new_ivf_lens_vec: Vec<i64> = Vec::new();
     let ivf_lens_vec: Vec<i64> = Vec::<i64>::try_from(ivf_lens)?;
@@ -414,12 +421,18 @@ pub fn create_index(
     }
 
     let total_num_embs = current_emb_offset;
-    let all_codes = Tensor::zeros(&[total_num_embs as i64], (Kind::Int64, device));
+    let all_codes_device = if device.is_cuda() {
+        Device::Cpu
+    } else {
+        device
+    };
+    let all_codes = Tensor::zeros(&[total_num_embs as i64], (Kind::Int64, all_codes_device));
 
     for chk_idx in 0..n_chunks {
         let chk_offset_global = chk_emb_offsets[chk_idx];
         let codes_fpath_for_global = Path::new(idx_path).join(format!("{}.codes.npy", chk_idx));
-        let codes_from_file = Tensor::read_npy(&codes_fpath_for_global)?.to_device(device);
+        let codes_from_file =
+            Tensor::read_npy(&codes_fpath_for_global)?.to_device(all_codes_device);
         let codes_in_chk_count = codes_from_file.size()[0];
         all_codes
             .narrow(0, chk_offset_global as i64, codes_in_chk_count)
@@ -429,8 +442,16 @@ pub fn create_index(
     let (sorted_codes, sorted_indices) = all_codes.sort(0, false);
     let code_counts = sorted_codes.bincount::<Tensor>(None, est_total_embs);
 
-    let (opt_ivf, opt_ivf_lens) = optimize_ivf(&sorted_indices, &code_counts, idx_path, device)
-        .context("Failed to optimize IVF")?;
+    let sorted_indices_for_ivf = sorted_indices.to_device(device);
+    let code_counts_for_ivf = code_counts.to_device(device);
+
+    let (opt_ivf, opt_ivf_lens) = optimize_ivf(
+        &sorted_indices_for_ivf,
+        &code_counts_for_ivf,
+        idx_path,
+        device,
+    )
+    .context("Failed to optimize IVF")?;
 
     let opt_ivf_fpath = Path::new(idx_path).join("ivf.npy");
     opt_ivf

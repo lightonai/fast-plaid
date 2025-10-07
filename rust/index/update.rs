@@ -168,25 +168,37 @@ pub fn update_index(
     }
 
     let total_num_embs = current_emb_offset;
-    let all_codes = Tensor::zeros(&[total_num_embs as i64], (Kind::Int64, device));
+    let all_codes_device = if device.is_cuda() {
+        Device::Cpu
+    } else {
+        device
+    };
+    let all_codes = Tensor::zeros(&[total_num_embs as i64], (Kind::Int64, all_codes_device));
 
     // Load all codes (old and new) into a single tensor
     for chk_idx in 0..new_total_chunks {
         let chk_offset_global = chk_emb_offsets[chk_idx];
         let codes_fpath = idx_path_obj.join(format!("{}.codes.npy", chk_idx));
-        let codes_from_file = Tensor::read_npy(&codes_fpath)?.to_device(device);
+        let codes_from_file = Tensor::read_npy(&codes_fpath)?.to_device(all_codes_device);
         let codes_in_chk_count = codes_from_file.size()[0];
         all_codes
             .narrow(0, chk_offset_global as i64, codes_in_chk_count)
             .copy_(&codes_from_file);
     }
 
-    // Sort all codes and generate the new, combined IVF
     let (sorted_codes, sorted_indices) = all_codes.sort(0, false);
     let code_counts = sorted_codes.bincount::<Tensor>(None, est_total_embs);
 
-    let (opt_ivf, opt_ivf_lens) = optimize_ivf(&sorted_indices, &code_counts, idx_path, device)
-        .context("Failed to optimize IVF during update")?;
+    let sorted_indices_for_ivf = sorted_indices.to_device(device);
+    let code_counts_for_ivf = code_counts.to_device(device);
+
+    let (opt_ivf, opt_ivf_lens) = optimize_ivf(
+        &sorted_indices_for_ivf,
+        &code_counts_for_ivf,
+        idx_path,
+        device,
+    )
+    .context("Failed to optimize IVF during update")?;
 
     // Overwrite the old IVF files with the new combined ones
     opt_ivf

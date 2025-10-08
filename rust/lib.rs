@@ -155,7 +155,7 @@ fn create(
 
     let embeddings: Vec<_> = embeddings
         .into_iter()
-        .map(|tensor| tensor.to_device(device).to_kind(Kind::Half))
+        .map(|tensor| tensor.to_kind(Kind::Half))
         .collect();
 
     create_index(&embeddings, &index, embedding_dim, nbits, device, centroids, seed)

@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context, Result};
+use indicatif::{ProgressBar, ProgressIterator};
 use rand::prelude::SliceRandom;
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
@@ -192,6 +193,7 @@ pub fn create_index(
     centroids: Tensor,
     seed: Option<u64>,
 ) -> Result<()> {
+    println!("Creating residual codec...");
     let _grad_guard = tch::no_grad_guard();
 
     let n_docs = documents_embeddings.len();
@@ -303,9 +305,12 @@ pub fn create_index(
         .to_device(Device::Cpu)
         .write_npy(&avg_res_fpath)?;
 
+    println!("Finished training codec.\nProcessing embeddings in {} chunks...", n_chunks);
+
     let proc_chunk_sz = 25_000.min(1 + n_passages);
 
-    for chk_idx in 0..n_chunks {
+    let bar = ProgressBar::new(n_chunks.try_into().unwrap());
+    for chk_idx in (0..n_chunks).progress_with(bar) {
         let chk_offset = chk_idx * proc_chunk_sz;
         let chk_end_offset = (chk_offset + proc_chunk_sz).min(n_passages);
 
@@ -378,6 +383,8 @@ pub fn create_index(
         serde_json::to_writer(buf_writer_meta, &chk_meta)?;
     }
 
+    println!("Finished processing all chunks.\nBuilding and optimizing IVF...");
+
     let mut current_emb_offset: usize = 0;
     let mut chk_emb_offsets: Vec<usize> = Vec::new();
 
@@ -441,6 +448,7 @@ pub fn create_index(
     opt_ivf_lens
         .to_device(Device::Cpu)
         .write_npy(&opt_ivf_lens_fpath)?;
+    println!("Finished building and optimizing IVF.");
 
     let final_meta_fpath = Path::new(idx_path).join("metadata.json");
     let final_num_docs = documents_embeddings.len();

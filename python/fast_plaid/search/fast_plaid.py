@@ -301,6 +301,7 @@ class FastPlaid:
 
         dim = documents_embeddings[0].shape[-1]
 
+        print("Computing K-means centroids...")
         centroids = compute_kmeans(
             documents_embeddings=documents_embeddings,
             dim=dim,
@@ -311,6 +312,7 @@ class FastPlaid:
             seed=seed,
             use_triton_kmeans=use_triton_kmeans,
         )
+        print("Finished computing K-means centroids.")
 
         fast_plaid_rust.create(
             index=self.index,

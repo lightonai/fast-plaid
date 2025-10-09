@@ -44,10 +44,10 @@ FastPlaid is available in multiple versions to support different PyTorch version
 
 | FastPlaid Version | PyTorch Version | Installation Command                |
 | ----------------- | --------------- | ----------------------------------- |
-| 1.2.2.280         | 2.8.0           | `pip install fast-plaid==1.2.2.280` |
-| 1.2.2.271         | 2.7.1           | `pip install fast-plaid==1.2.2.271` |
-| 1.2.2.270         | 2.7.0           | `pip install fast-plaid==1.2.2.270` |
-| 1.2.2.260         | 2.6.0           | `pip install fast-plaid==1.2.2.260` |
+| 1.2.4.280         | 2.8.0           | `pip install fast-plaid==1.2.4.280` |
+| 1.2.4.271         | 2.7.1           | `pip install fast-plaid==1.2.4.271` |
+| 1.2.4.270         | 2.7.0           | `pip install fast-plaid==1.2.4.270` |
+| 1.2.4.260         | 2.6.0           | `pip install fast-plaid==1.2.4.260` |
 
 ### Adding FastPlaid as a Dependency
 
@@ -56,7 +56,7 @@ You can add FastPlaid to your project dependencies with version ranges to ensure
 **For requirements.txt:**
 
 ```
-fast-plaid>=1.2.2.260,<=1.2.2.280
+fast-plaid>=1.2.4.260,<=1.2.4.280
 ```
 
 **For pyproject.toml:**
@@ -64,7 +64,7 @@ fast-plaid>=1.2.2.260,<=1.2.2.280
 ```toml
 [project]
 dependencies = [
-    "fast-plaid>=1.2.2.260,<=1.2.2.280"
+    "fast-plaid>=1.2.4.260,<=1.2.4.280"
 ]
 ```
 
@@ -72,7 +72,7 @@ dependencies = [
 
 ```python
 install_requires=[
-    "fast-plaid>=1.2.2.260,<=1.2.2.280"
+    "fast-plaid>=1.2.4.260,<=1.2.4.280"
 ]
 ```
 
@@ -168,7 +168,7 @@ print(scores)
 
 It is highly recommended to create your initial index with a large and representative sample of your data for optimal performance and accuracy. The **`.create()` method** establishes the fundamental structure of the index by calculating centroids that are specifically tailored to the distribution of this initial dataset.
 
-The **`.update()` method**, designed for efficiency, **does not re-compute these centroids**. Instead, it places new documents into the existing structure. If you frequently update the index with large volumes of data that have a different statistical distribution than the original set, you may experience "drift." This means the fixed centroids become less representative of the total collection, potentially leading to sub-optimal data partitioning and a gradual decline in retrieval accuracy over time. Therefore, building a robust initial index is key to its long-term health. If you find that your data distribution changes significantly, consider periodically re-creating the index with a new, representative sample to maintain optimal performance or avoid using the `.update()` method and rely on the **`.create()` method** which will delete the existing index and re-create it from scratch.
+The **`.update()` method**, designed for efficiency, **does not re-compute these centroids**. Instead, it places new documents into the existing structure. If you frequently update the index with large volumes of data that have a different statistical distribution than the original set, you may experience "drift." This means the fixed centroids become less representative of the total collection, potentially leading to sub-optimal data partitioning and a gradual decline in retrieval accuracy over time. Therefore, building a robust initial index is key to its long-term health. If you find that your data distribution changes significantly, consider periodically re-creating the index with a new, representative sample to maintain optimal performance or avoid using the `.update()` method and rely on the **`.create()` method** which will delete the existing index and re-create it from scratch. To update an existing embedding, you should delete it first and then add the new version with the `.update()` method.
 
 &nbsp;
 
@@ -345,6 +345,9 @@ The **`create` method** builds the multi-vector index from your document embeddi
         max_points_per_centroid: int = 256,
         nbits: int = 4,
         n_samples_kmeans: int | None = None,
+        seed: int = 42,
+        use_triton_kmeans: bool | None = None,
+        metadata: list[dict[str, Any]] | None = None,
     ) -> "FastPlaid":
 ```
 
@@ -372,16 +375,33 @@ n_samples_kmeans: int | None = None (optional)
     This parameter can be adjusted to balance between speed, memory usage and
     clustering quality. If you have a large dataset, you might want to set this to a
     smaller value to speed up the indexing process and save some memory.
+
+seed: int = 42 (optional)
+    Seed for the random number generator used in index creation.
+    Setting this ensures reproducible results across multiple runs.
+
+use_triton_kmeans: bool | None = None (optional)
+    Whether to use the Triton-based K-means implementation.
+    If `None`, it will be set to True if the device is not "cpu".
+    Triton-based implementation can provide better performance on GPUs.
+    Set to False to ensure perfectly reproducible results across runs.
+
+metadata: list[dict[str, Any]] | None = None (optional)
+    An optional list of metadata dictionaries corresponding to each document being indexed.
+    Each dictionary can contain arbitrary key-value pairs that you want to associate with the document.
+    If provided, the length of this list must match the number of documents being indexed.
+    The metadata will be stored in a SQLite database within the index directory for filtering during searches.
 ```
 
 ### Updating the Index
 
-The **`update` method** provides an efficient way to add new documents to an existing index without rebuilding it from scratch. This is significantly faster than calling .create() again, as it reuses the existing quantization configuration and only processes the new documents. The centroids and quantization parameters remain unchanged, **this might lead to a slight decrease in accuracy compared to a full re-indexing**.
+The **`update` method** provides an efficient way to add new documents to an existing index without rebuilding it from scratch. This is significantly faster than calling .create() again, as it reuses the existing quantization configuration and only processes the new documents. The centroids and quantization parameters remain unchanged, **this might lead to a slight decrease in accuracy compared to a full re-indexing**. To update an existing embedding, you should delete it first and then add the new version with the `.update()` method.
 
 ```python
     def update(
         self,
         documents_embeddings: list[torch.Tensor] | torch.Tensor,
+        metadata: list[dict[str, Any]] | None = None,
     ) -> "FastPlaid":
 ```
 
@@ -390,6 +410,12 @@ documents_embeddings: list[torch.Tensor]
     A list where each element is a PyTorch tensor representing the multi-vector embedding for a single document.
     Each document's embedding should have a shape of `(num_tokens, embedding_dimension)`.
     This method will add these new embeddings to the existing index.
+
+metadata: list[dict[str, Any]] | None = None
+    An optional list of metadata dictionaries corresponding to each new document being added.
+    Each dictionary can contain arbitrary key-value pairs that you want to associate with the document.
+    If provided, the length of this list must match the number of new documents being added.
+    The metadata will be stored in a SQLite database within the index directory for filtering during searches.
 ```
 
 ### Searching the Index
@@ -442,6 +468,24 @@ subset: list[list[int]] | list[int] | None = None (optional)
     - Document IDs correspond to the order of insertion, starting from 0.
 ```
 
+### Deleting from the Index
+
+The **`delete` method** allows to permanently remove embeddings from the index based on their insertion order IDs. If a metadata database exists, the corresponding entries will also be automatically removed. To update an existing embedding, you should delete it first and then add the new version with the `.update()` method.
+
+```python
+    def delete(
+        self,
+        subset: list[int],
+    ) -> "FastPlaid":
+```
+
+```
+subset: list[int]
+    A list of embeddings IDs to delete from the index. The IDs are based on the original
+    order of insertion, starting from 0. After deletion, the remaining documents are
+    re-indexed to maintain a sequential order.
+```
+
 ## Contributing
 
 Any contributions to FastPlaid are welcome! If you have ideas for improvements, bug fixes, or new features, please open an issue or submit a pull request. We are particularly interested in:
@@ -449,3 +493,69 @@ Any contributions to FastPlaid are welcome! If you have ideas for improvements, 
 - Re-computing centroids when using the `.update()` method to maintain optimal performance.
 - Additional algorithms for multi-vector search.
 - New search outputs formats for better integration with existing systems.
+
+&nbsp;
+
+## 🗂️ Built-in SQLite Filtering
+
+FastPlaid includes a lightweight, optional, built-in metadata filtering engine powered by SQLite. When you provide the metadata parameter during .create() or .update(), FastPlaid automatically stores this information in a searchable database within your index directory.
+
+You can then use the fast_plaid.filtering.where() function to query this database using standard SQL conditions. This function returns a list of embeddings IDs that match your criteria, which you can pass directly to the subset parameter of the .search() method to pre-filter your search.
+
+```python
+from datetime import date
+
+import torch
+from fast_plaid import filtering, search
+
+# 1. Initialize the FastPlaid index
+fast_plaid = search.FastPlaid(index="metadata_index")
+embedding_dim = 128
+
+# 2. Create initial documents with metadata
+initial_embeddings = [torch.randn(10, embedding_dim) for _ in range(3)]
+initial_metadata = [
+    {"name": "Alice", "category": "A", "join_date": date(2023, 5, 17)},
+    {"name": "Bob", "category": "B", "join_date": date(2021, 6, 21)},
+    {"name": "Alex", "category": "A", "join_date": date(2023, 8, 1)},
+]
+
+fast_plaid.create(documents_embeddings=initial_embeddings, metadata=initial_metadata)
+
+# 3. Update the index with new documents and metadata
+new_embeddings = [torch.randn(10, embedding_dim) for _ in range(2)]
+new_metadata = [
+    {"name": "Charlie", "category": "B", "join_date": date(2020, 3, 15)},
+    {
+        "name": "Amanda",
+        "category": "A",
+        "join_date": date(2024, 1, 10),
+        "status": "active",
+    },
+]
+
+fast_plaid.update(documents_embeddings=new_embeddings, metadata=new_metadata)
+
+# 4. Use filtering.where to get the corresponding rows of the FastPlaid index
+# which match the SQL condition
+subset = filtering.where(
+    index="metadata_index",
+    condition="name LIKE ? AND join_date > ?",
+    parameters=("A%", "2022-12-31"),
+)
+
+# 5. Perform a search restricted to the filtered subset
+query_embedding = torch.randn(1, 5, embedding_dim)
+scores = fast_plaid.search(queries_embeddings=query_embedding, top_k=3, subset=subset)
+
+print("Search results within the subset:")
+print(scores)
+
+# 5. Access to the metadata of the retrieved documents
+for match in scores:
+    print("Metadata of matched documents:")
+    print(filtering.get(index="metadata_index", subset=[subset for subset, _ in match]))
+```
+
+You can also rely on the existing subset parameter of the .search() method to filter candidates based
+on the order of insertion or rely on an external filtering system as providing the metadata parameter is optional.

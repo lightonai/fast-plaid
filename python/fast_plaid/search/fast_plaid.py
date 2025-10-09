@@ -4,13 +4,15 @@ import glob
 import math
 import os
 import random
-from typing import Self
+from typing import Any, Self
 
 import torch
 import torch.multiprocessing as mp
 from fast_plaid import fast_plaid_rust
 from fastkmeans import FastKMeans
 from joblib import Parallel, delayed
+
+from ..filtering import create, delete, update
 
 
 class TorchWithCudaNotFoundError(Exception):
@@ -57,30 +59,7 @@ def compute_kmeans(  # noqa: PLR0913
     n_samples_kmeans: int | None = None,
     use_triton_kmeans: bool | None = None,
 ) -> torch.Tensor:
-    """Compute K-means centroids for document embeddings.
-
-    Args:
-    ----
-    documents_embeddings:
-        A list of document embedding tensors.
-    dim:
-        The embedding dimension.
-    device:
-        The device to use for computation (e.g., "cuda:0").
-    kmeans_niters:
-        Number of iterations for the K-means algorithm.
-    max_points_per_centroid:
-        The maximum number of points per centroid for K-means.
-    seed:
-        Seed for the random number generator used in K-means.
-    n_samples_kmeans:
-        Number of samples to use for K-means. If None, it will be calculated based on
-        the number of documents.
-    use_triton_kmeans:
-        Whether to use the Triton-based K-means implementation. If None, it will be
-        set to True if the device is not "cpu".
-
-    """
+    """Compute K-means centroids for document embeddings."""
     num_passages = len(documents_embeddings)
 
     if n_samples_kmeans is None:
@@ -146,32 +125,7 @@ def search_on_device(  # noqa: PLR0913
     show_progress: bool,
     subset: list[list[int]] | None = None,
 ) -> list[list[tuple[int, float]]]:
-    """Perform a search on a single specified device.
-
-    Args:
-    ----
-    device:
-        The device to perform the search on.
-    queries_embeddings:
-        A tensor of query embeddings.
-    batch_size:
-        Internal batch size for the search.
-    n_full_scores:
-        Number of full scores to compute.
-    top_k:
-        Number of top results to return.
-    n_ivf_probe:
-        Number of inverted file probes to use.
-    index:
-        Path to the FastPlaid index.
-    torch_path:
-        Path to the PyTorch shared library.
-    show_progress:
-        Whether to show progress during the search.
-    subset:
-        An optional list of lists to restrict the search space for each query.
-
-    """
+    """Perform a search on a single specified device."""
     search_params_obj = fast_plaid_rust.SearchParameters(
         batch_size=batch_size,
         n_full_scores=n_full_scores,
@@ -265,6 +219,7 @@ class FastPlaid:
         n_samples_kmeans: int | None = None,
         seed: int = 42,
         use_triton_kmeans: bool | None = None,
+        metadata: list[dict[str, Any]] | None = None,
     ) -> "FastPlaid":
         """Create and saves the FastPlaid index.
 
@@ -286,6 +241,8 @@ class FastPlaid:
         use_triton_kmeans:
             Whether to use the Triton-based K-means implementation. If None, it will be
             set to True if the device is not "cpu".
+        metadata:
+            Optional list of dictionaries containing metadata for each document.
 
         """
         if isinstance(documents_embeddings, torch.Tensor):
@@ -297,8 +254,18 @@ class FastPlaid:
             embedding.squeeze(0) if embedding.dim() == 3 else embedding
             for embedding in documents_embeddings
         ]
+        num_docs = len(documents_embeddings)
 
         self._prepare_index_directory(index_path=self.index)
+
+        if metadata is not None:
+            if len(metadata) != num_docs:
+                error = f"""
+                The length of metadata ({len(metadata)}) must match the number of
+                documents_embeddings ({num_docs}).
+                """
+                raise ValueError(error)
+            create(index=self.index, metadata=metadata)
 
         dim = documents_embeddings[0].shape[-1]
 
@@ -331,6 +298,7 @@ class FastPlaid:
     def update(
         self,
         documents_embeddings: list[torch.Tensor] | torch.Tensor,
+        metadata: list[dict[str, Any]] | None = None,
     ) -> "FastPlaid":
         """Update an existing FastPlaid index with new documents.
 
@@ -341,6 +309,8 @@ class FastPlaid:
         ----
         documents_embeddings:
             A list of new document embedding tensors to add to the index.
+        metadata:
+            Optional list of dictionaries containing metadata for each new document.
 
         """
         if isinstance(documents_embeddings, torch.Tensor):
@@ -352,6 +322,7 @@ class FastPlaid:
             embedding.squeeze(0) if embedding.dim() == 3 else embedding
             for embedding in documents_embeddings
         ]
+        num_docs = len(documents_embeddings)
 
         if not os.path.exists(self.index) or not os.path.exists(
             os.path.join(self.index, "metadata.json")
@@ -361,6 +332,18 @@ class FastPlaid:
             Please create an index first using the .create() method.
             """
             raise FileNotFoundError(error)
+
+        if os.path.exists(os.path.join(self.index, "metadata.db")):
+            if metadata is None:
+                metadata = [{} for _ in range(num_docs)]
+
+            if len(metadata) != num_docs:
+                error = f"""
+                The length of metadata ({len(metadata)}) must match the number of
+                documents_embeddings ({num_docs}).
+                """
+                raise ValueError(error)
+            update(index=self.index, metadata=metadata)
 
         fast_plaid_rust.update(
             index=self.index,
@@ -555,6 +538,32 @@ class FastPlaid:
             scores.extend(scores_device)
 
         return scores
+
+    def delete(self, subset: list[int]) -> "FastPlaid":
+        """Delete embeddings from an existing FastPlaid index.
+
+        If a metadata database exists, the corresponding entries will also
+        be deleted.
+
+        Args:
+        ----
+        subset:
+            List of embeddings to delete from the index with respect to
+            the insertion order.
+
+        """
+        fast_plaid_rust.delete(
+            index=self.index,
+            torch_path=self.torch_path,
+            device=self.devices[0],
+            subset=subset,
+        )
+
+        metadata_db_path = os.path.join(self.index, "metadata.db")
+        if os.path.exists(metadata_db_path):
+            delete(index=self.index, subset=subset)
+
+        return self
 
 class FastPlaidIndex:
     """A Python wrapper for the Rust FastPlaidIndex class.

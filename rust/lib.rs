@@ -23,6 +23,7 @@ use winapi::um::libloaderapi::LoadLibraryA;
 use crate::index::create::create_index;
 use crate::index::update::{update_index, update_loaded_index};
 use crate::search::load::LoadedIndex;
+use crate::index::delete::delete_from_index;
 use search::load::load_index;
 use search::search::{search_index, QueryResult, SearchParameters};
 
@@ -258,6 +259,23 @@ fn load_and_search(
     Ok(results)
 }
 
+#[pyfunction]
+fn delete(
+    _py: Python<'_>,
+    index: String,
+    torch_path: String,
+    device: String,
+    subset: Vec<i64>,
+) -> PyResult<()> {
+    call_torch(torch_path)
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
+
+    let device = get_device(&device)?;
+
+    delete_from_index(&subset, &index, device)
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to delete from index: {}", e)))
+}
+
 /// A FastPlaid index that can be loaded once and searched multiple times.
 ///
 /// This class represents a loaded index and provides methods to search it
@@ -456,6 +474,6 @@ fn python_module(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(create, m)?)?;
     m.add_function(wrap_pyfunction!(update, m)?)?;
     m.add_function(wrap_pyfunction!(load_and_search, m)?)?;
-
+    m.add_function(wrap_pyfunction!(delete, m)?)?;
     Ok(())
 }

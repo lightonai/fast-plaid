@@ -1,8 +1,8 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use indicatif::{ProgressBar, ProgressIterator};
 use pyo3::prelude::*;
 use serde::Serialize;
-use tch::{Device, IndexOp, Kind, Tensor};
+use tch::{Device, Kind, Tensor};
 
 use crate::search::load::LoadedIndex;
 use crate::search::padding::direct_pad_sequences;
@@ -153,7 +153,7 @@ impl SearchParameters {
 ///
 /// # Arguments
 ///
-/// * `queries` - A 3D tensor of query embeddings with shape `[num_queries, tokens_per_query, dim]`.
+/// * `queries` - A vector of tensors, where each tensor represents the embeddings for a single query.
 /// * `index` - The `LoadedIndex` containing all necessary index components.
 /// * `params` - `SearchParameters` for search configuration.
 /// * `device` - The `tch::Device` for computation.
@@ -164,25 +164,27 @@ impl SearchParameters {
 /// A `Result` with a `Vec<QueryResult>`. Individual search failures result in an empty
 /// `QueryResult` for that specific query, ensuring the operation doesn't halt.
 pub fn search_index(
-    queries: &Tensor,
+    queries: &Vec<Tensor>,
     index: &LoadedIndex,
     params: &SearchParameters,
     device: Device,
     show_progress: bool,
     subset: Option<Vec<Vec<i64>>>,
 ) -> Result<Vec<QueryResult>> {
-    let [num_queries, _, query_dim] = queries.size()[..] else {
-        bail!(
-            "Expected a 3D tensor for queries, but got shape {:?}",
-            queries.size()
-        );
-    };
+    let num_queries = queries.len();
+    
+    if num_queries == 0 {
+        return Ok(vec![]);
+    }
 
-    let search_closure = |idx| {
-        let query_embedding = queries.i(idx).to(device);
+    // Get query dimension from the first query tensor
+    let query_dim = queries[0].size()[queries[0].dim() - 1];
+
+    let search_closure = |idx: usize| {
+        let query_embedding = &queries[idx].to(device);
 
         // Handle the per-query subset list
-        let query_subset = subset.as_ref().and_then(|s| s.get(idx as usize));
+        let query_subset = subset.as_ref().and_then(|s| s.get(idx));
         let subset_tensor = query_subset.map(|ids| {
             Tensor::from_slice(ids)
                 .to_device(device)
@@ -190,7 +192,7 @@ pub fn search_index(
         });
 
         let (passage_ids, scores) = search(
-            &query_embedding,
+            query_embedding,
             &index.ivf_index_strided,
             &index.codec,
             query_dim,
@@ -207,7 +209,7 @@ pub fn search_index(
         .unwrap_or_default();
 
         QueryResult {
-            query_id: idx as usize,
+            query_id: idx,
             passage_ids,
             scores,
         }
@@ -341,7 +343,7 @@ fn filter_pids_with_subset(pids: &Tensor, subset: &Tensor, device: Device) -> Te
 /// This function returns an error if tensor operations fail, if tensor dimensions are mismatched,
 /// or if the provided `codec` is missing components required for full decompression.
 pub fn search(
-    query_embeddings: &Tensor,
+    query_embedding: &Tensor,
     ivf_index_strided: &StridedTensor,
     codec: &ResidualCodec,
     emb_dim: i64,
@@ -356,9 +358,9 @@ pub fn search(
     subset: Option<&Tensor>,
 ) -> anyhow::Result<(Vec<i64>, Vec<f32>)> {
     let (pids, scores) = tch::no_grad(|| {
-        let query_embeddings_unsqueezed = query_embeddings.unsqueeze(0);
+        let query_embedding_unsqueezed = query_embedding.unsqueeze(0);
 
-        let query_centroid_scores = codec.centroids.matmul(&query_embeddings.transpose(0, 1));
+        let query_centroid_scores = codec.centroids.matmul(&query_embedding.transpose(0, 1));
 
         let selected_ivf_cells_indices = if n_ivf_probe == 1 {
             query_centroid_scores.argmax(0, true).permute(&[1, 0])
@@ -482,7 +484,7 @@ pub fn search(
 
         let (padded_doc_embs, mask) =
             direct_pad_sequences(&decompressed_embs, &final_doc_lengths, 0.0, device)?;
-        let final_scores = padded_doc_embs.matmul(&query_embeddings_unsqueezed.transpose(-2, -1));
+        let final_scores = padded_doc_embs.matmul(&query_embedding_unsqueezed.transpose(-2, -1));
         let reduced_scores = colbert_score_reduce(&final_scores, &mask);
 
         let (sorted_scores, sorted_indices) = reduced_scores.sort(0, true);

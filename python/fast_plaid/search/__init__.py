@@ -1,3 +1,3 @@
-from .fast_plaid import FastPlaid
+from .fast_plaid import FastPlaid, FastPlaidIndex
 
-__all__ = ["FastPlaid"]
+__all__ = ["FastPlaid", "FastPlaidIndex"]

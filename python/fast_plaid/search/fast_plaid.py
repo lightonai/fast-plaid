@@ -4,6 +4,7 @@ import glob
 import math
 import os
 import random
+from typing import Self
 
 import torch
 import torch.multiprocessing as mp
@@ -554,3 +555,311 @@ class FastPlaid:
             scores.extend(scores_device)
 
         return scores
+
+class FastPlaidIndex:
+    """A Python wrapper for the Rust FastPlaidIndex class.
+    
+    This class provides a clean Python interface for creating, loading, updating,
+    and searching FastPlaid indexes using the underlying Rust implementation.
+    
+    Args:
+    ----
+    rust_index:
+        The underlying Rust FastPlaidIndex instance.
+    torch_path:
+        Path to the PyTorch shared library.
+    device:
+        The device used by the index.
+    
+    """
+
+    def __init__(
+        self,
+        rust_index: fast_plaid_rust.FastPlaidIndex,
+        torch_path: str,
+        device: str,
+    ) -> None:
+        self._rust_index = rust_index
+        self._torch_path = torch_path
+        self._device = device
+
+    @classmethod
+    def create(  # noqa: PLR0913
+        cls,
+        index_path: str,
+        documents_embeddings: list[torch.Tensor] | torch.Tensor,
+        embedding_dim: int,
+        nbits: int = 4,
+        device: str | None = None,
+        kmeans_niters: int = 4,
+        max_points_per_centroid: int = 256,
+        n_samples_kmeans: int | None = None,
+        seed: int | None = None,
+        use_triton_kmeans: bool | None = None,
+    ) -> "FastPlaidIndex":
+        """Create a new FastPlaid index.
+
+        Args:
+        ----
+        index_path:
+            The directory path where the new index will be saved.
+        documents_embeddings:
+            A list of document embedding tensors to be indexed, or a single tensor.
+        embedding_dim:
+            The dimensionality of the embeddings.
+        nbits:
+            Number of bits to use for residual quantization (default is 4).
+        device:
+            The compute device to use (e.g., "cpu", "cuda:0"). If None, defaults to "cuda" if available.
+        kmeans_niters:
+            Number of iterations for the K-means algorithm.
+        max_points_per_centroid:
+            The maximum number of points per centroid for K-means.
+        n_samples_kmeans:
+            Number of samples to use for K-means. If None, calculated automatically.
+        seed:
+            Optional seed for the random number generator.
+        use_triton_kmeans:
+            Whether to use the Triton-based K-means implementation.
+
+        Returns:
+        -------
+        FastPlaidIndex:
+            A new FastPlaidIndex instance ready for searching.
+
+        """
+        # Set default device
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # Convert single tensor to list
+        if isinstance(documents_embeddings, torch.Tensor):
+            documents_embeddings = [
+                documents_embeddings[i] for i in range(documents_embeddings.shape[0])
+            ]
+
+        # Ensure embeddings are properly formatted
+        documents_embeddings = [
+            embedding.squeeze(0) if embedding.dim() == 3 else embedding
+            for embedding in documents_embeddings
+        ]
+
+        # Prepare index directory
+        FastPlaid._prepare_index_directory(index_path=index_path)
+
+        # Get torch path
+        torch_path = _load_torch_path(device=device)
+
+        # Compute K-means centroids
+        print("Computing K-means centroids...")
+        centroids = compute_kmeans(
+            documents_embeddings=documents_embeddings,
+            dim=embedding_dim,
+            kmeans_niters=kmeans_niters,
+            device=device,
+            max_points_per_centroid=max_points_per_centroid,
+            n_samples_kmeans=n_samples_kmeans,
+            seed=seed or 42,
+            use_triton_kmeans=use_triton_kmeans,
+        )
+        print("Finished computing K-means centroids.")
+
+        # Create the Rust index
+        rust_index = fast_plaid_rust.FastPlaidIndex.create(
+            index_path=index_path,
+            torch_path=torch_path,
+            device=device,
+            embedding_dim=embedding_dim,
+            nbits=nbits,
+            embeddings=documents_embeddings,
+            centroids=centroids,
+            seed=seed,
+        )
+
+        return cls(rust_index=rust_index, torch_path=torch_path, device=device)
+
+    @classmethod
+    def load(
+        cls,
+        index_path: str,
+        device: str | None = None,
+    ) -> "FastPlaidIndex":
+        """Load an existing FastPlaid index from disk.
+
+        Args:
+        ----
+        index_path:
+            Path to the directory containing the pre-built index.
+        device:
+            The compute device to use (e.g., "cpu", "cuda:0"). If None, defaults to "cuda" if available.
+
+        Returns:
+        -------
+        FastPlaidIndex:
+            A loaded FastPlaidIndex instance ready for searching.
+
+        """
+        # Set default device
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # Get torch path
+        torch_path = _load_torch_path(device=device)
+
+        # Load the Rust index
+        rust_index = fast_plaid_rust.FastPlaidIndex.load(
+            index_path=index_path,
+            torch_path=torch_path,
+            device=device,
+        )
+
+        return cls(rust_index=rust_index, torch_path=torch_path, device=device)
+
+    def update(
+        self,
+        documents_embeddings: list[torch.Tensor] | torch.Tensor,
+    ) -> Self:
+        """Update the index with new document embeddings.
+
+        This method updates the current index in-place without creating a new instance.
+        The index is updated both in memory and on disk using the stored index path.
+
+        Args:
+        ----
+        documents_embeddings:
+            A list of new document embedding tensors to add to the index, or a single tensor.
+
+        """
+        # Convert single tensor to list
+        if isinstance(documents_embeddings, torch.Tensor):
+            documents_embeddings = [
+                documents_embeddings[i] for i in range(documents_embeddings.shape[0])
+            ]
+
+        # Ensure embeddings are properly formatted
+        documents_embeddings = [
+            embedding.squeeze(0) if embedding.dim() == 3 else embedding
+            for embedding in documents_embeddings
+        ]
+
+        # Update the Rust index using the instance method (modifies in-place)
+        # The index_path is now stored as an attribute in the Rust struct
+        self._rust_index.update(
+            embeddings=documents_embeddings,
+        )
+        return self
+
+    def search(  # noqa: PLR0913
+        self,
+        queries_embeddings: torch.Tensor | list[torch.Tensor],
+        top_k: int = 10,
+        batch_size: int = 1 << 18,
+        n_full_scores: int = 4096,
+        n_ivf_probe: int = 8,
+        show_progress: bool = True,
+        subset: list[list[int]] | list[int] | None = None,
+    ) -> list[list[tuple[int, float]]]:
+        """Search the index for the given query embeddings.
+
+        Args:
+        ----
+        queries_embeddings:
+            Embeddings of the queries to search for. Can be a tensor or list of tensors.
+        top_k:
+            Number of top results to return.
+        batch_size:
+            Internal batch size for the search.
+        n_full_scores:
+            Number of full scores to compute for re-ranking.
+        n_ivf_probe:
+            Number of inverted file probes to use.
+        show_progress:
+            Whether to show progress during the search.
+        subset:
+            An optional list of lists of integers. If provided, the search
+            for each query will be restricted to the document IDs in the
+            corresponding inner list.
+
+        Returns:
+        -------
+        list[list[tuple[int, float]]]:
+            A list of search results, where each inner list contains tuples
+            of (document_id, score) for each query.
+
+        """
+        # Convert tensor to list of tensors if needed
+        if isinstance(queries_embeddings, torch.Tensor):
+            if queries_embeddings.dim() == 3:
+                # Batch of queries: [num_queries, seq_len, dim]
+                queries_list = [queries_embeddings[i] for i in range(queries_embeddings.shape[0])]
+            elif queries_embeddings.dim() == 2:
+                # Single query: [seq_len, dim]
+                queries_list = [queries_embeddings]
+            else:
+                raise ValueError(f"Expected 2D or 3D tensor, got {queries_embeddings.dim()}D")
+        else:
+            # Already a list of tensors
+            queries_list = queries_embeddings
+
+        # Ensure proper formatting
+        queries_list = [
+            query.squeeze(0) if query.dim() == 3 else query
+            for query in queries_list
+        ]
+
+        num_queries = len(queries_list)
+
+        # Handle subset formatting
+        if subset is not None:
+            if isinstance(subset, int):
+                subset = [subset] * num_queries
+            elif isinstance(subset, list) and len(subset) > 0 and isinstance(subset[0], int):
+                subset = [subset] * num_queries  # type: ignore
+
+            if len(subset) != num_queries:
+                raise ValueError(
+                    f"The length of the subset ({len(subset)}) must match the number of queries ({num_queries})"
+                )
+
+        # Create search parameters
+        search_params = fast_plaid_rust.SearchParameters(
+            batch_size=batch_size,
+            n_full_scores=n_full_scores,
+            top_k=top_k,
+            n_ivf_probe=n_ivf_probe,
+        )
+
+        # Perform the search using the Rust implementation
+        results = self._rust_index.search(
+            queries_embeddings=queries_list,
+            search_parameters=search_params,
+            show_progress=show_progress,
+            subset=subset,
+        )
+
+        # Convert results to the expected format
+        formatted_results = [
+            [
+                (passage_id, score)
+                for passage_id, score in zip(result.passage_ids, result.scores)
+            ]
+            for result in results
+        ]
+
+        return formatted_results
+
+    @property
+    def device(self) -> str:
+        """Get the device used by the index."""
+        return self._device
+
+    @property
+    def torch_path(self) -> str:
+        """Get the torch library path used by the index."""
+        return self._torch_path
+
+    @property
+    def index_path(self) -> str:
+        """Get the directory path of the index."""
+        return self._rust_index.index_path
+

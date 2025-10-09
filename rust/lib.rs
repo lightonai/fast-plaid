@@ -21,7 +21,8 @@ use winapi::um::libloaderapi::LoadLibraryA;
 
 // Internal module imports.
 use crate::index::create::create_index;
-use crate::index::update::update_index;
+use crate::index::update::{update_index, update_loaded_index};
+use crate::search::load::LoadedIndex;
 use search::load::load_index;
 use search::search::{search_index, QueryResult, SearchParameters};
 
@@ -234,11 +235,18 @@ fn load_and_search(
         .to_device(Device::Cpu)
         .to_kind(Kind::Half);
 
+    let num_queries = query_tensor.size()[0];
+    let mut query_list = Vec::with_capacity(num_queries as usize);
+    
+    for i in 0..num_queries {
+        query_list.push(query_tensor.get(i));
+    }
+
     let device = get_device(&device)?;
     let loaded_index = load_index(&index, device).map_err(anyhow_to_pyerr)?;
 
     let results = search_index(
-        &query_tensor,
+        &query_list,
         &loaded_index,
         search_parameters,
         device,
@@ -248,6 +256,185 @@ fn load_and_search(
     .map_err(anyhow_to_pyerr)?;
 
     Ok(results)
+}
+
+/// A FastPlaid index that can be loaded once and searched multiple times.
+///
+/// This class represents a loaded index and provides methods to search it
+/// efficiently. The index is loaded once and can be searched multiple times
+/// without reloading, making it ideal for serving multiple queries.
+#[pyclass(unsendable)]
+pub struct FastPlaidIndex {
+    loaded_index: LoadedIndex,
+    device: Device,
+    index_path: String,
+}
+
+#[pymethods]
+impl FastPlaidIndex {
+    /// Creates a new FastPlaid index and saves it to disk.
+    ///
+    /// This function processes document embeddings, clusters them using the provided
+    /// centroids, calculates quantization residuals, and serializes the complete
+    /// index structure to the specified directory.
+    ///
+    /// Args:
+    ///     index_path (str): The directory path where the new index will be saved.
+    ///     torch_path (str): Path to the Torch shared library (e.g., `libtorch.so`).
+    ///     device (str): The compute device to use for index creation (e.g., "cpu", "cuda:0").
+    ///     embedding_dim (int): The dimensionality of the embeddings.
+    ///     nbits (int): The number of bits to use for residual quantization.
+    ///     embeddings (list[torch.Tensor]): A list of 2D tensors, where each tensor
+    ///         is a batch of document embeddings.
+    ///     centroids (torch.Tensor): A 2D tensor of shape `[num_centroids, embedding_dim]`
+    ///         used for vector quantization.
+    ///     seed (int, optional): Optional seed for the random number generator.
+    ///
+    /// Returns:
+    ///     FastPlaidIndex: A new index object that is ready for searching.
+    #[staticmethod]
+    fn create(
+        _py: Python<'_>,
+        index_path: String,
+        torch_path: String,
+        device: String,
+        embedding_dim: i64,
+        nbits: i64,
+        embeddings: Vec<PyTensor>,
+        centroids: PyTensor,
+        seed: Option<u64>,
+    ) -> PyResult<Self> {
+        call_torch(torch_path.clone())
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
+
+        let device = get_device(&device)?;
+        let centroids = centroids.to_device(device).to_kind(Kind::Half);
+
+        let embeddings: Vec<_> = embeddings
+            .into_iter()
+            .map(|tensor| tensor.to_device(device).to_kind(Kind::Half))
+            .collect();
+
+        // Create the index
+        create_index(&embeddings, &index_path, embedding_dim, nbits, device, centroids, seed)
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to create index: {}", e)))?;
+
+        // Load the newly created index
+        let loaded_index = load_index(&index_path, device).map_err(anyhow_to_pyerr)?;
+
+        Ok(FastPlaidIndex {
+            loaded_index,
+            device,
+            index_path,
+        })
+    }
+
+    /// Creates a new FastPlaidIndex by loading from disk.
+    ///
+    /// Args:
+    ///     index_path (str): Path to the directory containing the pre-built index.
+    ///     torch_path (str): Path to the Torch shared library (e.g., `libtorch.so`).
+    ///     device (str): The compute device for the search (e.g., "cpu", "cuda:0").
+    ///
+    /// Returns:
+    ///     Index: A loaded index ready for searching.
+    #[staticmethod]
+    fn load(
+        _py: Python<'_>,
+        index_path: String,
+        torch_path: String,
+        device: String,
+    ) -> PyResult<Self> {
+        call_torch(torch_path)
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
+
+        let device = get_device(&device)?;
+        let loaded_index = load_index(&index_path, device).map_err(anyhow_to_pyerr)?;
+
+        Ok(FastPlaidIndex {
+            loaded_index,
+            device,
+            index_path,
+        })
+    }
+
+    /// Updates the loaded index with new document embeddings.
+    ///
+    /// This method adds new documents to the existing index without needing to
+    /// reload it from disk. The index is updated both in memory and on disk.
+    ///
+    /// Args:
+    ///     embeddings (list[torch.Tensor]): A list of 2D tensors containing the
+    ///         new document embeddings to add to the index.
+    fn update(
+        &mut self,
+        _py: Python<'_>,
+        embeddings: Vec<PyTensor>,
+    ) -> PyResult<()> {
+        let embeddings: Vec<_> = embeddings
+            .into_iter()
+            .map(|tensor| tensor.to_device(self.device).to_kind(Kind::Half))
+            .collect();
+
+        update_loaded_index(
+            &mut self.loaded_index,
+            &embeddings,
+            &self.index_path,
+            self.device,
+        )
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to update loaded index: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Searches the loaded index with the given query embeddings.
+    ///
+    /// Args:
+    ///     queries_embeddings (list[torch.Tensor]): A list of tensors, where each tensor
+    ///         represents the embeddings for a single query.
+    ///     search_parameters (SearchParameters): A configuration object specifying
+    ///         search behavior, such as `k` and `nprobe`.
+    ///     show_progress (bool): Whether to show a progress bar during search.
+    ///     subset (list[list[int]], optional): A list where each inner list contains
+    ///         the document IDs to restrict the search to for the corresponding query.
+    ///
+    /// Returns:
+    ///     list[QueryResult]: A list of result objects, each containing the
+    ///     `doc_id` and `score` for a retrieved document.
+    fn search(
+        &self,
+        _py: Python<'_>,
+        queries_embeddings: Vec<PyTensor>,
+        search_parameters: &SearchParameters,
+        show_progress: bool,
+        subset: Option<Vec<Vec<i64>>>,
+    ) -> PyResult<Vec<QueryResult>> {
+        let query_tensors: Vec<_> = queries_embeddings
+            .into_iter()
+            .map(|tensor| tensor.to_device(Device::Cpu).to_kind(Kind::Half))
+            .collect();
+
+        let results = search_index(
+            &query_tensors,
+            &self.loaded_index,
+            search_parameters,
+            self.device,
+            show_progress,
+            subset,
+        )
+        .map_err(anyhow_to_pyerr)?;
+
+        Ok(results)
+    }
+
+    /// Gets the index path.
+    ///
+    /// Returns:
+    ///     str: The directory path of the index.
+    #[getter]
+    fn index_path(&self) -> String {
+        self.index_path.clone()
+    }
 }
 
 /// A high-performance document retrieval toolkit using a ColBERT-style late
@@ -262,6 +449,7 @@ fn python_module(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Add data classes required for the Python interface.
     m.add_class::<SearchParameters>()?;
     m.add_class::<QueryResult>()?;
+    m.add_class::<FastPlaidIndex>()?;
 
     // Add functions to the Python module.
     m.add_function(wrap_pyfunction!(initialize_torch, m)?)?;

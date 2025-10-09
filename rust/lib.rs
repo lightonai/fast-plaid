@@ -23,7 +23,7 @@ use winapi::um::libloaderapi::LoadLibraryA;
 use crate::index::create::create_index;
 use crate::index::update::{update_index, update_loaded_index};
 use crate::search::load::LoadedIndex;
-use crate::index::delete::delete_from_index;
+use crate::index::delete::{delete_from_index, delete_from_loaded_index};
 use search::load::load_index;
 use search::search::{search_index, QueryResult, SearchParameters};
 
@@ -401,6 +401,29 @@ impl FastPlaidIndex {
             self.device,
         )
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to update loaded index: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Deletes documents from the loaded index.
+    ///
+    /// This method removes specified documents from the existing index without needing to
+    /// reload it from disk. The index is updated both in memory and on disk.
+    ///
+    /// Args:
+    ///     subset (list[int]): A list of document IDs to be removed from the index.
+    fn delete(
+        &mut self,
+        _py: Python<'_>,
+        subset: Vec<i64>,
+    ) -> PyResult<()> {
+        delete_from_loaded_index(
+            &mut self.loaded_index,
+            &subset,
+            &self.index_path,
+            self.device,
+        )
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to delete from loaded index: {}", e)))?;
 
         Ok(())
     }

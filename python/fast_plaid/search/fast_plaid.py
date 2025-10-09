@@ -758,6 +758,26 @@ class FastPlaidIndex:
         )
         return self
 
+    def delete(self, subset: list[int]) -> Self:
+        """Delete documents from the index.
+
+        This method removes specified documents from the index in-place without creating 
+        a new instance. The index is updated both in memory and on disk using the stored 
+        index path.
+
+        Args:
+        ----
+        subset:
+            A list of document IDs to be removed from the index.
+
+        """
+        # Delete from the Rust index using the instance method (modifies in-place)
+        # The index_path is now stored as an attribute in the Rust struct
+        self._rust_index.delete(
+            subset=subset,
+        )
+        return self
+
     def search(  # noqa: PLR0913
         self,
         queries_embeddings: torch.Tensor | list[torch.Tensor],

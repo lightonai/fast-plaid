@@ -3,13 +3,13 @@ requires = [
   "maturin >= 1.8.6",
   "numpy >= 1.26.4",
   "setuptools >= 78.1.1",
-  "torch >= 2.6.0, <= 2.7.0",
+  "torch == 2.6.0",
 ]
 build-backend = "maturin"
 
 [project]
 name = "fast_plaid"
-version = "1.2.4.260"
+version = "1.2.5.260"
 description = "Fast Plaid."
 authors = [
   { name = "Raphael Sourty, LightOn", email = "raphael.sourty@lighton.ai" },

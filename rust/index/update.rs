@@ -34,6 +34,7 @@ pub fn update_index(
     documents_embeddings: &Vec<Tensor>,
     idx_path: &str,
     device: Device,
+    batch_size: i64,
 ) -> Result<()> {
     let _grad_guard = tch::no_grad_guard();
 
@@ -93,12 +94,12 @@ pub fn update_index(
         let mut chk_codes_list: Vec<Tensor> = Vec::new();
         let mut chk_res_list: Vec<Tensor> = Vec::new();
 
-        for emb_batch in chk_embs_tensor.split(1 << 18, 0) {
-            let code_batch = compress_into_codes(&emb_batch, &codec.centroids);
+        for emb_batch in chk_embs_tensor.split(batch_size, 0) {
+            let code_batch = compress_into_codes(&emb_batch, &codec.centroids, batch_size);
             chk_codes_list.push(code_batch.shallow_clone());
 
             let mut recon_centroids_batches: Vec<Tensor> = Vec::new();
-            for sub_code_batch in code_batch.split(1 << 20, 0) {
+            for sub_code_batch in code_batch.split(batch_size, 0) {
                 recon_centroids_batches.push(codec.centroids.index_select(0, &sub_code_batch));
             }
             let recon_centroids = Tensor::cat(&recon_centroids_batches, 0);

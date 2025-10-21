@@ -44,10 +44,10 @@ FastPlaid is available in multiple versions to support different PyTorch version
 
 | FastPlaid Version | PyTorch Version | Installation Command                |
 | ----------------- | --------------- | ----------------------------------- |
-| 1.2.4.280         | 2.8.0           | `pip install fast-plaid==1.2.4.280` |
-| 1.2.4.271         | 2.7.1           | `pip install fast-plaid==1.2.4.271` |
-| 1.2.4.270         | 2.7.0           | `pip install fast-plaid==1.2.4.270` |
-| 1.2.4.260         | 2.6.0           | `pip install fast-plaid==1.2.4.260` |
+| 1.2.5.280         | 2.8.0           | `pip install fast-plaid==1.2.5.280` |
+| 1.2.5.271         | 2.7.1           | `pip install fast-plaid==1.2.5.271` |
+| 1.2.5.270         | 2.7.0           | `pip install fast-plaid==1.2.5.270` |
+| 1.2.5.260         | 2.6.0           | `pip install fast-plaid==1.2.5.260` |
 
 ### Adding FastPlaid as a Dependency
 
@@ -56,7 +56,7 @@ You can add FastPlaid to your project dependencies with version ranges to ensure
 **For requirements.txt:**
 
 ```
-fast-plaid>=1.2.4.260,<=1.2.4.280
+fast-plaid>=1.2.5.260,<=1.2.5.280
 ```
 
 **For pyproject.toml:**
@@ -64,7 +64,7 @@ fast-plaid>=1.2.4.260,<=1.2.4.280
 ```toml
 [project]
 dependencies = [
-    "fast-plaid>=1.2.4.260,<=1.2.4.280"
+    "fast-plaid>=1.2.5.260,<=1.2.5.280"
 ]
 ```
 
@@ -72,7 +72,7 @@ dependencies = [
 
 ```python
 install_requires=[
-    "fast-plaid>=1.2.4.260,<=1.2.4.280"
+    "fast-plaid>=1.2.5.260,<=1.2.5.280"
 ]
 ```
 
@@ -316,6 +316,7 @@ class FastPlaid:
         self,
         index: str,
         device: str | list[str] | None = None,
+        preload_index: bool = True,
     ) -> None:
 ```
 
@@ -331,6 +332,11 @@ device: str | list[str] | None = None
     - Can be a list of device strings (e.g., ["cuda:0", "cuda:1"]).
     - If multiple GPUs are specified and available, multiprocessing is automatically set up for parallel execution.
       Remember to include your code within an `if __name__ == "__main__":` block for proper multiprocessing behavior.
+
+preload_index: bool = True (optional)
+    If `True`, the index will be loaded into memory upon initialization. This can
+    speed up the first search operation by "warming up" the index. If `False`,
+    the index will be loaded when doing the search and unloaded afterward.
 ```
 
 ### Creating an Index
@@ -345,6 +351,7 @@ The **`create` method** builds the multi-vector index from your document embeddi
         max_points_per_centroid: int = 256,
         nbits: int = 4,
         n_samples_kmeans: int | None = None,
+        batch_size: int = 25_000,
         seed: int = 42,
         use_triton_kmeans: bool | None = None,
         metadata: list[dict[str, Any]] | None = None,
@@ -376,6 +383,9 @@ n_samples_kmeans: int | None = None (optional)
     clustering quality. If you have a large dataset, you might want to set this to a
     smaller value to speed up the indexing process and save some memory.
 
+batch_size: int = 25_000 (optional)
+    Batch size for processing embeddings during index creation.
+
 seed: int = 42 (optional)
     Seed for the random number generator used in index creation.
     Setting this ensures reproducible results across multiple runs.
@@ -402,6 +412,7 @@ The **`update` method** provides an efficient way to add new documents to an exi
         self,
         documents_embeddings: list[torch.Tensor] | torch.Tensor,
         metadata: list[dict[str, Any]] | None = None,
+        batch_size: int = 25_000,
     ) -> "FastPlaid":
 ```
 
@@ -416,6 +427,9 @@ metadata: list[dict[str, Any]] | None = None
     Each dictionary can contain arbitrary key-value pairs that you want to associate with the document.
     If provided, the length of this list must match the number of new documents being added.
     The metadata will be stored in a SQLite database within the index directory for filtering during searches.
+
+batch_size: int = 25_000 (optional)
+    Batch size for processing embeddings during the update.
 ```
 
 ### Searching the Index
@@ -427,7 +441,7 @@ The **`search` method** lets you query the created index with your query embeddi
         self,
         queries_embeddings: torch.Tensor | list[torch.Tensor],
         top_k: int = 10,
-        batch_size: int = 1 << 18,
+        batch_size: int = 25_000,
         n_full_scores: int = 4096,
         n_ivf_probe: int = 8,
         show_progress: bool = True,
@@ -444,7 +458,7 @@ queries_embeddings: torch.Tensor | list[torch.Tensor]
 top_k: int = 10 (optional)
     The number of top-scoring documents to retrieve for each query.
 
-batch_size: int = 1 << 18 (optional)
+batch_size: int = 25_000 (optional)
     The internal batch size used for processing queries.
     A larger batch size might improve throughput on powerful GPUs but can consume more memory.
 

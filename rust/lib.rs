@@ -11,7 +11,9 @@ use pyo3_tch::PyTensor;
 use tch::{Device, Kind};
 
 // Standard library imports.
+use std::collections::HashMap;
 use std::ffi::CString;
+use std::sync::{Arc, RwLock};
 
 // Conditional imports for cross-platform dynamic library loading.
 #[cfg(windows)]
@@ -21,24 +23,38 @@ use winapi::um::libloaderapi::LoadLibraryA;
 
 // Internal module imports.
 use crate::index::create::create_index;
-use crate::index::update::update_index;
 use crate::index::delete::delete_from_index;
-use search::load::load_index;
-use search::search::{search_index, QueryResult, SearchParameters};
+use crate::index::update::update_index;
+use search::load::{load_index, LoadedIndex};
+use search::search::{search_many, QueryResult, SearchParameters};
 
-/// Converts a Rust `anyhow::Error` into a Python-compatible `PyErr`.
-///
-/// This utility function acts as a bridge between Rust's flexible `anyhow` error
-/// handling and the error types expected by the PyO3 framework.
+use once_cell::sync::Lazy;
+
+static INDEX_CACHE: Lazy<RwLock<HashMap<(String, String), Arc<LoadedIndex>>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+/// Converts an `anyhow::Error` into a Python `PyValueError`.
 fn anyhow_to_pyerr(err: anyhow::Error) -> PyErr {
     PyValueError::new_err(err.to_string())
 }
 
-/// Dynamically loads the native Torch shared library (e.g., `libtorch.so` or `torch.dll`).
+/// Dynamically loads the native Torch shared library (libtorch).
 ///
-/// This is a workaround to ensure Torch's symbols are available in memory,
-/// which can prevent linking errors when `tch-rs` is used within a
-/// Python extension module.
+/// This function is necessary to ensure that the `tch` crate can find and
+/// link to the PyTorch library at runtime, especially when distributed
+/// via Python packages where the exact path isn't known at compile time.
+///
+/// It uses `dlopen` on Unix-like systems and `LoadLibraryA` on Windows.
+///
+/// # Arguments
+///
+/// * `torch_path` - The absolute path to the `libtorch` shared library
+///   (e.g., `libtorch.so`, `libtorch.dylib`, or `torch.dll`).
+///
+/// # Errors
+///
+/// Returns an `anyhow::Error` if the library fails to load, providing
+/// details from `dlerror` (Unix) or `GetLastError` (Windows).
 fn call_torch(torch_path: String) -> Result<(), anyhow::Error> {
     let torch_path_cstr = CString::new(torch_path.clone())
         .map_err(|e| anyhow!("Failed to create CString for libtorch path: {}", e))?;
@@ -77,14 +93,24 @@ fn call_torch(torch_path: String) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// Parses a string identifier into a `tch::Device`.
+/// Parses a Python-style device string into a `tch::Device`.
 ///
-/// Supports simple device strings like "cpu", "cuda", and indexed CUDA devices
-/// such as "cuda:0".
+/// # Arguments
+///
+/// * `device` - A string slice representing the device, e.g., "cpu", "cuda", "cuda:0".
+///
+/// # Returns
+///
+/// A `PyResult` containing the corresponding `tch::Device` if successful.
+///
+/// # Errors
+///
+/// Returns a `PyValueError` if the device string is unsupported or invalid
+/// (e.g., "cuda:foo" or "tpu").
 fn get_device(device: &str) -> Result<Device, PyErr> {
     match device.to_lowercase().as_str() {
         "cpu" => Ok(Device::Cpu),
-        "cuda" => Ok(Device::Cuda(0)), // Default to the first CUDA device.
+        "cuda" => Ok(Device::Cuda(0)),
         s if s.starts_with("cuda:") => {
             let parts: Vec<&str> = s.split(':').collect();
             if parts.len() == 2 {
@@ -104,38 +130,98 @@ fn get_device(device: &str) -> Result<Device, PyErr> {
     }
 }
 
-/// Pre-loads the native Torch library from a specified path.
+/// Retrieves a loaded index from the global cache or loads it if not present.
 ///
-/// Call this function once at the start of a Python script if you encounter
-/// linking issues with the Torch library, which can occur in complex deployment
-/// environments.
+/// This function uses a `RwLock` on the `INDEX_CACHE` to ensure thread-safe
+/// access. It first attempts to retrieve the index with a read lock. If not
+/// found, it acquires a write lock to load the index and insert it into the cache.
+///
+/// # Arguments
+///
+/// * `index_path` - The file system path to the index directory.
+/// * `device_str` - The string representation of the device (e.g., "cuda:0"),
+///   used as part of the cache key.
+/// * `device` - The `tch::Device` to load the index onto.
+///
+/// # Returns
+///
+/// A `PyResult` containing an `Arc<LoadedIndex>` on success.
+///
+/// # Errors
+///
+/// Returns a `PyErr` if `load_index` fails.
+fn get_or_load_index(
+    index_path: &str,
+    device_str: &str,
+    device: Device,
+) -> PyResult<Arc<LoadedIndex>> {
+    let key = (index_path.to_string(), device_str.to_string());
+
+    // --- First check with a read lock ---
+    {
+        let cache = INDEX_CACHE.read().unwrap();
+        if let Some(index_arc) = cache.get(&key) {
+            return Ok(Arc::clone(index_arc));
+        }
+    }
+
+    // --- If not found, acquire a write lock ---
+    let mut cache = INDEX_CACHE.write().unwrap();
+
+    // --- Double-check in case another thread loaded it while we waited for the write lock ---
+    if let Some(index_arc) = cache.get(&key) {
+        return Ok(Arc::clone(index_arc));
+    }
+
+    // --- Load the index, insert into cache, and return ---
+    let loaded_index = load_index(index_path, device).map_err(anyhow_to_pyerr)?;
+    let index_arc = Arc::new(loaded_index);
+
+    cache.insert(key, Arc::clone(&index_arc));
+
+    Ok(index_arc)
+}
+
+/// Manually initializes and loads the libtorch shared library.
+///
+/// This function is called automatically by other functions in this module,
+/// but can be called explicitly if needed.
 ///
 /// Args:
-///     torch_path (str): The file path to the Torch shared library,
-///         e.g., `/path/to/libtorch_cuda.so`.
+///     torch_path (str): The absolute path to the `libtorch` shared library
+///         (e.g., `libtorch.so` or `torch.dll`).
+///
+/// Raises:
+///     RuntimeError: If the torch library fails to load.
 #[pyfunction]
 fn initialize_torch(_py: Python<'_>, torch_path: String) -> PyResult<()> {
     call_torch(torch_path)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to initialize Torch: {}", e)))
 }
 
-/// Creates and saves a new FastPlaid index to disk.
+/// [Internal] Creates and saves a new FastPlaid index.
 ///
-/// This function processes document embeddings, clusters them using the provided
-/// centroids, calculates quantization residuals, and serializes the complete
-/// index structure to the specified directory.
+/// This is the low-level Rust implementation called by `FastPlaid.create()`.
+/// It's generally recommended to use the `FastPlaid` class wrapper instead.
+///
+/// This function builds the index from pre-computed centroids and embeddings,
+/// quantizes the embeddings, and saves the index files to disk.
 ///
 /// Args:
-///     index (str): The directory path where the new index will be saved.
-///     torch_path (str): Path to the Torch shared library (e.g., `libtorch.so`).
-///     device (str): The compute device to use for index creation (e.g., "cpu", "cuda:0").
-///     embedding_dim (int): The dimensionality of the embeddings.
-///     nbits (int): The number of bits to use for residual quantization.
-///     embeddings (list[torch.Tensor]): A list of 2D tensors, where each tensor
-///         is a batch of document embeddings.
-///     centroids (torch.Tensor): A 2D tensor of shape `[num_centroids, embedding_dim]`
-///         used for vector quantization.
-///     seed (int, optional): Optional seed for the random number generator.
+///     index (str): The file path to the directory to save the index.
+///     torch_path (str): Path to the `libtorch` shared library.
+///     device (str): Device to use for computation (e.g., "cpu", "cuda:0").
+///     embedding_dim (int): The dimension of the token embeddings (e.g., 128).
+///     nbits (int): Number of bits for product quantization (e.g., 4).
+///     embeddings (list[torch.Tensor]): A list of 2D tensors
+///         (num_tokens, embedding_dim), one for each document.
+///     centroids (torch.Tensor): A 2D tensor of (num_centroids, embedding_dim)
+///         pre-computed by K-means.
+///     batch_size (int): Batch size for processing embeddings during creation.
+///     seed (int | None): Optional seed for reproducible index creation.
+///
+/// Raises:
+///     RuntimeError: If index creation fails or `libtorch` fails to load.
 #[pyfunction]
 fn create(
     _py: Python<'_>,
@@ -146,35 +232,57 @@ fn create(
     nbits: i64,
     embeddings: Vec<PyTensor>,
     centroids: PyTensor,
+    batch_size: i64,
     seed: Option<u64>,
 ) -> PyResult<()> {
     call_torch(torch_path)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
+
+    let mut cache = INDEX_CACHE.write().unwrap();
+    cache.clear();
 
     let device = get_device(&device)?;
     let centroids = centroids.to_device(device).to_kind(Kind::Half);
 
     let embeddings: Vec<_> = embeddings
         .into_iter()
-        .map(|tensor| tensor.to_device(device).to_kind(Kind::Half))
+        .map(|tensor| tensor.to_kind(Kind::Half))
         .collect();
 
-    create_index(&embeddings, &index, embedding_dim, nbits, device, centroids, seed)
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to create index: {}", e)))
+    let result = create_index(
+        &embeddings,
+        &index,
+        embedding_dim,
+        nbits,
+        device,
+        centroids,
+        batch_size,
+        seed,
+    )
+    .map_err(|e| PyRuntimeError::new_err(format!("Failed to create index: {}", e)));
+
+    result
 }
 
-/// Updates an existing FastPlaid index with new documents.
+/// [Internal] Adds new documents to an existing FastPlaid index.
 ///
-/// This function loads the configuration from an existing index, processes the
-/// new document embeddings, and adds them to the index without rebuilding it
-/// from scratch.
+/// This is the low-level Rust implementation called by `FastPlaid.update()`.
+/// It's generally recommended to use the `FastPlaid` class wrapper instead.
+///
+/// This function appends new quantized embeddings to the index files. It does
+/// not re-compute centroids and assumes the existing index structure.
+/// Clears the *entire* index cache upon successful completion.
 ///
 /// Args:
-///     index (str): The directory path of the index to update.
-///     torch_path (str): Path to the Torch shared library (e.g., `libtorch.so`).
-///     device (str): The compute device to use (e.g., "cpu", "cuda:0").
-///     embeddings (list[torch.Tensor]): A list of 2D tensors containing the
-///         new document embeddings to add to the index.
+///     index (str): The file path to the directory of the existing index.
+///     torch_path (str): Path to the `libtorch` shared library.
+///     device (str): Device to use for computation (e.g., "cpu", "cuda:0").
+///     embeddings (list[torch.Tensor]): A list of 2D tensors
+///         (num_tokens, embedding_dim), one for each new document.
+///     batch_size (int): Batch size for processing new embeddings.
+///
+/// Raises:
+///     RuntimeError: If updating the index fails or `libtorch` fails to load.
 #[pyfunction]
 fn update(
     _py: Python<'_>,
@@ -182,9 +290,13 @@ fn update(
     torch_path: String,
     device: String,
     embeddings: Vec<PyTensor>,
+    batch_size: i64,
 ) -> PyResult<()> {
     call_torch(torch_path)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
+
+    let mut cache = INDEX_CACHE.write().unwrap();
+    cache.clear();
 
     let device = get_device(&device)?;
 
@@ -193,30 +305,71 @@ fn update(
         .map(|tensor| tensor.to_device(device).to_kind(Kind::Half))
         .collect();
 
-    update_index(&embeddings, &index, device)
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to update index: {}", e)))
+    let result = update_index(&embeddings, &index, device, batch_size)
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to update index: {}", e)));
+
+    result
 }
 
-/// Loads an index and performs a search in a single, high-level operation.
+/// [Internal] Loads an index into the global cache for fast access.
 ///
-/// This is the primary entry point for searching. It handles loading the index
-/// from disk, moving it to the specified device, executing the search with the
-/// given queries, and returning the results.
+/// This is the low-level Rust implementation called by `FastPlaid._load_index()`.
+/// It's generally recommended to use the `FastPlaid` class wrapper instead.
+///
+/// If the index (for the specified path and device) is already in the cache,
+/// this function does nothing. Otherwise, it loads the index from disk
+/// and stores it in a global, thread-safe cache.
 ///
 /// Args:
-///     index (str): Path to the directory containing the pre-built index.
-///     torch_path (str): Path to the Torch shared library (e.g., `libtorch.so`).
-///     device (str): The compute device for the search (e.g., "cpu", "cuda:0").
-///     queries_embeddings (torch.Tensor): A 2D tensor of query embeddings with
-///         shape `[num_queries, embedding_dim]`.
-///     search_parameters (SearchParameters): A configuration object specifying
-///         search behavior, such as `k` and `nprobe`.
-///     subset (list[list[int]], optional): A list where each inner list contains
-///         the document IDs to restrict the search to for the corresponding query.
+///     index (str): The file path to the directory of the existing index.
+///     torch_path (str): Path to the `libtorch` shared library.
+///     device (str): Device to load the index onto (e.g., "cpu", "cuda:0").
+///
+/// Raises:
+///     RuntimeError: If loading the index fails or `libtorch` fails to load.
+#[pyfunction]
+fn preload_index(
+    _py: Python<'_>,
+    index: String,
+    torch_path: String,
+    device: String,
+) -> PyResult<()> {
+    call_torch(torch_path)
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
+    let device_tch = get_device(&device)?;
+    // Call get_or_load_index to trigger a load if not already cached
+    get_or_load_index(&index, &device, device_tch)?;
+
+    Ok(())
+}
+
+/// [Internal] Loads an index (from cache or disk) and performs a search.
+///
+/// This is the low-level Rust implementation called by `FastPlaid.search()`.
+/// It's generally recommended to use the `FastPlaid` class wrapper instead.
+///
+/// This function first retrieves the index from the global cache (or loads it
+/// if not present), then executes the multi-vector search against it.
+///
+/// Args:
+///     index (str): The file path to the directory of the existing index.
+///     torch_path (str): Path to the `libtorch` shared library.
+///     device (str): Device to perform the search on (e.g., "cpu", "cuda:0").
+///     queries_embeddings (torch.Tensor): A 3D tensor of query embeddings
+///         with shape (num_queries, num_query_tokens, embedding_dim).
+///     search_parameters (SearchParameters): A SearchParameters object
+///         containing `top_k`, `n_ivf_probe`, etc.
+///     show_progress (bool): Whether to display a progress bar during search.
+///     subset (list[list[int]] | None): An optional filter to restrict the
+///         search. Must be a list of lists, where each inner list contains
+///         the document IDs to search for that specific query.
 ///
 /// Returns:
-///     list[QueryResult]: A list of result objects, each containing the
-///     `doc_id` and `score` for a retrieved document.
+///     list[QueryResult]: A list of `QueryResult` objects, one for each query.
+///
+/// Raises:
+///     RuntimeError: If searching fails or `libtorch` fails to load.
+///     ValueError: If search parameters are invalid.
 #[pyfunction]
 fn load_and_search(
     _py: Python<'_>,
@@ -226,31 +379,55 @@ fn load_and_search(
     queries_embeddings: PyTensor,
     search_parameters: &SearchParameters,
     show_progress: bool,
+    preload_index: bool,
     subset: Option<Vec<Vec<i64>>>,
 ) -> PyResult<Vec<QueryResult>> {
     call_torch(torch_path)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
 
-    let query_tensor = queries_embeddings
-        .to_device(Device::Cpu)
-        .to_kind(Kind::Half);
+    let device_tch = get_device(&device)?;
 
-    let device = get_device(&device)?;
-    let loaded_index = load_index(&index, device).map_err(anyhow_to_pyerr)?;
+    // Get the index from cache or load it
+    let index = if preload_index {
+        get_or_load_index(&index, &device, device_tch)
+    } else {
+        println!("Loading index from disk without caching.");
+        let loaded_index = load_index(&index, device_tch)
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to load index: {}", e)))?;
+        Ok(Arc::new(loaded_index))
+    }?;
 
-    let results = search_index(
-        &query_tensor,
-        &loaded_index,
+    // Perform the search
+    let results = search_many(
+        &queries_embeddings.to_kind(Kind::Half),
+        &index,
         search_parameters,
-        device,
+        device_tch,
         show_progress,
         subset,
     )
     .map_err(anyhow_to_pyerr)?;
-
     Ok(results)
 }
 
+/// [Internal] Deletes documents from an existing FastPlaid index.
+///
+/// This is the low-level Rust implementation called by `FastPlaid.delete()`.
+/// It's generally recommended to use the `FastPlaid` class wrapper instead.
+///
+/// This function removes the specified document IDs from the index files.
+/// The remaining documents are re-indexed to maintain sequential IDs.
+/// Clears the *entire* index cache upon successful completion.
+///
+/// Args:
+///     index (str): The file path to the directory of the existing index.
+///     torch_path (str): Path to the `libtorch` shared library.
+///     device (str): Device to use for the operation (e.g., "cpu", "cuda:0").
+///     subset (list[int]): A list of document IDs to delete. IDs correspond
+///         to the original insertion order.
+///
+/// Raises:
+///     RuntimeError: If deletion fails or `libtorch` fails to load.
 #[pyfunction]
 fn delete(
     _py: Python<'_>,
@@ -262,29 +439,33 @@ fn delete(
     call_torch(torch_path)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
 
+    let mut cache = INDEX_CACHE.write().unwrap();
+    cache.clear();
+
     let device = get_device(&device)?;
 
-    delete_from_index(&subset, &index, device)
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to delete from index: {}", e)))
+    let result = delete_from_index(&subset, &index, device)
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to delete from index: {}", e)));
+
+    result
 }
 
-/// A high-performance document retrieval toolkit using a ColBERT-style late
-/// interaction model, implemented in Rust with Python bindings.
+/// Defines the Python module `fast_plaid_rust`.
 ///
-/// This module provides functions for creating, updating, and searching indexes,
-/// along with the necessary data classes `SearchParameters` and `QueryResult`
-/// to interact with the library from Python.
+/// This function is the main entry point for the PyO3 library. It registers
+/// all the exposed Python functions (`create`, `update`, `load_and_search`, etc.)
+/// and classes (`SearchParameters`, `QueryResult`) to make them available
+/// for import in Python.
 #[pymodule]
 #[pyo3(name = "fast_plaid_rust")]
 fn python_module(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // Add data classes required for the Python interface.
     m.add_class::<SearchParameters>()?;
     m.add_class::<QueryResult>()?;
 
-    // Add functions to the Python module.
     m.add_function(wrap_pyfunction!(initialize_torch, m)?)?;
     m.add_function(wrap_pyfunction!(create, m)?)?;
     m.add_function(wrap_pyfunction!(update, m)?)?;
+    m.add_function(wrap_pyfunction!(preload_index, m)?)?;
     m.add_function(wrap_pyfunction!(load_and_search, m)?)?;
     m.add_function(wrap_pyfunction!(delete, m)?)?;
     Ok(())

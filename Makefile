@@ -13,4 +13,4 @@ test:
 	uv run tests/test.py
 
 evaluate:
-	uv run test.py
+	uv run benchmark/benchmark.py

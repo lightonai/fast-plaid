@@ -3,7 +3,7 @@ on:
 
 jobs:
   build_wheels:
-    name: Build wheels for Python ${{ matrix.python-version }} on ${{ matrix.os }} - 271
+    name: Build wheels for Python ${{ matrix.python-version }} on ${{ matrix.os }} - 280
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

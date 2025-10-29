@@ -466,10 +466,10 @@ pub fn search(
             .bucket_weights
             .as_ref()
             .ok_or_else(|| anyhow!("Codec missing bucket_weights for decompression."))?;
-        let bucket_weight_indices_lookup = codec
-            .bucket_weight_indices_lookup
-            .as_ref()
-            .ok_or_else(|| anyhow!("Codec missing decomp_indices_lookup for decompression."))?;
+        let bucket_weight_indices_lookup =
+            codec.bucket_weight_indices_lookup.as_ref().ok_or_else(|| {
+                anyhow!("Codec missing bucket_weight_indices_lookup for decompression.")
+            })?;
 
         let decompressed_embeddings = decompress_residuals(
             &final_residuals,

@@ -600,7 +600,6 @@ class FastPlaid:
                 subset=subset,  # type: ignore
             )
 
-        # Use batch_size as the split size for (multi-GPU) processing
         queries_embeddings_splits = torch.split(
             tensor=queries_embeddings,
             split_size_or_sections=len(self.devices),

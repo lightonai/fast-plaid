@@ -606,16 +606,15 @@ class FastPlaid:
         )
         num_splits = len(queries_embeddings_splits)
 
-        # --- FIX APPLIED HERE ---
+        subset_splits: list[list[list[int]] | None] = (
+            [None] * num_splits if subset is None else []
+        )
         if subset is not None:
-            subset_splits = [
-                subset[i * batch_size : (i + 1) * batch_size]  # type: ignore
-                for i in range(num_splits)
-            ]
-        else:
-            # Initialize subset_splits with Nones if subset is None
-            subset_splits = [None] * num_splits
-        # --- END OF FIX ---
+            current_idx = 0
+            for split in queries_embeddings_splits:
+                size = split.shape[0]
+                subset_splits.append(subset[current_idx : current_idx + size])  # type: ignore
+                current_idx += size
 
         # Parallel GPU processing
         args_for_starmap = []

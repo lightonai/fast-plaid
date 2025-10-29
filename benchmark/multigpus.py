@@ -64,6 +64,7 @@ if __name__ == "__main__":
     scores = fast_plaid.search(
         queries_embeddings=queries_embeddings,
         top_k=10,
+        subset=[i for i in range(50)]
     )
 
     end = time.time()

@@ -600,23 +600,21 @@ class FastPlaid:
                 subset=subset,  # type: ignore
             )
 
-        # Use batch_size as the split size for (multi-GPU) processing
         queries_embeddings_splits = torch.split(
             tensor=queries_embeddings,
             split_size_or_sections=len(self.devices),
         )
-        num_splits = len(queries_embeddings_splits)
 
-        # --- FIX APPLIED HERE ---
+        num_splits = len(queries_embeddings_splits)
         if subset is not None:
-            subset_splits = [
-                subset[i * batch_size : (i + 1) * batch_size]  # type: ignore
-                for i in range(num_splits)
-            ]
+            current_idx = 0
+            for split in queries_embeddings_splits:
+                size = split.shape[0]
+                subset_splits.append(subset[current_idx : current_idx + size])  # type: ignore
+                current_idx += size
         else:
             # Initialize subset_splits with Nones if subset is None
             subset_splits = [None] * num_splits
-        # --- END OF FIX ---
 
         # Parallel GPU processing
         args_for_starmap = []

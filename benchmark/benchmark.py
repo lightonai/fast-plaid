@@ -9,6 +9,8 @@ import torch
 from fast_plaid import evaluation, search
 from pylate import models
 
+print("Torch version:", torch.__version__)
+
 parser = argparse.ArgumentParser(
     description="Run Fast-PLAiD evaluation on a BEIR dataset."
 )

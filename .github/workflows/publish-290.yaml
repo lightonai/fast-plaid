@@ -3,7 +3,7 @@ on:
 
 jobs:
   build_wheels:
-    name: Build wheels for Python ${{ matrix.python-version }} on ${{ matrix.os }} - 280
+    name: Build wheels for Python ${{ matrix.python-version }} on ${{ matrix.os }} - 290
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -20,8 +20,8 @@ jobs:
         run: |
           echo "Deleting existing pyproject.toml (if any)..."
           rm -f pyproject.toml
-          echo "Using ci-280.toml as pyproject.toml..."
-          cp ci-280.toml pyproject.toml
+          echo "Using ci-290.toml as pyproject.toml..."
+          cp ci-290.toml pyproject.toml
           echo "File preparation complete."
 
       - name: Set up Python ${{ matrix.python-version }}
@@ -51,7 +51,7 @@ jobs:
           CIBW_ENVIRONMENT: |
             PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cpu/torch_stable.html"
           CIBW_PIP_ARGS: --no-cache-dir
-          CIBW_BEFORE_BUILD: "pip install torch==2.8.0 numpy maturin delvewheel"
+          CIBW_BEFORE_BUILD: "pip install torch==2.9.0 numpy maturin delvewheel"
           CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
             LD_LIBRARY_PATH=$(python -c 'import torch, os; print(os.path.join(os.path.dirname(torch.__file__), "lib"))'):$LD_LIBRARY_PATH auditwheel repair -w {dest_dir} {wheel} --exclude libtorch.so --exclude libtorch_cpu.so --exclude libtorch_python.so
           CIBW_REPAIR_WHEEL_COMMAND_MACOS: >
@@ -66,7 +66,7 @@ jobs:
           path: ./wheelhouse/*.whl
 
   publish:
-    name: Publish 280 to PyPI
+    name: Publish 290 to PyPI
     needs: build_wheels
     runs-on: ubuntu-latest
     permissions:

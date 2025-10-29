@@ -48,11 +48,9 @@ pub fn delete_from_index(subset: &[i64], idx_path: &str, device: Device) -> Resu
 
         let mut new_doclens = Vec::new();
         let mut embs_to_keep_mask = Vec::new();
-        let mut embs_in_chunk = 0;
 
         for (i, &len) in doclens.iter().enumerate() {
             let doc_id = current_doc_offset + i as i64;
-            embs_in_chunk += len;
             if !ids_to_delete_set.contains(&doc_id) {
                 new_doclens.push(len);
                 for _ in 0..len {
@@ -83,7 +81,9 @@ pub fn delete_from_index(subset: &[i64], idx_path: &str, device: Device) -> Resu
             let residuals = Tensor::read_npy(&residuals_path)?.to_device(device);
             let new_residuals = residuals.masked_select(&embs_to_keep_tensor.unsqueeze(-1));
             let new_residuals_shape = [-1, residuals.size()[1]];
-            new_residuals.reshape(&new_residuals_shape).write_npy(&residuals_path)?;
+            new_residuals
+                .reshape(&new_residuals_shape)
+                .write_npy(&residuals_path)?;
 
             // Update metadata
             let chunk_meta_path = idx_path_obj.join(format!("{}.metadata.json", chunk_idx));

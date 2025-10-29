@@ -27,10 +27,10 @@ use crate::utils::residual_codec::ResidualCodec;
 ///
 /// This function assumes specific dimensional relationships and will not work correctly if they
 /// are not met. The caller must ensure:
-/// - `(emb_dim * nbits)` is perfectly divisible by 8.
+/// - `(embedding_dimension * nbits)` is perfectly divisible by 8.
 /// - 8 is perfectly divisible by `nbits`.
 /// - The first dimension of `packed_residuals` matches the first dimension of `codes`.
-/// - The second dimension of `packed_residuals` is `(emb_dim * nbits) / 8`.
+/// - The second dimension of `packed_residuals` is `(embedding_dimension * nbits) / 8`.
 ///
 /// # Arguments
 ///
@@ -40,12 +40,12 @@ use crate::utils::residual_codec::ResidualCodec;
 /// * `bucket_weight_indices_lookup` - An intermediate table to map unpacked codes to `bucket_weights` indices.
 /// * `codes` - Indices used to select the initial coarse centroids for each embedding.
 /// * `centroids` - The codebook of coarse centroids.
-/// * `emb_dim` - The dimensionality of the final, decompressed embedding vectors.
+/// * `embedding_dimension` - The dimensionality of the final, decompressed embedding vectors.
 /// * `nbits` - The number of bits used for each sub-quantizer code within the packed residuals.
 ///
 /// # Returns
 ///
-/// A `Tensor` of shape `[num_embeddings, emb_dim]` containing the fully decompressed embeddings.
+/// A `Tensor` of shape `[num_embeddings, embedding_dimension]` containing the fully decompressed embeddings.
 pub fn decompress_residuals(
     packed_residuals: &Tensor,
     bucket_weights: &Tensor,
@@ -53,13 +53,13 @@ pub fn decompress_residuals(
     bucket_weight_indices_lookup: &Tensor,
     codes: &Tensor,
     centroids: &Tensor,
-    emb_dim: i64,
+    embedding_dimension: i64,
     nbits: i64,
 ) -> Tensor {
     let num_embeddings = codes.size()[0];
 
     const BITS_PER_PACKED_UNIT: i64 = 8;
-    let packed_dim = (emb_dim * nbits) / BITS_PER_PACKED_UNIT;
+    let packed_dim = (embedding_dimension * nbits) / BITS_PER_PACKED_UNIT;
     let codes_per_packed_unit = BITS_PER_PACKED_UNIT / nbits;
 
     let retrieved_centroids = centroids.index_select(0, codes);
@@ -86,12 +86,13 @@ pub fn decompress_residuals(
         flat_gathered_weights.view([num_embeddings, packed_dim, codes_per_packed_unit]);
 
     let output_contributions_sum = reshaped_gathered_weights + reshaped_centroids;
-    let decompressed_embeddings = output_contributions_sum.view([num_embeddings, emb_dim]);
+    let decompressed_embeddings =
+        output_contributions_sum.view([num_embeddings, embedding_dimension]);
 
     let norms = decompressed_embeddings
         .norm_scalaropt_dim(2.0, &[-1], true)
         .clamp_min(1e-12);
-        
+
     decompressed_embeddings / norms
 }
 
@@ -163,7 +164,7 @@ impl SearchParameters {
 ///
 /// A `Result` with a `Vec<QueryResult>`. Individual search failures result in an empty
 /// `QueryResult` for that specific query, ensuring the operation doesn't halt.
-pub fn search_index(
+pub fn search_many(
     queries: &Tensor,
     index: &LoadedIndex,
     params: &SearchParameters,
@@ -178,11 +179,11 @@ pub fn search_index(
         );
     };
 
-    let search_closure = |idx| {
-        let query_embedding = queries.i(idx).to(device);
+    let search_closure = |query_index| {
+        let query_embedding = queries.i(query_index).to(device);
 
         // Handle the per-query subset list
-        let query_subset = subset.as_ref().and_then(|s| s.get(idx as usize));
+        let query_subset = subset.as_ref().and_then(|s| s.get(query_index as usize));
         let subset_tensor = query_subset.map(|ids| {
             Tensor::from_slice(ids)
                 .to_device(device)
@@ -207,7 +208,7 @@ pub fn search_index(
         .unwrap_or_default();
 
         QueryResult {
-            query_id: idx as usize,
+            query_id: query_index as usize,
             passage_ids,
             scores,
         }
@@ -271,41 +272,41 @@ pub fn colbert_score_reduce(token_scores: &Tensor, attention_mask: &Tensor) -> T
 ///
 /// # Preconditions
 ///
-/// * The `pids` tensor must be sorted and contain unique elements.
+/// * The `passage_ids` tensor must be sorted and contain unique elements.
 ///
 /// # Arguments
 ///
-/// * `pids` - A 1D tensor of passage IDs, assumed to be sorted and unique.
-/// * `subset` - A 1D tensor of passage IDs to intersect with `pids`. This tensor does not
+/// * `passage_ids` - A 1D tensor of passage IDs, assumed to be sorted and unique.
+/// * `subset` - A 1D tensor of passage IDs to intersect with `passage_ids`. This tensor does not
 ///   need to be sorted or unique, as this function will handle it.
 /// * `device` - The `tch::Device` on which to create an empty tensor if the result is empty.
 ///
 /// # Returns
 ///
-/// A new 1D `Tensor` containing only the elements that are present in both `pids` and `subset`,
+/// A new 1D `Tensor` containing only the elements that are present in both `passage_ids` and `subset`,
 /// sorted in ascending order.
-fn filter_pids_with_subset(pids: &Tensor, subset: &Tensor, device: Device) -> Tensor {
-    if subset.numel() == 0 || pids.numel() == 0 {
+fn filter_passage_ids_with_subset(passage_ids: &Tensor, subset: &Tensor, device: Device) -> Tensor {
+    if subset.numel() == 0 || passage_ids.numel() == 0 {
         return Tensor::empty(&[0], (Kind::Int64, device));
     }
 
     let (sorted_subset, _) = subset.sort(0, false);
     let (unique_sorted_subset, _, _) = sorted_subset.unique_consecutive(false, false, 0);
 
-    let concatenated = Tensor::cat(&[pids, &unique_sorted_subset], 0);
+    let concatenated = Tensor::cat(&[passage_ids, &unique_sorted_subset], 0);
 
-    let (sorted_cat, _) = concatenated.sort(0, false);
-    let size = sorted_cat.size()[0];
+    let (sorted_concatenated, _) = concatenated.sort(0, false);
+    let size = sorted_concatenated.size()[0];
 
     if size < 2 {
         return Tensor::empty(&[0], (Kind::Int64, device));
     }
 
-    let duplicates_mask = sorted_cat
+    let duplicates_mask = sorted_concatenated
         .narrow(0, 0, size - 1)
-        .eq_tensor(&sorted_cat.narrow(0, 1, size - 1));
+        .eq_tensor(&sorted_concatenated.narrow(0, 1, size - 1));
 
-    sorted_cat
+    sorted_concatenated
         .narrow(0, 1, size - 1)
         .masked_select(&duplicates_mask)
 }
@@ -322,7 +323,7 @@ fn filter_pids_with_subset(pids: &Tensor, subset: &Tensor, device: Device) -> Te
 /// * `query_embeddings` - A tensor containing the query embeddings.
 /// * `ivf_index_strided` - A strided tensor representing the IVF index for coarse lookup.
 /// * `codec` - The `ResidualCodec` used for decompressing document vectors.
-/// * `emb_dim` - The dimensionality of the embeddings.
+/// * `embedding_dimension` - The dimensionality of the embeddings.
 /// * `doc_codes_strided` - A strided tensor containing the quantized codes for all documents.
 /// * `doc_residuals_strided` - A strided tensor containing the compressed residuals for all documents.
 /// * `n_ivf_probe` - The number of IVF cells to probe for candidate documents.
@@ -344,7 +345,7 @@ pub fn search(
     query_embeddings: &Tensor,
     ivf_index_strided: &StridedTensor,
     codec: &ResidualCodec,
-    emb_dim: i64,
+    embedding_dimension: i64,
     doc_codes_strided: &StridedTensor,
     doc_residuals_strided: &StridedTensor,
     n_ivf_probe: i64,
@@ -355,7 +356,7 @@ pub fn search(
     device: Device,
     subset: Option<&Tensor>,
 ) -> anyhow::Result<(Vec<i64>, Vec<f32>)> {
-    let (pids, scores) = tch::no_grad(|| {
+    let (passage_ids, scores) = tch::no_grad(|| {
         let query_embeddings_unsqueezed = query_embeddings.unsqueeze(0);
 
         let query_centroid_scores = codec.centroids.matmul(&query_embeddings.transpose(0, 1));
@@ -370,43 +371,46 @@ pub fn search(
         };
 
         let flat_selected_ivf_cells = selected_ivf_cells_indices.flatten(0, -1).contiguous();
+
         let (unique_ivf_cells_to_probe, _, _) =
             flat_selected_ivf_cells.unique_dim(-1, false, false, false);
 
         let (retrieved_passage_ids_ivf, _) =
             ivf_index_strided.lookup(&unique_ivf_cells_to_probe, device);
+
         let (sorted_passage_ids_ivf, _) = retrieved_passage_ids_ivf.sort(0, false);
-        let (mut unique_passage_ids_after_ivf, _, _) =
+
+        let (mut unique_passage_ids, _, _) =
             sorted_passage_ids_ivf.unique_consecutive(false, false, 0);
 
         if let Some(subset_tensor) = subset {
-            unique_passage_ids_after_ivf =
-                filter_pids_with_subset(&unique_passage_ids_after_ivf, subset_tensor, device);
+            unique_passage_ids =
+                filter_passage_ids_with_subset(&unique_passage_ids, subset_tensor, device);
         }
 
-        if unique_passage_ids_after_ivf.numel() == 0 {
+        if unique_passage_ids.numel() == 0 {
             return Ok((vec![], vec![]));
         }
 
         let mut approx_score_chunks = Vec::new();
-        let total_pids_for_approx = unique_passage_ids_after_ivf.size()[0];
-        let num_approx_batches = (total_pids_for_approx + batch_size - 1) / batch_size;
+        let total_passage_ids_for_approx = unique_passage_ids.size()[0];
+        let num_approx_batches = (total_passage_ids_for_approx + batch_size - 1) / batch_size;
 
-        for batch_idx in 0..num_approx_batches {
-            let batch_start = batch_idx * batch_size;
-            let batch_end = ((batch_idx + 1) * batch_size).min(total_pids_for_approx);
+        for step in 0..num_approx_batches {
+            let batch_start = step * batch_size;
+            let batch_end = ((step + 1) * batch_size).min(total_passage_ids_for_approx);
             if batch_start >= batch_end {
                 continue;
             }
 
-            let batch_pids =
-                unique_passage_ids_after_ivf.narrow(0, batch_start, batch_end - batch_start);
+            let batch_passage_ids =
+                unique_passage_ids.narrow(0, batch_start, batch_end - batch_start);
             let (batch_packed_codes, batch_doc_lengths) =
-                doc_codes_strided.lookup(&batch_pids, device);
+                doc_codes_strided.lookup(&batch_passage_ids, device);
 
             if batch_packed_codes.numel() == 0 {
                 approx_score_chunks.push(Tensor::zeros(
-                    &[batch_pids.size()[0]],
+                    &[batch_passage_ids.size()[0]],
                     (Kind::Float, device),
                 ));
                 continue;
@@ -419,36 +423,33 @@ pub fn search(
             approx_score_chunks.push(colbert_score_reduce(&padded_approx_scores, &mask));
         }
 
-        let approx_scores = if !approx_score_chunks.is_empty() {
+        let mut approx_scores = if !approx_score_chunks.is_empty() {
             Tensor::cat(&approx_score_chunks, 0)
         } else {
             Tensor::empty(&[0], (Kind::Float, device))
         };
 
-        if approx_scores.size().get(0) != Some(&unique_passage_ids_after_ivf.size()[0]) {
+        if approx_scores.size().get(0) != Some(&unique_passage_ids.size()[0]) {
             return Err(anyhow!(
                 "PID ({}) and approx scores ({}) count mismatch.",
-                unique_passage_ids_after_ivf.size()[0],
+                unique_passage_ids.size()[0],
                 approx_scores.size().get(0).unwrap_or(&-1),
             ));
         }
 
-        let mut passage_ids_to_rerank = unique_passage_ids_after_ivf;
-        let mut working_approx_scores = approx_scores;
+        let mut passage_ids_to_rerank = unique_passage_ids;
 
-        if n_docs_for_full_score < working_approx_scores.size()[0]
-            && working_approx_scores.numel() > 0
-        {
+        if n_docs_for_full_score < approx_scores.size()[0] && approx_scores.numel() > 0 {
             let (top_scores, top_indices) =
-                working_approx_scores.topk(n_docs_for_full_score, 0, true, true);
+                approx_scores.topk(n_docs_for_full_score, 0, true, true);
             passage_ids_to_rerank = passage_ids_to_rerank.index_select(0, &top_indices);
-            working_approx_scores = top_scores;
+            approx_scores = top_scores;
         }
 
-        let n_pids_for_decomp = (n_docs_for_full_score / 4).max(1);
-        if n_pids_for_decomp < working_approx_scores.size()[0] && working_approx_scores.numel() > 0
-        {
-            let (_, top_indices) = working_approx_scores.topk(n_pids_for_decomp, 0, true, true);
+        let n_passage_ids_for_decompression = (n_docs_for_full_score / 4).max(1);
+        if n_passage_ids_for_decompression < approx_scores.size()[0] && approx_scores.numel() > 0 {
+            let (_, top_indices) =
+                approx_scores.topk(n_passage_ids_for_decompression, 0, true, true);
             passage_ids_to_rerank = passage_ids_to_rerank.index_select(0, &top_indices);
         }
 
@@ -458,45 +459,47 @@ pub fn search(
 
         let (final_codes, final_doc_lengths) =
             doc_codes_strided.lookup(&passage_ids_to_rerank, device);
+
         let (final_residuals, _) = doc_residuals_strided.lookup(&passage_ids_to_rerank, device);
 
         let bucket_weights = codec
             .bucket_weights
             .as_ref()
             .ok_or_else(|| anyhow!("Codec missing bucket_weights for decompression."))?;
-        let decomp_lookup = codec
-            .decomp_indices_lookup
-            .as_ref()
-            .ok_or_else(|| anyhow!("Codec missing decomp_indices_lookup for decompression."))?;
+        let bucket_weight_indices_lookup =
+            codec.bucket_weight_indices_lookup.as_ref().ok_or_else(|| {
+                anyhow!("Codec missing bucket_weight_indices_lookup for decompression.")
+            })?;
 
-        let decompressed_embs = decompress_residuals(
+        let decompressed_embeddings = decompress_residuals(
             &final_residuals,
             bucket_weights,
             &codec.byte_reversed_bits_map,
-            decomp_lookup,
+            bucket_weight_indices_lookup,
             &final_codes,
             &codec.centroids,
-            emb_dim,
+            embedding_dimension,
             nbits_param,
         );
 
-        let (padded_doc_embs, mask) =
-            direct_pad_sequences(&decompressed_embs, &final_doc_lengths, 0.0, device)?;
-        let final_scores = padded_doc_embs.matmul(&query_embeddings_unsqueezed.transpose(-2, -1));
-        let reduced_scores = colbert_score_reduce(&final_scores, &mask);
+        let (padded_doc_embeddings, mask) =
+            direct_pad_sequences(&decompressed_embeddings, &final_doc_lengths, 0.0, device)?;
+        let scores = padded_doc_embeddings.matmul(&query_embeddings_unsqueezed.transpose(-2, -1));
+        let scores = colbert_score_reduce(&scores, &mask);
 
-        let (sorted_scores, sorted_indices) = reduced_scores.sort(0, true);
-        let sorted_pids = passage_ids_to_rerank.index_select(0, &sorted_indices);
+        let (scores, sorted_indices) = scores.sort(0, true);
+        let sorted_passage_ids = passage_ids_to_rerank.index_select(0, &sorted_indices);
 
-        let pids_vec: Vec<i64> = sorted_pids.try_into()?;
-        let scores_vec: Vec<f32> = sorted_scores.try_into()?;
+        let sorted_passage_ids: Vec<i64> = sorted_passage_ids.try_into()?;
+        let scores: Vec<f32> = scores.try_into()?;
 
-        let result_count = top_k.min(pids_vec.len());
+        let result_count = top_k.min(sorted_passage_ids.len());
+
         Ok((
-            pids_vec[..result_count].to_vec(),
-            scores_vec[..result_count].to_vec(),
+            sorted_passage_ids[..result_count].to_vec(),
+            scores[..result_count].to_vec(),
         ))
     })?;
 
-    Ok((pids, scores))
+    Ok((passage_ids, scores))
 }

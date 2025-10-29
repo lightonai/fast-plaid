@@ -1,11 +1,11 @@
 lint:
 	cargo clean
-	uv pip install torch==2.8.0
+	uv pip install torch==2.9.0
 	uv run --extra dev pre-commit run --files python/**/**/**.py
 
 install:
 	cargo clean
-	uv pip install torch==2.8.0
+	uv pip install torch==2.9.0
 	uv pip install -e ".[dev]"
 
 test:
@@ -13,4 +13,4 @@ test:
 	uv run tests/test.py
 
 evaluate:
-	uv run test.py
+	uv run benchmark/benchmark.py

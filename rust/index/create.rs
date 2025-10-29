@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context, Result};
+use indicatif::{ProgressBar, ProgressIterator};
 use rand::prelude::SliceRandom;
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
@@ -33,8 +34,8 @@ pub struct Metadata {
 /// # Arguments
 ///
 /// * `ivf` - A 1D tensor containing the indices of embeddings, forming the concatenated inverted lists.
-/// * `ivf_lens` - A 1D tensor where each element specifies the length of the corresponding inverted list in `ivf`.
-/// * `idx_path` - The path to the directory containing the index files, specifically the `doclens.*.json` files.
+/// * `inverted_file_lengths` - A 1D tensor where each element specifies the length of the corresponding inverted list in `ivf`.
+/// * `index_path` - The path to the directory containing the index files, specifically the `doclens.*.json` files.
 /// * `device` - The `tch::Device` on which to perform tensor operations.
 ///
 /// # Returns
@@ -44,19 +45,19 @@ pub struct Metadata {
 /// * A tensor with the new lengths of each optimized inverted list.
 pub fn optimize_ivf(
     ivf: &Tensor,
-    ivf_lens: &Tensor,
-    idx_path: &str,
+    inverted_file_lengths: &Tensor,
+    index_path: &str,
     device: Device,
 ) -> Result<(Tensor, Tensor)> {
     let mut doclen_files: BTreeMap<i64, String> = BTreeMap::new();
     let doclen_re =
         Regex::new(r"doclens\.(\d+)\.json").context("Failed to compile regex for doclens files")?;
 
-    for dir_entry_res in
-        fs::read_dir(idx_path).with_context(|| format!("Failed to read directory: {}", idx_path))?
+    for dir_entry_res in fs::read_dir(index_path)
+        .with_context(|| format!("Failed to read directory: {}", index_path))?
     {
         let dir_entry =
-            dir_entry_res.with_context(|| format!("Failed to read entry in {}", idx_path))?;
+            dir_entry_res.with_context(|| format!("Failed to read entry in {}", index_path))?;
         let fname = dir_entry.file_name();
         if let Some(fname_str) = fname.to_str() {
             if let Some(caps) = doclen_re.captures(fname_str) {
@@ -81,9 +82,9 @@ pub fn optimize_ivf(
         all_doclens.extend(chunk_doclens);
     }
 
-    let total_embs: i64 = all_doclens.iter().sum();
+    let total_embeddings: i64 = all_doclens.iter().sum();
 
-    let mut emb_to_pid_vec: Vec<i64> = Vec::with_capacity(total_embs as usize);
+    let mut emb_to_pid_vec: Vec<i64> = Vec::with_capacity(total_embeddings as usize);
     let mut pid_counter: i64 = 0;
     for &doc_len in &all_doclens {
         for _ in 0..doc_len {
@@ -98,24 +99,24 @@ pub fn optimize_ivf(
 
     let pids_in_ivf = emb_to_pid.index_select(0, ivf);
     let mut unique_pids_list: Vec<Tensor> = Vec::new();
-    let mut new_ivf_lens_vec: Vec<i64> = Vec::new();
-    let ivf_lens_vec: Vec<i64> = Vec::<i64>::try_from(ivf_lens)?;
+    let mut new_inverted_file_lengths_vec: Vec<i64> = Vec::new();
+    let inverted_file_lengths_vec: Vec<i64> = Vec::<i64>::try_from(inverted_file_lengths)?;
     let mut ivf_offset: i64 = 0;
 
-    for &len in &ivf_lens_vec {
+    for &len in &inverted_file_lengths_vec {
         let pids_seg = pids_in_ivf.narrow(0, ivf_offset, len);
         let (unique_pids, _, _) = pids_seg.unique_dim(0, true, false, false);
         unique_pids_list.push(unique_pids.copy());
-        new_ivf_lens_vec.push(unique_pids.size1().unwrap_or(0));
+        new_inverted_file_lengths_vec.push(unique_pids.size1().unwrap_or(0));
         ivf_offset += len;
     }
 
     let pids_in_ivf = Tensor::cat(&unique_pids_list, 0);
-    let new_ivf_lens = Tensor::from_slice(&new_ivf_lens_vec)
+    let new_inverted_file_lengths = Tensor::from_slice(&new_inverted_file_lengths_vec)
         .to_device(device)
         .to_kind(Kind::Int64);
 
-    Ok((pids_in_ivf, new_ivf_lens))
+    Ok((pids_in_ivf, new_inverted_file_lengths))
 }
 
 /// Compresses embeddings into codes by finding the nearest centroid.
@@ -126,16 +127,16 @@ pub fn optimize_ivf(
 ///
 /// # Arguments
 ///
-/// * `embs` - A tensor of embeddings to be compressed, with shape `[num_embeddings, dim]`.
+/// * `embeddings` - A tensor of embeddings to be compressed, with shape `[num_embeddings, dim]`.
 /// * `centroids` - A tensor of centroids, with shape `[num_centroids, dim]`.
+/// * `batch_size` - The size of each batch for processing embeddings.
 ///
 /// # Returns
 ///
 /// A 1D tensor of codes (indices of the nearest centroids).
-pub fn compress_into_codes(embs: &Tensor, centroids: &Tensor) -> Tensor {
+pub fn compress_into_codes(embeddings: &Tensor, centroids: &Tensor, batch_size: i64) -> Tensor {
     let mut codes = Vec::new();
-    let batch_sz = (1 << 29) / centroids.size()[0] as i64;
-    for mut emb_batch in embs.split(batch_sz, 0) {
+    for mut emb_batch in embeddings.split(batch_size, 0) {
         codes.push(centroids.matmul(&emb_batch.t_()).argmax(0, false));
     }
     Tensor::cat(&codes, 0)
@@ -148,15 +149,15 @@ pub fn compress_into_codes(embs: &Tensor, centroids: &Tensor) -> Tensor {
 ///
 /// # Arguments
 ///
-/// * `res` - A 1D tensor containing bit values (0s or 1s).
+/// * `bits` - A 1D tensor containing bit values (0s or 1s).
 ///
 /// # Returns
 ///
 /// A 1D tensor of `Uint8` bytes.
-pub fn packbits(res: &Tensor) -> Tensor {
-    let bits_mat = res.reshape(&[-1, 8]).to_kind(Kind::Half);
+pub fn packbits(bits: &Tensor) -> Tensor {
+    let bits_mat = bits.reshape(&[-1, 8]).to_kind(Kind::Half);
     let weights = Tensor::from_slice(&[128i64, 64, 32, 16, 8, 4, 2, 1])
-        .to_device(res.device())
+        .to_device(bits.device())
         .to_kind(Kind::Half);
     let packed = bits_mat.matmul(&weights).to_kind(Kind::Uint8);
     packed
@@ -172,7 +173,7 @@ pub fn packbits(res: &Tensor) -> Tensor {
 /// # Arguments
 ///
 /// * `documents_embeddings` - A vector of tensors, where each tensor represents the embeddings for a single document.
-/// * `idx_path` - The directory path where the generated index files will be stored.
+/// * `index_path` - The directory path where the generated index files will be stored.
 /// * `embedding_dim` - The dimensionality of the embeddings.
 /// * `nbits` - The number of bits to use for residual quantization.
 /// * `device` - The `tch::Device` (e.g., CPU or CUDA) on which to perform computations.
@@ -181,26 +182,24 @@ pub fn packbits(res: &Tensor) -> Tensor {
 ///
 /// # Returns
 ///
-/// A `Result` indicating success or failure. On success, the `idx_path`
+/// A `Result` indicating success or failure. On success, the `index_path`
 /// directory will contain all the necessary index files.
 pub fn create_index(
     documents_embeddings: &Vec<Tensor>,
-    idx_path: &str,
+    index_path: &str,
     embedding_dim: i64,
     nbits: i64,
     device: Device,
     centroids: Tensor,
+    batch_size: i64,
     seed: Option<u64>,
 ) -> Result<()> {
-    let _grad_guard = tch::no_grad_guard();
-
     let n_docs = documents_embeddings.len();
-    let n_chunks = (n_docs as f64 / 25_000f64.min(1.0 + n_docs as f64)).ceil() as usize;
-
+    let n_chunks = (n_docs as f64 / (batch_size as f64).min(1.0 + n_docs as f64)).ceil() as usize;
     let n_passages = documents_embeddings.len();
 
     let sample_k_float = 16.0 * (120.0 * n_passages as f64).sqrt();
-    let k = (1.0 + sample_k_float).min(n_passages as f64) as usize;
+    let sample_count = (1.0 + sample_k_float).min(n_passages as f64) as usize;
 
     let mut rng = if let Some(seed_value) = seed {
         Box::new(StdRng::seed_from_u64(seed_value)) as Box<dyn RngCore>
@@ -210,57 +209,93 @@ pub fn create_index(
 
     let mut passage_indices: Vec<u32> = (0..n_passages as u32).collect();
     passage_indices.shuffle(&mut *rng);
-    let sample_pids: Vec<u32> = passage_indices.into_iter().take(k).collect();
+    let sample_pids: Vec<u32> = passage_indices.into_iter().take(sample_count).collect();
 
-    let mut sample_tensors_vec: Vec<&Tensor> = Vec::with_capacity(k);
+    let mut total_samples_i64: i64 = 0;
+    // Calculate avg_doc_len over all documents
     let avg_doc_len = documents_embeddings
         .iter()
         .map(|t| t.size()[0] as f64)
         .sum::<f64>()
         / n_docs as f64;
 
-    for &pid in &sample_pids {
-        sample_tensors_vec.push(&documents_embeddings[pid as usize]);
+    let sample_tensors_refs: Vec<&Tensor> = sample_pids
+        .iter()
+        .map(|&pid| {
+            let tensor = &documents_embeddings[pid as usize];
+            total_samples_i64 += tensor.size()[0];
+            tensor
+        })
+        .collect();
+
+    let total_samples_f64 = total_samples_i64 as f64;
+    let heldout_size = (0.05 * total_samples_f64).min(50_000f64).round() as i64;
+
+    let mut heldout_tensors_vec: Vec<Tensor> = Vec::with_capacity(sample_count);
+    let mut current_heldout_count: i64 = 0;
+
+    for tensor in sample_tensors_refs.iter().rev() {
+        let needed = heldout_size - current_heldout_count;
+        if needed <= 0 {
+            break;
+        }
+
+        let t_size = tensor.size()[0];
+
+        if t_size <= needed {
+            heldout_tensors_vec.push(tensor.to_kind(Kind::Half));
+            current_heldout_count += t_size;
+        } else {
+            let partial_tensor = tensor
+                .narrow(0, t_size - needed, needed)
+                .to_kind(Kind::Half);
+            heldout_tensors_vec.push(partial_tensor);
+            current_heldout_count += needed;
+        }
     }
 
-    let sample_embs = Tensor::cat(&sample_tensors_vec, 0)
-        .to_kind(Kind::Half)
-        .to_device(device);
+    heldout_tensors_vec.reverse();
 
-    let mut est_total_embs_f64 = (n_passages as f64) * avg_doc_len;
-    est_total_embs_f64 = (16.0 * est_total_embs_f64.sqrt()).log2().floor();
-    let est_total_embs = 2f64.powf(est_total_embs_f64) as i64;
+    let heldout_samples = if heldout_tensors_vec.is_empty() {
+        Tensor::empty(&[0, embedding_dim], (Kind::Half, device))
+    } else {
+        Tensor::cat(&heldout_tensors_vec, 0).to_device(device)
+    };
 
-    let plan_fpath = Path::new(idx_path).join("plan.json");
+    let mut est_total_embeddings_f64 = (n_passages as f64) * avg_doc_len;
+    est_total_embeddings_f64 = (16.0 * est_total_embeddings_f64.sqrt()).log2().floor();
+    let est_total_embeddings = 2f64.powf(est_total_embeddings_f64) as i64;
+
+    let plan_fpath = Path::new(index_path).join("plan.json");
     let plan_data = json!({ "nbits": nbits, "num_chunks": n_chunks });
     let mut plan_file = File::create(plan_fpath)?;
     writeln!(plan_file, "{}", serde_json::to_string_pretty(&plan_data)?)?;
 
-    let total_samples = sample_embs.size()[0] as f64;
-    let heldout_sz = (0.05 * total_samples).min(50_000f64).round() as i64;
-    let sample_splits =
-        sample_embs.split_with_sizes(&[total_samples as i64 - heldout_sz, heldout_sz], 0);
-
-    let heldout_samples = sample_splits[1].shallow_clone();
+    // Ensure we have samples to train on
+    if heldout_samples.size()[0] == 0 {
+        return Err(anyhow!("Cannot train codec: no heldout samples were generated. Check sampling logic or input data."));
+    }
 
     let initial_codec = ResidualCodec::load(
         nbits,
-        centroids.copy(),
+        centroids,
         Tensor::zeros(&[embedding_dim], (Kind::Half, device)),
         None,
         None,
         device,
     )?;
 
-    let heldout_codes = compress_into_codes(&heldout_samples, &initial_codec.centroids);
+    let heldout_codes = compress_into_codes(&heldout_samples, &initial_codec.centroids, batch_size);
 
-    let mut recon_embs_vec = Vec::new();
-    for code_batch_idxs in heldout_codes.split((1 << 20) as i64, 0) {
-        recon_embs_vec.push(initial_codec.centroids.index_select(0, &code_batch_idxs));
+    let mut reconstructed_embeddings_vec = Vec::new();
+    for code_batch_indexes in heldout_codes.split(batch_size, 0) {
+        reconstructed_embeddings_vec
+            .push(initial_codec.centroids.index_select(0, &code_batch_indexes));
     }
-    let heldout_recon_embs = Tensor::cat(&recon_embs_vec, 0);
+    let heldout_reconstructed_embeddings = Tensor::cat(&reconstructed_embeddings_vec, 0);
 
-    let heldout_res_raw = (&heldout_samples - &heldout_recon_embs).to_kind(Kind::Float); // Here float on purpose
+    let heldout_res_raw =
+        (&heldout_samples - &heldout_reconstructed_embeddings).to_kind(Kind::Float); // Here float on purpose
     let avg_res_per_dim = heldout_res_raw
         .abs()
         .mean_dim(Some(&[0i64][..]), false, Kind::Float) // Here float on purpose
@@ -273,67 +308,73 @@ pub fn create_index(
     let cutoff_quantiles = quantiles_base.narrow(0, 1, n_options as i64 - 1);
     let weight_quantiles = &quantiles_base + (0.5 / n_options as f64);
 
-    let b_cutoffs = heldout_res_raw.quantile(&cutoff_quantiles, None, false, "linear");
-    let b_weights = heldout_res_raw.quantile(&weight_quantiles, None, false, "linear");
+    let bucket_cutoffs = heldout_res_raw.quantile(&cutoff_quantiles, None, false, "linear");
+    let bucket_weights = heldout_res_raw.quantile(&weight_quantiles, None, false, "linear");
 
     let final_codec = ResidualCodec::load(
         nbits,
-        initial_codec.centroids.copy(),
+        initial_codec.centroids,
         avg_res_per_dim,
-        Some(b_cutoffs.copy()),
-        Some(b_weights.copy()),
+        Some(bucket_cutoffs.copy()),
+        Some(bucket_weights.copy()),
         device,
     )?;
 
-    let centroids_fpath = Path::new(idx_path).join("centroids.npy");
+    let centroids_fpath = Path::new(index_path).join("centroids.npy");
     final_codec
         .centroids
         .to_device(Device::Cpu)
         .write_npy(&centroids_fpath)?;
 
-    let cutoffs_fpath = Path::new(idx_path).join("bucket_cutoffs.npy");
-    b_cutoffs.to_device(Device::Cpu).write_npy(&cutoffs_fpath)?;
+    let cutoffs_fpath = Path::new(index_path).join("bucket_cutoffs.npy");
+    bucket_cutoffs
+        .to_device(Device::Cpu)
+        .write_npy(&cutoffs_fpath)?;
 
-    let weights_fpath = Path::new(idx_path).join("bucket_weights.npy");
-    b_weights.to_device(Device::Cpu).write_npy(&weights_fpath)?;
+    let weights_fpath = Path::new(index_path).join("bucket_weights.npy");
+    bucket_weights
+        .to_device(Device::Cpu)
+        .write_npy(&weights_fpath)?;
 
-    let avg_res_fpath = Path::new(idx_path).join("avg_residual.npy");
+    let avg_res_fpath = Path::new(index_path).join("avg_residual.npy");
     final_codec
         .avg_residual
         .to_device(Device::Cpu)
         .write_npy(&avg_res_fpath)?;
 
-    let proc_chunk_sz = 25_000.min(1 + n_passages);
+    let proc_chunk_sz = (batch_size as usize).min(1 + n_passages);
 
-    for chk_idx in 0..n_chunks {
-        let chk_offset = chk_idx * proc_chunk_sz;
+    let bar = ProgressBar::new(n_chunks.try_into().unwrap());
+    bar.set_message("Creating index...");
+
+    for chunk_index in (0..n_chunks).progress_with(bar) {
+        let chk_offset = chunk_index * proc_chunk_sz;
         let chk_end_offset = (chk_offset + proc_chunk_sz).min(n_passages);
 
-        let chk_embs_vec: Vec<Tensor> = documents_embeddings[chk_offset..chk_end_offset]
+        let chk_embeddings_vec: Vec<Tensor> = documents_embeddings[chk_offset..chk_end_offset]
             .iter()
-            .map(|t| t.shallow_clone())
+            .map(|t| t.to_kind(Kind::Half))
             .collect();
-        let chk_doclens: Vec<i64> = chk_embs_vec.iter().map(|e| e.size()[0]).collect();
-        let chk_embs_tensor = Tensor::cat(&chk_embs_vec, 0)
+        let chk_doclens: Vec<i64> = chk_embeddings_vec.iter().map(|e| e.size()[0]).collect();
+        let chk_embeddings_tensor = Tensor::cat(&chk_embeddings_vec, 0)
             .to_kind(Kind::Half)
             .to_device(device);
 
         let mut chk_codes_list: Vec<Tensor> = Vec::new();
-        let mut chk_res_list: Vec<Tensor> = Vec::new();
+        let mut chunk_residuals_list: Vec<Tensor> = Vec::new();
 
-        for emb_batch in chk_embs_tensor.split(1 << 18, 0) {
-            let code_batch = compress_into_codes(&emb_batch, &final_codec.centroids);
-            chk_codes_list.push(code_batch.shallow_clone());
+        for emb_batch in chk_embeddings_tensor.split(batch_size, 0) {
+            let code_batch = compress_into_codes(&emb_batch, &final_codec.centroids, batch_size);
 
-            let mut recon_centroids_batches: Vec<Tensor> = Vec::new();
-            for sub_code_batch in code_batch.split(1 << 20, 0) {
-                recon_centroids_batches
+            let mut reconstructed_centroids_batches: Vec<Tensor> = Vec::new();
+            for sub_code_batch in code_batch.split(batch_size, 0) {
+                reconstructed_centroids_batches
                     .push(final_codec.centroids.index_select(0, &sub_code_batch));
             }
-            let recon_centroids = Tensor::cat(&recon_centroids_batches, 0);
+            let reconstructed_centroids = Tensor::cat(&reconstructed_centroids_batches, 0);
 
-            let mut res_batch = &emb_batch - &recon_centroids;
-            res_batch = Tensor::bucketize(&res_batch, &b_cutoffs, true, false);
+            let mut res_batch = &emb_batch - &reconstructed_centroids;
+            res_batch = Tensor::bucketize(&res_batch, &bucket_cutoffs, true, false);
 
             let mut res_shape = res_batch.size();
             res_shape.push(nbits);
@@ -347,23 +388,24 @@ pub fn create_index(
             let res_packed = packbits(&res_flat);
 
             let shape = [res_batch.size()[0], embedding_dim / 8 * nbits];
-            chk_res_list.push(res_packed.reshape(&shape));
+            chunk_residuals_list.push(res_packed.reshape(&shape));
+            chk_codes_list.push(code_batch);
         }
 
         let chk_codes = Tensor::cat(&chk_codes_list, 0);
-        let chk_residuals = Tensor::cat(&chk_res_list, 0);
+        let chk_residuals = Tensor::cat(&chunk_residuals_list, 0);
 
-        let chk_codes_fpath = Path::new(idx_path).join(&format!("{}.codes.npy", chk_idx));
+        let chk_codes_fpath = Path::new(index_path).join(&format!("{}.codes.npy", chunk_index));
         chk_codes
             .to_device(Device::Cpu)
             .write_npy(&chk_codes_fpath)?;
 
-        let chk_res_fpath = Path::new(idx_path).join(&format!("{}.residuals.npy", chk_idx));
+        let chk_res_fpath = Path::new(index_path).join(&format!("{}.residuals.npy", chunk_index));
         chk_residuals
             .to_device(Device::Cpu)
             .write_npy(&chk_res_fpath)?;
 
-        let chk_doclens_fpath = Path::new(idx_path).join(format!("doclens.{}.json", chk_idx));
+        let chk_doclens_fpath = Path::new(index_path).join(format!("doclens.{}.json", chunk_index));
         let dl_file = File::create(chk_doclens_fpath)?;
         let buf_writer = BufWriter::new(dl_file);
         serde_json::to_writer(buf_writer, &chk_doclens)?;
@@ -372,7 +414,7 @@ pub fn create_index(
             num_passages: chk_doclens.len(),
             num_embeddings: chk_codes.size()[0] as usize,
         };
-        let chk_meta_fpath = Path::new(idx_path).join(format!("{}.metadata.json", chk_idx));
+        let chk_meta_fpath = Path::new(index_path).join(format!("{}.metadata.json", chunk_index));
         let meta_f_w = File::create(chk_meta_fpath)?;
         let buf_writer_meta = BufWriter::new(meta_f_w);
         serde_json::to_writer(buf_writer_meta, &chk_meta)?;
@@ -381,8 +423,8 @@ pub fn create_index(
     let mut current_emb_offset: usize = 0;
     let mut chk_emb_offsets: Vec<usize> = Vec::new();
 
-    for chk_idx in 0..n_chunks {
-        let chk_meta_fpath = Path::new(idx_path).join(format!("{}.metadata.json", chk_idx));
+    for chunk_index in 0..n_chunks {
+        let chk_meta_fpath = Path::new(index_path).join(format!("{}.metadata.json", chunk_index));
         let meta_f_r = File::open(&chk_meta_fpath)?;
         let buf_reader = BufReader::new(meta_f_r);
         let mut json_val: serde_json::Value = serde_json::from_reader(buf_reader)?;
@@ -391,7 +433,7 @@ pub fn create_index(
             meta_obj.insert("embedding_offset".to_string(), json!(current_emb_offset));
             chk_emb_offsets.push(current_emb_offset);
 
-            let embs_in_chk = meta_obj
+            let embeddings_in_chk = meta_obj
                 .get("num_embeddings")
                 .and_then(|v| v.as_u64())
                 .ok_or_else(|| {
@@ -400,7 +442,7 @@ pub fn create_index(
                         chk_meta_fpath.display()
                     )
                 })? as usize;
-            current_emb_offset += embs_in_chk;
+            current_emb_offset += embeddings_in_chk;
 
             let meta_f_w_updated = File::create(&chk_meta_fpath)?;
             let writer_updated = BufWriter::new(meta_f_w_updated);
@@ -413,12 +455,13 @@ pub fn create_index(
         }
     }
 
-    let total_num_embs = current_emb_offset;
-    let all_codes = Tensor::zeros(&[total_num_embs as i64], (Kind::Int64, device));
+    let total_num_embeddings = current_emb_offset;
+    let all_codes = Tensor::zeros(&[total_num_embeddings as i64], (Kind::Int64, device));
 
-    for chk_idx in 0..n_chunks {
-        let chk_offset_global = chk_emb_offsets[chk_idx];
-        let codes_fpath_for_global = Path::new(idx_path).join(format!("{}.codes.npy", chk_idx));
+    for chunk_index in 0..n_chunks {
+        let chk_offset_global = chk_emb_offsets[chunk_index];
+        let codes_fpath_for_global =
+            Path::new(index_path).join(format!("{}.codes.npy", chunk_index));
         let codes_from_file = Tensor::read_npy(&codes_fpath_for_global)?.to_device(device);
         let codes_in_chk_count = codes_from_file.size()[0];
         all_codes
@@ -427,25 +470,26 @@ pub fn create_index(
     }
 
     let (sorted_codes, sorted_indices) = all_codes.sort(0, false);
-    let code_counts = sorted_codes.bincount::<Tensor>(None, est_total_embs);
+    let code_counts = sorted_codes.bincount::<Tensor>(None, est_total_embeddings);
 
-    let (opt_ivf, opt_ivf_lens) = optimize_ivf(&sorted_indices, &code_counts, idx_path, device)
-        .context("Failed to optimize IVF")?;
+    let (opt_ivf, opt_inverted_file_lengths) =
+        optimize_ivf(&sorted_indices, &code_counts, index_path, device)
+            .context("Failed to optimize IVF")?;
 
-    let opt_ivf_fpath = Path::new(idx_path).join("ivf.npy");
+    let opt_ivf_fpath = Path::new(index_path).join("ivf.npy");
     opt_ivf
         .to_device(Device::Cpu)
         .to_kind(Kind::Int64)
         .write_npy(&opt_ivf_fpath)?;
-    let opt_ivf_lens_fpath = Path::new(idx_path).join("ivf_lengths.npy");
-    opt_ivf_lens
+    let opt_inverted_file_lengths_fpath = Path::new(index_path).join("ivf_lengths.npy");
+    opt_inverted_file_lengths
         .to_device(Device::Cpu)
-        .write_npy(&opt_ivf_lens_fpath)?;
+        .write_npy(&opt_inverted_file_lengths_fpath)?;
 
-    let final_meta_fpath = Path::new(idx_path).join("metadata.json");
+    let final_meta_fpath = Path::new(index_path).join("metadata.json");
     let final_num_docs = documents_embeddings.len();
     let final_avg_doclen = if final_num_docs > 0 {
-        total_num_embs as f64 / final_num_docs as f64
+        total_num_embeddings as f64 / final_num_docs as f64
     } else {
         0.0
     };
@@ -453,8 +497,8 @@ pub fn create_index(
     let final_meta_json = json!({
         "num_chunks": n_chunks,
         "nbits": nbits,
-        "num_partitions": est_total_embs,
-        "num_embeddings": total_num_embs,
+        "num_partitions": est_total_embeddings,
+        "num_embeddings": total_num_embeddings,
         "avg_doclen": final_avg_doclen,
     });
     let final_meta_file = fs::File::create(&final_meta_fpath)?;

@@ -24,7 +24,7 @@ pub struct ResidualCodec {
     /// A pre-computed lookup table to reverse the order of `nbits` segments within a byte.
     pub byte_reversed_bits_map: Tensor,
     /// An optional lookup table for decomposing compressed byte values into bucket indices.
-    pub decomp_indices_lookup: Option<Tensor>,
+    pub bucket_weight_indices_lookup: Option<Tensor>,
 }
 
 impl ResidualCodec {
@@ -88,46 +88,41 @@ impl ResidualCodec {
         .to_device(device);
 
         let keys_per_byte = 8 / nbits_param;
-        let opt_decomp_lookup_table = if let Some(ref weights) = bucket_weights_tensor_initial {
-            let num_buckets = weights.size()[0] as usize;
-            let bucket_indices = (0..num_buckets as i64).collect::<Vec<_>>();
+        let opt_bucket_weight_indices_lookup_table =
+            if let Some(ref weights) = bucket_weights_tensor_initial {
+                let num_buckets = weights.size()[0] as usize;
+                let bucket_indices = (0..num_buckets as i64).collect::<Vec<_>>();
 
-            let combinations = iter::repeat(bucket_indices)
-                .take(keys_per_byte as usize)
-                .multi_cartesian_product()
-                .flatten()
-                .collect::<Vec<_>>();
+                let combinations = iter::repeat(bucket_indices)
+                    .take(keys_per_byte as usize)
+                    .multi_cartesian_product()
+                    .flatten()
+                    .collect::<Vec<_>>();
 
-            let lookup_shape = vec![
-                (num_buckets as i64).pow(keys_per_byte as u32),
-                keys_per_byte,
-            ];
+                let lookup_shape = vec![
+                    (num_buckets as i64).pow(keys_per_byte as u32),
+                    keys_per_byte,
+                ];
 
-            Some(
-                Tensor::from_slice(&combinations)
-                    .reshape(&lookup_shape)
-                    .to_kind(Kind::Int64)
-                    .to_device(device),
-            )
-        } else {
-            None
-        };
+                Some(
+                    Tensor::from_slice(&combinations)
+                        .reshape(&lookup_shape)
+                        .to_kind(Kind::Int64)
+                        .to_device(device),
+                )
+            } else {
+                None
+            };
 
         Ok(Self {
             nbits: nbits_param,
-            centroids: centroids_tensor_initial
-                .to_device(device)
-                .to_kind(Kind::Half),
-            avg_residual: avg_residual_tensor_initial
-                .to_device(device)
-                .to_kind(Kind::Half),
-            bucket_cutoffs: bucket_cutoffs_tensor_initial
-                .map(|t| t.to_device(device).to_kind(Kind::Half)),
-            bucket_weights: bucket_weights_tensor_initial
-                .map(|t| t.to_device(device).to_kind(Kind::Half)),
+            centroids: centroids_tensor_initial,
+            avg_residual: avg_residual_tensor_initial,
+            bucket_cutoffs: bucket_cutoffs_tensor_initial,
+            bucket_weights: bucket_weights_tensor_initial,
             bit_helper: bit_helper_tensor,
             byte_reversed_bits_map: byte_map_tensor,
-            decomp_indices_lookup: opt_decomp_lookup_table,
+            bucket_weight_indices_lookup: opt_bucket_weight_indices_lookup_table,
         })
     }
 }

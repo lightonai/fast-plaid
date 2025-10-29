@@ -9,6 +9,8 @@ import torch
 from fast_plaid import evaluation, search
 from pylate import models
 
+print("Torch version:", torch.__version__)
+
 parser = argparse.ArgumentParser(
     description="Run Fast-PLAiD evaluation on a BEIR dataset."
 )
@@ -88,11 +90,11 @@ search_time = end_search - start_search
 
 large_queries_embeddings = torch.cat(
     ([queries_embeddings] * ((1000 // queries_embeddings.shape[0]) + 1))[:1000]
-)
+).to("cpu")
 
 print(f"🔍 50_000 queries on {dataset_name}...")
 start_search = time.time()
-_ = index.search(queries_embeddings=large_queries_embeddings)
+_ = index.search(queries_embeddings=large_queries_embeddings, top_k=10, n_full_scores=4096, n_ivf_probe=8)
 end_search = time.time()
 heavy_search_time = end_search - start_search
 queries_per_second = large_queries_embeddings.shape[0] / heavy_search_time
@@ -140,70 +142,3 @@ with open(output_filepath, "w") as f:
     json.dump(output_data, f, indent=4)
 
 print(f"🎉 Finished evaluation for dataset: {dataset_name}\n")
-
-# Pylate
-
-from pylate import evaluation, indexes, retrieve
-
-index = indexes.PLAID(
-    override=True,
-    index_name=f"{dataset_name}_pylate",
-    embedding_size=96,
-    nbits=4,
-)
-
-retriever = retrieve.ColBERT(index=index)
-
-start = time.time()
-index.add_documents(
-    documents_ids=[document["id"] for document in documents],
-    documents_embeddings=documents_embeddings,
-)
-end = time.time()
-indexing_time = end - start
-print(f"🏗️  Pylate index on {dataset_name}: {end - start:.2f} seconds")
-
-start = time.time()
-scores = retriever.retrieve(queries_embeddings=queries_embeddings, k=20)
-end = time.time()
-search_time = end - start
-print(f"🔍 Pylate search on {dataset_name}: {search_time:.2f} seconds")
-
-
-start = time.time()
-_ = retriever.retrieve(queries_embeddings=large_queries_embeddings, k=20)
-end = time.time()
-heavy_search_time = end - start
-queries_per_second = large_queries_embeddings.shape[0] / heavy_search_time
-
-for (query_id, query), query_scores in zip(queries.items(), scores):
-    for score in query_scores:
-        if score["id"] == query_id:
-            # Remove the query_id from the score
-            query_scores.remove(score)
-
-evaluation_scores = evaluation.evaluate(
-    scores=scores,
-    qrels=qrels,
-    queries=list(queries.values()),
-    metrics=["map", "ndcg@10", "ndcg@100", "recall@10", "recall@100"],
-)
-
-print(f"\n--- 📈 Final Scores for {dataset_name} (Pylate) ---")
-print(evaluation_scores)
-
-output_data = {
-    "dataset": dataset_name,
-    "indexing": round(indexing_time, 3),
-    "search": round(search_time, 3),
-    "qps": round(queries_per_second, 2),
-    "size": len(documents),
-    "queries": num_queries,
-    "scores": evaluation_scores,
-}
-
-output_filepath = os.path.join(output_dir, f"{dataset_name}_pylate.json")
-with open(output_filepath, "w") as f:
-    json.dump(output_data, f, indent=4)
-
-print(f"💾 Exporting Pylate results to {output_filepath}")

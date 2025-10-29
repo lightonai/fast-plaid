@@ -8,59 +8,23 @@ use tch::{Device, Kind, Tensor};
 use crate::search::tensor::StridedTensor;
 use crate::utils::residual_codec::ResidualCodec;
 
-/// Holds metadata, typically loaded from a configuration or header file.
-///
-/// This struct is designed to be deserialized from a format like JSON or TOML,
-/// capturing key properties about an associated dataset, such as its structure
-/// or encoding scheme.
 #[derive(Deserialize, Debug)]
 pub struct Metadata {
-    /// The number of chunks or segments the data is divided into.
     pub num_chunks: usize,
-    /// The number of bits used for data representation, often for quantization.
     pub nbits: i64,
 }
 
-/// Represents a loaded search index and its associated data tensors.
-///
-/// This structure holds all the necessary components for performing a search,
-/// including the quantization codec and strided tensors for efficient data access.
 pub struct LoadedIndex {
-    /// The residual codec used for encoding and decoding vector residuals.
     pub codec: ResidualCodec,
-    /// A strided tensor containing the IVF (Inverted File) index.
     pub ivf_index_strided: StridedTensor,
-    /// A strided tensor of document codes.
     pub doc_codes_strided: StridedTensor,
-    /// A strided tensor of document residuals.
     pub doc_residuals_strided: StridedTensor,
-    /// The number of bits used for quantization in the codec.
     pub nbits: i64,
 }
 
-/// Loads an index from a specified directory and prepares it for searching.
-///
-/// This function reads index metadata, loads tensor data from `.npy` files,
-/// and assembles them into a `LoadedIndex` struct. It handles loading tensors
-/// onto the specified compute device and dynamically loads the required Torch library.
-///
-/// # Arguments
-///
-/// * `index_dir_path_str` - The file path to the directory containing the index files.
-/// * `device` - The `tch::Device` (e.g., `Device::Cuda(0)` or `Device::Cpu`) onto which the tensors will be loaded.
-///
-/// # Returns
-///
-/// A `Result` containing the fully loaded `LoadedIndex` on success, or an error
-/// if any part of the loading process fails (e.g., file not found, parsing error).
-///
-/// # Errors
-///
-/// This function will return an error if:
-/// - The Torch library path cannot be converted to a C-style string.
-/// - The `metadata.json` file is missing or cannot be parsed.
-/// - Any of the required `.npy` or `.json` files are missing or corrupt.
-/// - Tensors cannot be loaded onto the specified device.
+unsafe impl Send for LoadedIndex {}
+unsafe impl Sync for LoadedIndex {}
+
 pub fn load_index(index_dir_path_str: &str, device: Device) -> Result<LoadedIndex> {
     let index_dir_path = Path::new(index_dir_path_str);
     let metadata_content_raw = std::fs::read(index_dir_path.join("metadata.json"))
@@ -118,16 +82,17 @@ pub fn load_index(index_dir_path_str: &str, device: Device) -> Result<LoadedInde
         .to_kind(Kind::Int64)
         .to_device(device);
 
-    let total_embs_from_doclens = if all_doc_lengths.numel() > 0 {
+    let total_embeddings_from_doclens = if all_doc_lengths.numel() > 0 {
         all_doc_lengths.sum(Kind::Int64).int64_value(&[])
     } else {
         0
     };
 
-    let full_codes_preallocated = Tensor::empty(&[total_embs_from_doclens], (Kind::Int64, device));
+    let full_codes_preallocated =
+        Tensor::empty(&[total_embeddings_from_doclens], (Kind::Int64, device));
     let residual_element_size = (index_dimension * nbits_metadata) / 8;
     let full_residuals_preallocated = Tensor::empty(
-        &[total_embs_from_doclens, residual_element_size],
+        &[total_embeddings_from_doclens, residual_element_size],
         (Kind::Uint8, device),
     );
 
@@ -159,12 +124,12 @@ pub fn load_index(index_dir_path_str: &str, device: Device) -> Result<LoadedInde
     }
 
     let final_codes = full_codes_preallocated.narrow(0, 0, current_write_offset);
-    let final_residuals = full_residuals_preallocated.narrow(0, 0, current_write_offset);
+    let packed_residuals = full_residuals_preallocated.narrow(0, 0, current_write_offset);
 
     let doc_codes_strided =
         StridedTensor::new(final_codes, all_doc_lengths.shallow_clone(), device);
     let doc_residuals_strided =
-        StridedTensor::new(final_residuals, all_doc_lengths.shallow_clone(), device);
+        StridedTensor::new(packed_residuals, all_doc_lengths.shallow_clone(), device);
 
     Ok(LoadedIndex {
         codec,

@@ -8,12 +8,25 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest]
-        python-version: ["3.13"]
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Free up disk space on Ubuntu
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          echo "Initial free space:"
+          df -h
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo swapoff -a
+          sudo rm -f /swapfile
+          echo "Free space after cleanup:"
+          df -h
 
       - name: Prepare pyproject.toml
         shell: bash
@@ -50,8 +63,8 @@ jobs:
           CIBW_MANYLINUX_ARM64_IMAGE: manylinux_2_28
           CIBW_ENVIRONMENT: |
             PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cpu/torch_stable.html"
-          CIBW_PIP_ARGS: --no-cache-dir
-          CIBW_BEFORE_BUILD: "pip install delvewheel"
+          CIBW_PIP_ARGS: "--no-cache-dir --no-build-isolation"
+          CIBW_BEFORE_BUILD: "pip install torch==2.9.0 numpy maturin delvewheel"
           CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
             LD_LIBRARY_PATH=$(python -c 'import torch, os; print(os.path.join(os.path.dirname(torch.__file__), "lib"))'):$LD_LIBRARY_PATH auditwheel repair -w {dest_dir} {wheel} --exclude libtorch.so --exclude libtorch_cpu.so --exclude libtorch_python.so
           CIBW_REPAIR_WHEEL_COMMAND_MACOS: >

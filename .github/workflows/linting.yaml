@@ -30,5 +30,3 @@ jobs:
 
       - name: Check Python code with ruff
         run: uv run ruff check python
-
-        

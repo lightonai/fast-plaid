@@ -1,8 +1,8 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use indicatif::{ProgressBar, ProgressIterator};
 use pyo3::prelude::*;
 use serde::Serialize;
-use tch::{Device, IndexOp, Kind, Tensor};
+use tch::{Device, Kind, Tensor};
 
 use crate::search::load::LoadedIndex;
 use crate::search::padding::direct_pad_sequences;
@@ -165,22 +165,18 @@ impl SearchParameters {
 /// A `Result` with a `Vec<QueryResult>`. Individual search failures result in an empty
 /// `QueryResult` for that specific query, ensuring the operation doesn't halt.
 pub fn search_many(
-    queries: &Tensor,
+    queries: &Vec<Tensor>,
     index: &LoadedIndex,
     params: &SearchParameters,
     device: Device,
     show_progress: bool,
     subset: Option<Vec<Vec<i64>>>,
 ) -> Result<Vec<QueryResult>> {
-    let [num_queries, _, query_dim] = queries.size()[..] else {
-        bail!(
-            "Expected a 3D tensor for queries, but got shape {:?}",
-            queries.size()
-        );
-    };
+    let num_queries = queries.len();
+    let query_dim = queries[0].size()[queries[0].dim() - 1];
 
-    let search_closure = |query_index| {
-        let query_embedding = queries.i(query_index).to(device);
+    let search_closure = |query_index: usize| {
+        let query_embedding = &queries[query_index].to(device);
 
         // Handle the per-query subset list
         let query_subset = subset.as_ref().and_then(|s| s.get(query_index as usize));

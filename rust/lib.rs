@@ -376,7 +376,7 @@ fn load_and_search(
     index: String,
     torch_path: String,
     device: String,
-    queries_embeddings: PyTensor,
+    queries_embeddings: Vec<PyTensor>,
     search_parameters: &SearchParameters,
     show_progress: bool,
     preload_index: bool,
@@ -397,9 +397,14 @@ fn load_and_search(
         Ok(Arc::new(loaded_index))
     }?;
 
+    let queries_embeddings: Vec<_> = queries_embeddings
+        .into_iter()
+        .map(|tensor| tensor.to_kind(Kind::Half))
+        .collect();
+
     // Perform the search
     let results = search_many(
-        &queries_embeddings.to_kind(Kind::Half),
+        &queries_embeddings,
         &index,
         search_parameters,
         device_tch,

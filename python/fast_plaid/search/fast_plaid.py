@@ -154,11 +154,11 @@ def search_on_device(  # noqa: PLR0913
     ]
 
 
-def cleanup_embeddings(embeddings: list[torch.Tensor] | torch.Tensor) -> list[torch.Tensor]:
+def cleanup_embeddings(
+    embeddings: list[torch.Tensor] | torch.Tensor,
+) -> list[torch.Tensor]:
     if isinstance(embeddings, torch.Tensor):
-        embeddings = [
-            embeddings[i] for i in range(embeddings.shape[0])
-        ]
+        embeddings = [embeddings[i] for i in range(embeddings.shape[0])]
     return [
         embedding.squeeze(0) if embedding.dim() == 3 else embedding
         for embedding in embeddings
@@ -524,7 +524,8 @@ class FastPlaid:
 
             # Use torch.chunk to split the tensor into num_cpus
             queries_embeddings_splits = [
-                queries_embeddings[i:i + num_cpus] for i in range(0, num_queries, num_cpus)
+                queries_embeddings[i : i + num_cpus]
+                for i in range(0, num_queries, num_cpus)
             ]
 
             # Filter out empty chunks that torch.chunk might create
@@ -593,7 +594,8 @@ class FastPlaid:
             )
 
         queries_embeddings_splits = [
-            queries_embeddings[i:i + len(self.devices)] for i in range(0, num_queries, len(self.devices))
+            queries_embeddings[i : i + len(self.devices)]
+            for i in range(0, num_queries, len(self.devices))
         ]
 
         num_splits = len(queries_embeddings_splits)

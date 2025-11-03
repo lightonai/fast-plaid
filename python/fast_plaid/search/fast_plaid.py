@@ -157,6 +157,7 @@ def search_on_device(  # noqa: PLR0913
 def cleanup_embeddings(
     embeddings: list[torch.Tensor] | torch.Tensor,
 ) -> list[torch.Tensor]:
+    """Convert embeddings to a list and remove extra dimensions."""
     if isinstance(embeddings, torch.Tensor):
         embeddings = [embeddings[i] for i in range(embeddings.shape[0])]
     return [

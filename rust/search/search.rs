@@ -173,6 +173,9 @@ pub fn search_many(
     subset: Option<Vec<Vec<i64>>>,
 ) -> Result<Vec<QueryResult>> {
     let num_queries = queries.len();
+    if num_queries == 0 {
+        return Ok(Vec::new());
+    }
     let query_dim = queries[0].size()[queries[0].dim() - 1];
 
     let search_closure = |query_index: usize| {

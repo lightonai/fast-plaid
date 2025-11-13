@@ -444,7 +444,7 @@ class FastPlaid:
         self,
         queries_embeddings: torch.Tensor | list[torch.Tensor],
         top_k: int = 10,
-        batch_size: int = 25000,
+        batch_size: int = 2000,
         n_full_scores: int = 4096,
         n_ivf_probe: int = 8,
         show_progress: bool = True,

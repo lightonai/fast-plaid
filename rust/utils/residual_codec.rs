@@ -27,6 +27,25 @@ pub struct ResidualCodec {
     pub bucket_weight_indices_lookup: Option<Tensor>,
 }
 
+impl Clone for ResidualCodec {
+    fn clone(&self) -> Self {
+        Self {
+            nbits: self.nbits,
+            // tch::Tensor::shallow_clone() creates a new Tensor object sharing the same storage.
+            centroids: self.centroids.shallow_clone(),
+            avg_residual: self.avg_residual.shallow_clone(),
+            bucket_cutoffs: self.bucket_cutoffs.as_ref().map(|t| t.shallow_clone()),
+            bucket_weights: self.bucket_weights.as_ref().map(|t| t.shallow_clone()),
+            bit_helper: self.bit_helper.shallow_clone(),
+            byte_reversed_bits_map: self.byte_reversed_bits_map.shallow_clone(),
+            bucket_weight_indices_lookup: self
+                .bucket_weight_indices_lookup
+                .as_ref()
+                .map(|t| t.shallow_clone()),
+        }
+    }
+}
+
 impl ResidualCodec {
     /// Creates and initializes a new `ResidualCodec`.
     ///
@@ -84,7 +103,7 @@ impl ResidualCodec {
                 .map(|&val| val as i64)
                 .collect::<Vec<_>>(),
         )
-        .to_kind(Kind::Int64)
+        .to_kind(Kind::Uint8)
         .to_device(device);
 
         let keys_per_byte = 8 / nbits_param;

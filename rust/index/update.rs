@@ -8,7 +8,8 @@ use std::path::Path;
 use tch::{Device, Kind, Tensor};
 
 use crate::index::create::{compress_into_codes, optimize_ivf, packbits, Metadata};
-
+use crate::search::load::LoadedIndex;
+use crate::search::tensor::StridedTensor;
 use crate::utils::residual_codec::ResidualCodec;
 
 const DEFAULT_PROC_CHUNK_SIZE: usize = 25_000;
@@ -35,12 +36,12 @@ pub fn update_index(
     idx_path: &str,
     device: Device,
     batch_size: i64,
-) -> Result<()> {
+    codec: &ResidualCodec,
+) -> Result<LoadedIndex> {
     let _grad_guard = tch::no_grad_guard();
-
     let idx_path_obj = Path::new(idx_path);
 
-    // Load main metadata to get existing state
+    // 1. Load Initial Metadata
     let main_meta_path = idx_path_obj.join("metadata.json");
     let main_meta_file = File::open(&main_meta_path)
         .with_context(|| format!("Failed to open main metadata file: {:?}", main_meta_path))?;
@@ -56,23 +57,14 @@ pub fn update_index(
     let est_total_embs = main_meta["num_partitions"]
         .as_i64()
         .context("Missing 'num_partitions' in metadata")?;
+    let embedding_dim = codec.centroids.size()[1];
 
-    // Load codec components from the existing index
-    let centroids = Tensor::read_npy(&idx_path_obj.join("centroids.npy"))?.to_device(device);
-    let b_cutoffs = Tensor::read_npy(&idx_path_obj.join("bucket_cutoffs.npy"))?.to_device(device);
-    let b_weights = Tensor::read_npy(&idx_path_obj.join("bucket_weights.npy"))?.to_device(device);
-    let avg_residual = Tensor::read_npy(&idx_path_obj.join("avg_residual.npy"))?.to_device(device);
-    let embedding_dim = centroids.size()[1];
+    let b_cutoffs = codec
+        .bucket_cutoffs
+        .as_ref()
+        .ok_or_else(|| anyhow!("Codec missing bucket_cutoffs"))?;
 
-    let codec = ResidualCodec::load(
-        nbits,
-        centroids,
-        avg_residual,
-        Some(b_cutoffs.copy()),
-        Some(b_weights.copy()),
-        device,
-    )?;
-
+    // 2. Process New Documents (Chunking & Quantization)
     let n_new_docs = documents_embeddings.len();
     let proc_chunk_sz = DEFAULT_PROC_CHUNK_SIZE.min(1 + n_new_docs);
     let n_new_chunks = (n_new_docs as f64 / proc_chunk_sz as f64).ceil() as usize;
@@ -105,7 +97,7 @@ pub fn update_index(
             let recon_centroids = Tensor::cat(&recon_centroids_batches, 0);
 
             let mut res_batch = &emb_batch - &recon_centroids;
-            res_batch = Tensor::bucketize(&res_batch, &b_cutoffs, true, false);
+            res_batch = Tensor::bucketize(&res_batch, b_cutoffs, true, false);
 
             let mut res_shape = res_batch.size();
             res_shape.push(nbits);
@@ -124,15 +116,16 @@ pub fn update_index(
         let chk_codes = Tensor::cat(&chk_codes_list, 0);
         let chk_residuals = Tensor::cat(&chk_res_list, 0);
 
-        // Save new chunk files
         chk_codes
             .to_device(Device::Cpu)
             .write_npy(&idx_path_obj.join(&format!("{}.codes.npy", chk_idx)))?;
         chk_residuals
             .to_device(Device::Cpu)
             .write_npy(&idx_path_obj.join(&format!("{}.residuals.npy", chk_idx)))?;
+
         let dl_file = File::create(idx_path_obj.join(format!("doclens.{}.json", chk_idx)))?;
         serde_json::to_writer(BufWriter::new(dl_file), &chk_doclens)?;
+
         let chk_meta = Metadata {
             num_passages: chk_doclens.len(),
             num_embeddings: chk_codes.size()[0] as usize,
@@ -141,11 +134,12 @@ pub fn update_index(
         serde_json::to_writer(BufWriter::new(meta_f_w), &chk_meta)?;
     }
 
+    // 3. Update Global Metadata & Collect Offsets
     let new_total_chunks = start_chunk_idx + n_new_chunks;
     let mut current_emb_offset = 0;
     let mut chk_emb_offsets: Vec<usize> = Vec::with_capacity(new_total_chunks);
+    let mut all_doc_lens_vec: Vec<i64> = Vec::new();
 
-    // Update metadata for all chunks with their global embedding offsets
     for chk_idx in 0..new_total_chunks {
         let chk_meta_fpath = idx_path_obj.join(format!("{}.metadata.json", chk_idx));
         let meta_f_r = File::open(&chk_meta_fpath)?;
@@ -160,36 +154,51 @@ pub fn update_index(
 
             let meta_f_w_updated = File::create(&chk_meta_fpath)?;
             serde_json::to_writer_pretty(BufWriter::new(meta_f_w_updated), &json_val)?;
-        } else {
-            return Err(anyhow!(
-                "Metadata in {:?} is not a JSON object",
-                chk_meta_fpath
-            ));
         }
+
+        let doclens_path = idx_path_obj.join(format!("doclens.{}.json", chk_idx));
+        let file = File::open(&doclens_path)?;
+        let doclens: Vec<i64> = serde_json::from_reader(BufReader::new(file))?;
+        all_doc_lens_vec.extend(doclens);
     }
 
     let total_num_embs = current_emb_offset;
+
+    // 4. Aggregate Codes and Residuals into Global Tensors
     let all_codes = Tensor::zeros(&[total_num_embs as i64], (Kind::Int64, device));
 
-    // Load all codes (old and new) into a single tensor
+    let residual_dim = embedding_dim / 8 * nbits;
+    let all_residuals = Tensor::zeros(
+        &[total_num_embs as i64, residual_dim],
+        (Kind::Uint8, device),
+    );
+
     for chk_idx in 0..new_total_chunks {
         let chk_offset_global = chk_emb_offsets[chk_idx];
+
         let codes_fpath = idx_path_obj.join(format!("{}.codes.npy", chk_idx));
         let codes_from_file = Tensor::read_npy(&codes_fpath)?.to_device(device);
-        let codes_in_chk_count = codes_from_file.size()[0];
+        let count = codes_from_file.size()[0];
+
         all_codes
-            .narrow(0, chk_offset_global as i64, codes_in_chk_count)
+            .narrow(0, chk_offset_global as i64, count)
             .copy_(&codes_from_file);
+
+        let res_fpath = idx_path_obj.join(format!("{}.residuals.npy", chk_idx));
+        let res_from_file = Tensor::read_npy(&res_fpath)?.to_device(device);
+
+        all_residuals
+            .narrow(0, chk_offset_global as i64, count)
+            .copy_(&res_from_file);
     }
 
-    // Sort all codes and generate the new, combined IVF
+    // 5. Optimize IVF
     let (sorted_codes, sorted_indices) = all_codes.sort(0, false);
     let code_counts = sorted_codes.bincount::<Tensor>(None, est_total_embs);
 
     let (opt_ivf, opt_ivf_lens) = optimize_ivf(&sorted_indices, &code_counts, idx_path, device)
         .context("Failed to optimize IVF during update")?;
 
-    // Overwrite the old IVF files with the new combined ones
     opt_ivf
         .to_device(Device::Cpu)
         .to_kind(Kind::Int64)
@@ -198,23 +207,8 @@ pub fn update_index(
         .to_device(Device::Cpu)
         .write_npy(&idx_path_obj.join("ivf_lengths.npy"))?;
 
-    // We need to count the total number of passages across all doclens files
-    let doclens_re = regex::Regex::new(r"doclens\.(\d+)\.json")?;
-    let mut total_passages = 0;
-    for entry in fs::read_dir(idx_path)? {
-        let entry = entry?;
-        let fname = entry.file_name();
-        if let Some(fname_str) = fname.to_str() {
-            if doclens_re.is_match(fname_str) {
-                let file = File::open(entry.path())?;
-                let doclens: Vec<i64> = serde_json::from_reader(BufReader::new(file))?;
-                total_passages += doclens.len();
-            }
-        }
-    }
-
-    let final_avg_doclen = if total_passages > 0 {
-        total_num_embs as f64 / total_passages as f64
+    let final_avg_doclen = if !all_doc_lens_vec.is_empty() {
+        total_num_embs as f64 / all_doc_lens_vec.len() as f64
     } else {
         0.0
     };
@@ -229,5 +223,25 @@ pub fn update_index(
     let final_meta_file = fs::File::create(&main_meta_path)?;
     serde_json::to_writer_pretty(BufWriter::new(final_meta_file), &final_meta_json)?;
 
-    Ok(())
+    let all_doc_lengths_tensor = Tensor::from_slice(&all_doc_lens_vec)
+        .to_kind(Kind::Int64)
+        .to_device(device);
+
+    let doc_codes_strided =
+        StridedTensor::new(all_codes, all_doc_lengths_tensor.shallow_clone(), device);
+
+    let doc_residuals_strided = StridedTensor::new(all_residuals, all_doc_lengths_tensor, device);
+
+    let ivf_index_strided = StridedTensor::new(opt_ivf, opt_ivf_lens, device);
+
+    drop(sorted_codes);
+    drop(sorted_indices);
+
+    Ok(LoadedIndex {
+        codec: codec.clone(),
+        ivf_index_strided,
+        doc_codes_strided,
+        doc_residuals_strided,
+        nbits: nbits,
+    })
 }

@@ -62,9 +62,11 @@ pub fn load_index(index_dir_path_str: &str, device: Device) -> Result<LoadedInde
     let ivf_data = Tensor::read_npy(index_dir_path.join("ivf.npy"))?
         .to_kind(Kind::Int64)
         .to_device(device);
+
     let ivf_lengths = Tensor::read_npy(index_dir_path.join("ivf_lengths.npy"))?
-        .to_kind(Kind::Int64)
+        .to_kind(Kind::Int)
         .to_device(device);
+
     let ivf_index_strided = StridedTensor::new(ivf_data, ivf_lengths, device);
 
     let mut all_doc_lens_vec: Vec<i64> = Vec::new();
@@ -89,7 +91,7 @@ pub fn load_index(index_dir_path_str: &str, device: Device) -> Result<LoadedInde
     };
 
     let full_codes_preallocated =
-        Tensor::empty(&[total_embeddings_from_doclens], (Kind::Int64, device));
+        Tensor::empty(&[total_embeddings_from_doclens], (Kind::Int, device));
     let residual_element_size = (index_dimension * nbits_metadata) / 8;
     let full_residuals_preallocated = Tensor::empty(
         &[total_embeddings_from_doclens, residual_element_size],

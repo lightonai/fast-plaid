@@ -1,32 +1,37 @@
 use std::collections::HashMap;
 use tch::{Device, Kind, Tensor};
 
-/// Creates a sliding window view of a tensor without copying data.
+/// Computes a single quantile for a 1D tensor using `kthvalue`.
 ///
-/// This function generates a new tensor view by sliding a window of a specified
-/// length over the first dimension of the source tensor. It leverages the
-/// `as_strided` method to create this view efficiently, avoiding memory
-/// duplication.
-///
-/// # Arguments
-///
-/// * `source_tensor` - A reference to the input `Tensor`. The sliding window
-///   will be applied along its first dimension.
-/// * `stride_len` - The length of the sliding window. This determines the size
-///   of the second dimension in the output tensor.
-/// * `inner_dims` - A slice representing the remaining dimensions of the
-///   `source_tensor` that should be preserved within each window.
-///
-/// # Returns
-///
-/// A new `Tensor` that is a strided view of the original. The new shape will be
-/// `[source_tensor.size()[0] - stride_len + 1, stride_len, ...inner_dims]`.
-///
-/// # Panics
-///
-/// This function may panic if `stride_len` is greater than the size of the
-/// first dimension of `source_tensor`, as this would result in a negative
-/// output dimension.
+/// https://github.com/pytorch/pytorch/issues/157431#issuecomment-3026856373
+fn scalar_quantile_kthvalue(tensor: &Tensor, q: f64) -> Tensor {
+    let n = tensor.size()[0];
+
+    // 1. Calculate target float index
+    let idx_float = q * (n - 1) as f64;
+    let lower_idx = idx_float.floor() as i64;
+    let upper_idx = idx_float.ceil() as i64;
+
+    // Note: kthvalue is 1-indexed in Torch, so we add 1 to our 0-indexed calculations.
+
+    // Optimization: If the index is exactly an integer, we only need one lookup.
+    if lower_idx == upper_idx {
+        // We take the 0-th element of the tuple returned by kthvalue (values, indices)
+        return tensor.kthvalue(lower_idx + 1, 0, true).0;
+    }
+
+    // 2. Retrieve bounds
+    let (lower_val, _) = tensor.kthvalue(lower_idx + 1, 0, true);
+    let (upper_val, _) = tensor.kthvalue(upper_idx + 1, 0, true);
+
+    // 3. Linear Interpolation (Lerp)
+    // weight is the fractional part: idx_float - floor(idx_float)
+    let weight = idx_float - lower_idx as f64;
+
+    // Performs: start + weight * (end - start)
+    lower_val.lerp(&upper_val, weight)
+}
+
 pub fn create_view(source_tensor: &Tensor, stride_len: i64, inner_dims: &[i64]) -> Tensor {
     let output_dim = source_tensor.size()[0] - stride_len + 1;
 
@@ -114,8 +119,7 @@ pub struct StridedTensor {
 impl StridedTensor {
     /// Computes optimal strides based on the distribution of element lengths.
     ///
-    /// Strides are determined by sampling quantiles, ensuring that common sequence
-    /// lengths are well-represented. The maximum element length is always included.
+    /// This now uses the optimized `scalar_quantile_kthvalue` logic.
     fn compute_strides(lengths: &Tensor, max_len: i64, device: Device) -> Vec<i64> {
         if lengths.numel() == 0 {
             return if max_len > 0 {
@@ -131,19 +135,18 @@ impl StridedTensor {
             lengths.index_select(0, &indices)
         } else {
             lengths.shallow_clone()
-        };
+        }
+        .to_kind(Kind::Float);
 
-        let quantiles = Tensor::from_slice(&[0.5, 0.75, 0.9, 0.95])
-            .to_kind(Kind::Float)
-            .to_device(device);
+        let target_quantiles = [0.5, 0.75, 0.9, 0.95];
 
-        let mut strides: Vec<i64> = sampled_lengths
-            .to_kind(Kind::Float)
-            .quantile(&quantiles, 0, false, &"linear")
-            .to_kind(Kind::Int64)
-            .iter::<i64>()
-            .unwrap()
-            .filter(|&s| s > 0) // Ensure strides are positive.
+        let mut strides: Vec<i64> = target_quantiles
+            .iter()
+            .map(|&q| {
+                let val_tensor = scalar_quantile_kthvalue(&sampled_lengths, q);
+                val_tensor.int64_value(&[]) // Extract scalar result as i64
+            })
+            .filter(|&s| s > 0)
             .collect();
 
         // Always include the max length as a possible stride.
@@ -261,8 +264,6 @@ impl StridedTensor {
             0
         };
 
-        // Find the smallest stride that can accommodate the longest element in the batch.
-        // Fall back to the maximum possible length if no suitable stride is found.
         let chosen_stride = self
             .precomputed_strides
             .iter()
@@ -270,7 +271,6 @@ impl StridedTensor {
             .copied()
             .unwrap_or(self.max_element_len);
 
-        // Handle cases where all selected elements have length 0.
         if chosen_stride == 0 {
             let mut empty_shape = vec![0];
             empty_shape.extend_from_slice(&self.inner_dims);
@@ -282,8 +282,8 @@ impl StridedTensor {
 
         let view = self.views_by_stride.get(&chosen_stride).unwrap_or_else(|| {
             panic!(
-                "Internal error: Stride view not found for stride: {}. Available: {:?}. Max selected length: {}.",
-                chosen_stride, self.precomputed_strides, max_selected_len
+                "Internal error: Stride view not found for stride: {}. Available: {:?}.",
+                chosen_stride, self.precomputed_strides
             )
         });
 

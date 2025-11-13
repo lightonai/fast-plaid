@@ -173,6 +173,7 @@ fn get_or_load_index(
         return Ok(Arc::clone(index_arc));
     }
 
+    println!("Loading index from disk and caching it: {}", index_path);
     // --- Load the index, insert into cache, and return ---
     let loaded_index = load_index(index_path, device).map_err(anyhow_to_pyerr)?;
     let index_arc = Arc::new(loaded_index);
@@ -295,20 +296,32 @@ fn update(
     call_torch(torch_path)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
 
-    let mut cache = INDEX_CACHE.write().unwrap();
-    cache.clear();
+    let device_tch = get_device(&device)?;
 
-    let device = get_device(&device)?;
+    // Retrieve the existing index to get the codec (needed for quantization)
+    let index_arc = get_or_load_index(&index, &device, device_tch)?;
 
     let embeddings: Vec<_> = embeddings
         .into_iter()
-        .map(|tensor| tensor.to_device(device).to_kind(Kind::Half))
+        .map(|tensor| tensor.to_device(device_tch).to_kind(Kind::Half))
         .collect();
 
-    let result = update_index(&embeddings, &index, device, batch_size)
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to update index: {}", e)));
+    // Call internal update_index which now returns Result<LoadedIndex>
+    let updated_index_struct = update_index(
+        &embeddings,
+        &index,
+        device_tch,
+        batch_size,
+        &index_arc.codec,
+    )
+    .map_err(|e| PyRuntimeError::new_err(format!("Failed to update index: {}", e)))?;
 
-    result
+    // Update the cache directly with the new in-memory index object
+    let mut cache = INDEX_CACHE.write().unwrap();
+    let key = (index, device);
+    cache.insert(key, Arc::new(updated_index_struct));
+
+    Ok(())
 }
 
 /// [Internal] Loads an index into the global cache for fast access.
@@ -337,7 +350,6 @@ fn preload_index(
     call_torch(torch_path)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
     let device_tch = get_device(&device)?;
-    // Call get_or_load_index to trigger a load if not already cached
     get_or_load_index(&index, &device, device_tch)?;
 
     Ok(())

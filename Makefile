@@ -10,7 +10,7 @@ install:
 
 test:
 	cargo clean
-	uv run tests/test.py
+	uv run python test.py
 
 evaluate:
-	uv run docs/benchmark/benchmark.py
+	uv run python docs/benchmark/benchmark.py

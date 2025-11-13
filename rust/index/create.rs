@@ -481,9 +481,11 @@ pub fn create_index(
         .to_device(Device::Cpu)
         .to_kind(Kind::Int64)
         .write_npy(&opt_ivf_fpath)?;
+
     let opt_inverted_file_lengths_fpath = Path::new(index_path).join("ivf_lengths.npy");
     opt_inverted_file_lengths
         .to_device(Device::Cpu)
+        .to_kind(Kind::Int)
         .write_npy(&opt_inverted_file_lengths_fpath)?;
 
     let final_meta_fpath = Path::new(index_path).join("metadata.json");

@@ -3,7 +3,6 @@ import json
 import os
 import shutil
 import time
-from typing import List
 
 import numpy as np
 import torch
@@ -12,21 +11,21 @@ from fast_plaid import evaluation, search
 from pylate import models
 from tqdm.auto import tqdm
 
+
 def encode_worker(
     gpu_id: int,
-    texts: List[str],
+    texts: list[str],
     model_name: str,
     query_length: int,
     document_length: int,
     is_query: bool,
-) -> List[np.ndarray]:
-    """
-    A separate process that loads a model onto a specific GPU and encodes texts.
-    """
+) -> list[np.ndarray]:
+    """A separate process that loads a model onto a specific GPU and encodes texts."""
     device = f"cuda:{gpu_id}"
     torch.cuda.set_device(device)
-    
+
     import logging
+
     logging.getLogger("pylate.models.colbert").setLevel(logging.ERROR)
 
     try:
@@ -36,7 +35,7 @@ def encode_worker(
             document_length=document_length,
         )
         model.to(device)
-        model.eval() 
+        model.eval()
     except Exception as e:
         print(f"WORKER {gpu_id} FAILED to load model: {e}")
         return []
@@ -44,17 +43,22 @@ def encode_worker(
     try:
         batch_size = 512
         embeddings = []
-        
+
         desc = f"GPU {gpu_id} {'Queries' if is_query else 'Docs'}"
         with torch.no_grad():
-            for i in tqdm(range(0, len(texts), batch_size), desc=desc, position=gpu_id, leave=False):
+            for i in tqdm(
+                range(0, len(texts), batch_size),
+                desc=desc,
+                position=gpu_id,
+                leave=False,
+            ):
                 batch_texts = texts[i : i + batch_size]
                 batch_embeddings = model.encode(
                     batch_texts,
                     is_query=is_query,
                 )
                 embeddings.extend(batch_embeddings)
-                
+
     except Exception as e:
         print(f"WORKER {gpu_id} FAILED during encoding: {e}")
         del model
@@ -64,6 +68,7 @@ def encode_worker(
     del model
     torch.cuda.empty_cache()
     return embeddings
+
 
 def run_evaluation():
     parser = argparse.ArgumentParser(
@@ -79,16 +84,26 @@ def run_evaluation():
     dataset_name = args.dataset
 
     query_length_map = {
-        "quora": 32, "climate-fever": 64, "nq": 32, "msmarco": 32,
-        "hotpotqa": 32, "nfcorpus": 32, "scifact": 48, "trec-covid": 48,
-        "fiqa": 32, "arguana": 64, "scidocs": 48, "dbpedia-entity": 32,
-        "webis-touche2020": 32, "fever": 32,
+        "quora": 32,
+        "climate-fever": 64,
+        "nq": 32,
+        "msmarco": 32,
+        "hotpotqa": 32,
+        "nfcorpus": 32,
+        "scifact": 48,
+        "trec-covid": 48,
+        "fiqa": 32,
+        "arguana": 64,
+        "scidocs": 48,
+        "dbpedia-entity": 32,
+        "webis-touche2020": 32,
+        "fever": 32,
     }
-    
+
     MODEL_NAME = "answerdotai/answerai-colbert-small-v1"
     QUERY_LENGTH = query_length_map.get(dataset_name, 32)
     DOC_LENGTH = 300
-    
+
     NUM_GPUS = torch.cuda.device_count()
     if NUM_GPUS == 0:
         print("❌ No GPUs detected. This script requires GPUs.")
@@ -112,13 +127,13 @@ def run_evaluation():
 
     print(f"🧠 Encoding {len(document_texts)} documents (in parallel)...")
     doc_chunks = np.array_split(document_texts, NUM_GPUS)
-    
+
     doc_worker_args = []
     for gpu_id in range(NUM_GPUS):
         doc_worker_args.append(
             (
                 gpu_id,
-                doc_chunks[gpu_id].tolist(), 
+                doc_chunks[gpu_id].tolist(),
                 MODEL_NAME,
                 QUERY_LENGTH,
                 DOC_LENGTH,
@@ -129,18 +144,19 @@ def run_evaluation():
     start_time = time.time()
     with mp.Pool(NUM_GPUS) as pool:
         doc_results_list = pool.starmap(encode_worker, doc_worker_args)
-    
+
     documents_embeddings = [item for sublist in doc_results_list for item in sublist]
     end_time = time.time()
     print(f"✅ Document encoding finished in {end_time - start_time:.2f} seconds.")
 
     if len(documents_embeddings) != len(document_texts):
-        print(f"❌ Error: Expected {len(document_texts)} doc embeddings, but got {len(documents_embeddings)}.")
+        print(
+            f"❌ Error: Expected {len(document_texts)} doc embeddings, but got {len(documents_embeddings)}."
+        )
         return
 
     print(f"🧠 Encoding {len(query_texts)} queries (in parallel)...")
     query_chunks = np.array_split(query_texts, NUM_GPUS)
-    
 
     query_worker_args = []
     for gpu_id in range(NUM_GPUS):
@@ -164,9 +180,11 @@ def run_evaluation():
     print(f"✅ Query encoding finished in {end_time - start_time:.2f} seconds.")
 
     if len(queries_embeddings) != len(query_texts):
-        print(f"❌ Error: Expected {len(query_texts)} query embeddings, but got {len(queries_embeddings)}.")
+        print(
+            f"❌ Error: Expected {len(query_texts)} query embeddings, but got {len(queries_embeddings)}."
+        )
         return
-    
+
     queries_embeddings_np = torch.Tensor(np.array(queries_embeddings))
     documents_embeddings = [torch.tensor(doc_emb) for doc_emb in documents_embeddings]
     queries_embeddings = torch.cat(tensors=[queries_embeddings_np], dim=0)
@@ -196,7 +214,8 @@ def run_evaluation():
     start_search = time.time()
     # Move queries to the index device (cuda:1) for searching
     scores = index.search(
-        queries_embeddings=queries_embeddings, top_k=20,
+        queries_embeddings=queries_embeddings,
+        top_k=20,
     )
     end_search = time.time()
     search_time = end_search - start_time
@@ -247,6 +266,8 @@ if __name__ == "__main__":
     try:
         mp.set_start_method("spawn", force=True)
     except RuntimeError as e:
-        print(f"Could not set 'spawn' start method. This is required for CUDA. Error: {e}")
+        print(
+            f"Could not set 'spawn' start method. This is required for CUDA. Error: {e}"
+        )
 
     run_evaluation()

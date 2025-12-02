@@ -96,7 +96,8 @@ import torch
 
 from fast_plaid import search
 
-fast_plaid = search.FastPlaid(index="index")
+fast_plaid = search.FastPlaid(index="index", device="cpu") # or "cuda" for GPU.
+# On CPU, specifying device speeds up initialization.
 
 embedding_dim = 128
 
@@ -212,7 +213,7 @@ scores = fast_plaid.search(
 print(scores)
 ```
 
-Providing a `subset` filter can significantly speed up the search process, especially when the subset is much smaller than the total number of indexed documents.
+Providing a `subset` filter can significantly speed up the search process, especially when the subset is much smaller than the total number of indexed documents. In order to increase the recall when applying drastic filtering, consider increasing the `n_ivf_probe` parameter in the `.search()` method (default: 8). It controls the number of clusters to search within the index for each query. Only clusters that contain documents from the provided subset are considered during the search.
 
 &nbsp;
 
@@ -316,7 +317,6 @@ class FastPlaid:
         self,
         index: str,
         device: str | list[str] | None = None,
-        preload_index: bool = True,
     ) -> None:
 ```
 
@@ -328,15 +328,12 @@ device: str | list[str] | None = None
     Specifies the device(s) to use for computation.
     - If None (default) and CUDA is available, it defaults to "cuda".
     - If CUDA is not available, it defaults to "cpu".
+    - You should specify the device to accelerate the initialization of FastPlaid index especially when using CPUs.
     - Can be a single device string (e.g., "cuda:0" or "cpu").
     - Can be a list of device strings (e.g., ["cuda:0", "cuda:1"]).
     - If multiple GPUs are specified and available, multiprocessing is automatically set up for parallel execution.
       Remember to include your code within an `if __name__ == "__main__":` block for proper multiprocessing behavior.
 
-preload_index: bool = True (optional)
-    If `True`, the index will be loaded into memory upon initialization. This can
-    speed up the first search operation by "warming up" the index. If `False`,
-    the index will be loaded when doing the search and unloaded afterward.
 ```
 
 ### Creating an Index
@@ -405,7 +402,7 @@ metadata: list[dict[str, Any]] | None = None (optional)
 
 ### Updating the Index
 
-The **`update` method** provides an efficient way to add new documents to an existing index without rebuilding it from scratch. This is significantly faster than calling .create() again, as it reuses the existing quantization configuration and only processes the new documents. The centroids and quantization parameters remain unchanged, **this might lead to a slight decrease in accuracy compared to a full re-indexing**. To update an existing embedding, you should delete it first and then add the new version with the `.update()` method.
+The **`update` method** provides an efficient way to add new documents to an existing index without rebuilding it from scratch. This is significantly faster than calling .create() again, as it reuses the existing quantization configuration and only processes the new documents. The centroids and quantization parameters remain unchanged, **this might lead to a slight decrease in accuracy compared to a full re-indexing**. To update an existing embedding, you should delete it first and then add the new version with the `.update()` method. Warning, when using the `delete` method, the remaining documents are re-indexed to maintain a sequential order. If you delete document k, all documents with id > k will have their id decreased by 1.
 
 ```python
     def update(
@@ -484,7 +481,7 @@ subset: list[list[int]] | list[int] | None = None (optional)
 
 ### Deleting from the Index
 
-The **`delete` method** allows to permanently remove embeddings from the index based on their insertion order IDs. If a metadata database exists, the corresponding entries will also be automatically removed. To update an existing embedding, you should delete it first and then add the new version with the `.update()` method.
+The **`delete` method** allows to permanently remove embeddings from the index based on their insertion order IDs. If a metadata database exists, the corresponding entries will also be automatically removed. To update an existing embedding, you should delete it first and then add the new version with the `.update()` method. Warning, when using the `delete` method, the remaining documents are re-indexed to maintain a sequential order. If you delete document k, all documents with id > k will have their id decreased by 1.
 
 ```python
     def delete(

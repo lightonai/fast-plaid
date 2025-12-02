@@ -6,23 +6,22 @@ use tch::{Device, Kind, Tensor};
 
 /// A global, thread-safe cache for reusable scratch tensors.
 ///
-/// This cache stores one tensor per `(Device, Kind)` combination. It is designed
-/// to reduce the frequency of memory allocations by reusing and expanding tensors
-/// as needed, which is particularly effective when dealing with variably sized
-/// batches on devices like GPUs.
+/// This cache stores one tensor per `(Device, Kind)` combination. It acts as a
+/// **Memory Pool**, designed to reduce the high latency cost of allocating
+/// fresh GPU memory for every batch.
+///
+///
+///
+/// The strategy is "grow-only": if a requested size fits within the cached tensor,
+/// a view is returned. If the request exceeds the cached size, the tensor is
+/// re-allocated to the larger size.
 static PAD_CACHE: Lazy<Mutex<HashMap<(Device, Kind), Tensor>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Retrieves a scratch tensor of a specified minimum shape.
 ///
 /// This function provides an efficient way to get a temporary tensor, amortizing
-/// allocation costs by maintaining a global cache. If a cached tensor for the
-/// given `device` and `kind` is available but too small, it is resized to fit
-/// the `min_shape`. If no tensor is cached, a new one is created.
-///
-/// The returned tensor is a shallow clone and may be larger than `min_shape`.
-/// The caller is responsible for slicing it to the exact required dimensions
-/// (e.g., using `narrow`).
+/// allocation costs.
 ///
 /// # Arguments
 ///
@@ -33,16 +32,21 @@ static PAD_CACHE: Lazy<Mutex<HashMap<(Device, Kind), Tensor>>> =
 ///
 /// # Returns
 ///
-/// A `Tensor` that meets the minimum shape requirement.
+/// A `Tensor` that meets the minimum shape requirement. The returned tensor is a
+/// shallow clone (pointer copy) of the global cache entry. The caller is responsible
+/// for slicing it to the exact required dimensions (e.g., using `narrow`) before usage.
 pub fn get_scratch(device: Device, kind: Kind, min_shape: &[i64], pad_value: f64) -> Tensor {
     let mut map = PAD_CACHE.lock();
     match map.entry((device, kind)) {
         Entry::Occupied(mut e) => {
             let t = e.get_mut();
+            // Check if the cached tensor is large enough in all relevant dimensions
             if t.size()[0] < min_shape[0]
                 || t.size()[1] < min_shape[1]
                 || t.size()[2] < min_shape[2]
             {
+                // Expand strategy: Create a new tensor that is at least as big as the request
+                // but keeps previous max dimensions to avoid shrinking.
                 let new_shape = [
                     t.size()[0].max(min_shape[0]),
                     t.size()[1].max(min_shape[1]),
@@ -61,25 +65,13 @@ pub fn get_scratch(device: Device, kind: Kind, min_shape: &[i64], pad_value: f64
 }
 
 /// A trait for finding the maximum value within a tensor.
-///
-/// This extension trait provides a `max_value` method to simplify the
-/// process of finding the single largest value across all elements
-/// of a `Tensor`.
 pub trait MaxValueExt {
     /// Computes the maximum value of all elements in the tensor.
-    ///
-    /// # Returns
-    ///
-    /// A new `Tensor` containing a single element, which is the maximum
-    /// value from the original tensor.
     fn max_value(&self) -> Tensor;
 }
 
 /// Implements the `MaxValueExt` trait for `tch::Tensor`.
 impl MaxValueExt for Tensor {
-    /// This implementation simply calls the built-in `max()` method.
-    /// It is marked with `#[inline(always)]` to encourage the compiler
-    /// to make it a zero-cost abstraction.
     #[inline(always)]
     fn max_value(&self) -> Tensor {
         self.max()
@@ -88,37 +80,36 @@ impl MaxValueExt for Tensor {
 
 /// A global, thread-safe cache for `arange` tensors.
 ///
-/// This cache stores tensors created by `Tensor::arange` to avoid redundant
-/// generation, which is common when creating attention masks of similar lengths.
-/// Tensors are keyed by their `(Device, length)` tuple.
+/// Used to avoid regenerating `[0, 1, 2, ... N]` sequences on the GPU repeatedly
+/// during attention mask generation. Tensors are keyed by `(Device, length)`.
 static RANGE_CACHE: Lazy<Mutex<HashMap<(Device, i64), Tensor>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Pads a batch of variable-length sequences into a dense tensor.
 ///
-/// This function efficiently transforms a concatenated tensor of sequences into a
-/// single padded tensor and generates a corresponding boolean attention mask. The
-/// implementation is optimized for performance on hardware accelerators (e.g., GPUs)
-/// by minimizing host-device synchronization and reusing memory buffers.
+/// This function efficiently transforms a flattened, concatenated tensor of sequences
+/// into a single dense 3D tensor and generates a corresponding boolean attention mask.
 ///
 /// # Key Optimizations
-/// - **Scratch Buffer**: Uses a cached scratch tensor via `get_scratch` to avoid repeated memory allocations.
-/// - **Asynchronous Operations**: Determines the maximum sequence length on the device without blocking.
-/// - **Efficient Masking**: Creates the attention mask using broadcasting, avoiding large intermediate tensors.
-/// - **Scatter-based Copy**: Uses `index_put_` with indices derived from the attention mask to efficiently copy data into the correct positions.
+/// - **Scratch Buffer**: Uses `PAD_CACHE` to avoid expensive `malloc` on the GPU.
+/// - **Asynchronous Operations**: Calculates `max_len` on the device to avoid host-device sync.
+/// - **Scatter-based Copy**: Instead of iterating through rows (slow in Python/loops),
+///   it calculates global indices via the mask and copies all data in one
+///   vectorized `index_put_` kernel.
 ///
 /// # Arguments
 ///
-/// * `sequences` - A 2D tensor of shape `[total_tokens, features]` containing the concatenated data of all sequences.
-/// * `length_values` - A 1D tensor of shape `[batch_size]` where each element is the length of a sequence.
+/// * `sequences` - A 2D tensor of shape `[total_tokens, features]` containing the
+///   concatenated data of all sequences.
+/// * `length_values` - A 1D tensor of shape `[batch_size]` containing sequence lengths.
 /// * `pad_value` - The floating-point value to use for padding.
 /// * `device` - The `tch::Device` on which to perform the operations.
 ///
 /// # Returns
 ///
-/// A `Result` containing a tuple of:
-/// * The padded sequences as a 3D tensor of shape `[batch_size, max_len, features]`.
-/// * A boolean attention mask of shape `[batch_size, max_len]`, where `true` indicates a valid token.
+/// A `Result` containing:
+/// * `padded_sequences`: Shape `[batch_size, max_len, features]`.
+/// * `attention_mask`: Shape `[batch_size, max_len]`, `true` = valid token.
 pub fn direct_pad_sequences(
     sequences: &Tensor,
     length_values: &Tensor,
@@ -135,9 +126,11 @@ pub fn direct_pad_sequences(
     let batch_size = length_values.size()[0];
     let feature_dim = sequences.size()[1];
 
+    // 1. Determine dimensions
     let max_len_tensor = length_values.to_device(device).max_value();
     let max_len: i64 = max_len_tensor.int64_value(&[]);
 
+    // 2. Prepare destination buffer (from cache)
     let padded_scratch = get_scratch(
         device,
         sequences.kind(),
@@ -145,12 +138,18 @@ pub fn direct_pad_sequences(
         pad_value,
     );
 
+    // Slice the scratch buffer to the exact size needed for this batch
     let mut padded_sequences = padded_scratch
         .narrow(0, 0, batch_size)
         .narrow(1, 0, max_len)
         .narrow(2, 0, feature_dim);
+
+    // Reset values to pad_value before writing
     let _ = padded_sequences.fill_(pad_value);
 
+    // 3. Generate Attention Mask
+    // We create a range row `[0, 1, ... max_len]` and compare it against `length_values`
+    // using broadcasting to create the boolean mask.
     let range_row = {
         let mut map = RANGE_CACHE.lock();
         map.entry((device, max_len))
@@ -159,19 +158,25 @@ pub fn direct_pad_sequences(
     };
 
     let attention_mask = range_row
-        .unsqueeze(0)
-        .lt_tensor(&length_values.to_device(device).unsqueeze(-1));
+        .unsqueeze(0) // Shape: [1, max_len]
+        .lt_tensor(&length_values.to_device(device).unsqueeze(-1)); // Shape: [batch, 1]
 
+    // 4. Scatter Data
+    // We get the coordinates of all `true` values in the mask. These correspond
+    // exactly to where the valid tokens should sit in the dense 3D tensor.
     let nz = attention_mask.nonzero();
-    let b_indices_flat = nz.select(1, 0);
-    let t_indices_flat = nz.select(1, 1);
+    let b_indices_flat = nz.select(1, 0); // Batch indices
+    let t_indices_flat = nz.select(1, 1); // Time/Sequence indices
 
     let sequences_on_device = sequences.to_device(device);
 
+    // Copy the flattened sequence data into the dense tensor at the specific
+    // (batch, time) coordinates derived from the mask.
     let _ = padded_sequences.index_put_(
         &[Some(b_indices_flat), Some(t_indices_flat)],
         &sequences_on_device,
         false,
     );
+
     Ok((padded_sequences, attention_mask))
 }

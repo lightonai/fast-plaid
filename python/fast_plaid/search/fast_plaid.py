@@ -4,15 +4,16 @@ import glob
 import math
 import os
 import random
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import torch
-import torch.multiprocessing as mp
 from fast_plaid import fast_plaid_rust
 from fastkmeans import FastKMeans
 from joblib import Parallel, delayed
 
 from ..filtering import create, delete, update
+from .load import _reload_index
 
 
 class TorchWithCudaNotFoundError(Exception):
@@ -120,13 +121,19 @@ def search_on_device(  # noqa: PLR0913
     n_full_scores: int,
     top_k: int,
     n_ivf_probe: int,
-    index: str,
-    torch_path: str,
+    index_object: Any,
     show_progress: bool,
-    preload_index: bool,
     subset: list[list[int]] | None = None,
 ) -> list[list[tuple[int, float]]]:
-    """Perform a search on a single specified device."""
+    """Perform a search on a single specified device using the passed object."""
+    # Guard clause to prevent the TypeError in Rust binding
+    if index_object is None:
+        error = f"""
+        Index object is None for device '{device}'.
+        This usually means the index was not found or failed to load.
+        """
+        raise ValueError(error)
+
     search_parameters = fast_plaid_rust.SearchParameters(
         batch_size=batch_size,
         n_full_scores=n_full_scores,
@@ -134,15 +141,13 @@ def search_on_device(  # noqa: PLR0913
         n_ivf_probe=n_ivf_probe,
     )
 
-    scores = fast_plaid_rust.load_and_search(
-        index=index,
-        torch_path=torch_path,
+    scores = fast_plaid_rust.pysearch(
+        index=index_object,
         device=device,
         queries_embeddings=queries_embeddings,
         search_parameters=search_parameters,
         show_progress=show_progress,
         subset=subset,
-        preload_index=preload_index,
     )
 
     return [
@@ -171,83 +176,35 @@ class FastPlaid:
         self,
         index: str,
         device: str | list[str] | None = None,
-        preload_index: bool = True,
+        **kwargs: Any,  # noqa: ARG002
     ) -> None:
         """Initialize the FastPlaid instance."""
-        self.multiple_gpus = False
-        if (
-            isinstance(device, list)
-            and len(device) > 1
-            and torch.cuda.device_count() > 1
-        ):
-            self.multiple_gpus = True
-            if mp.get_start_method(allow_none=True) != "spawn":
-                mp.set_start_method(method="spawn", force=True)
-
-        if device is None and torch.cuda.is_available():
-            self.devices = ["cuda"]
-        elif not torch.cuda.is_available():
-            cpu_count = os.cpu_count()
-            if cpu_count is None:
-                error = """
-                No CPU cores available. Please check your system configuration.
-                >>> import os; print(os.cpu_count())
-                Returns None.
-                """
-                raise RuntimeError(error)
-            self.devices = ["cpu"] * cpu_count
-        elif isinstance(device, str):
+        if device is not None and isinstance(device, str):
             self.devices = [device]
         elif isinstance(device, list):
             self.devices = device
+        elif torch.cuda.is_available():
+            self.devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
         else:
-            error = "Device must be a string, a list of strings, or None."
-            raise ValueError(error)
+            self.devices = ["cpu"]
+
+        # Ensure devices are unique to avoid redundant loading
+        self.devices = list(dict.fromkeys(self.devices))
 
         self.torch_path = _load_torch_path(device=self.devices[0])
         self.index = index
 
-        self.preload_index = preload_index
+        # Initialize Torch environment once
+        fast_plaid_rust.initialize_torch(torch_path=self.torch_path)
 
-        if self.preload_index:
-            self._load_index(
-                index_path=self.index,
-                torch_path=self.torch_path,
-                device=self.devices[0],
-            )
-
-        if self.multiple_gpus:
-            return
-
-        fast_plaid_rust.initialize_torch(
-            torch_path=self.torch_path,
-        )
-
-    @staticmethod
-    def _load_index(index_path: str, torch_path: str, device: str) -> None:
-        """Triggers the loading of the index.
-
-        If the index is already in the cache, this function does nothing.
-        This can be used to "warm up" the index before the first search.
-
-        Args:
-        ----
-        index_path:
-            Path to the index directory.
-        torch_path:
-            Path to the libtorch shared library.
-        device:
-            The device string (e.g., "cpu", "cuda:0").
-
-        """
-        if not os.path.exists(os.path.join(index_path, "metadata.json")):
-            return
-
-        # The Rust function handles both torch initialization and loading
-        fast_plaid_rust.preload_index(
-            index=index_path,
-            torch_path=torch_path,
-            device=device,
+        # Load an index object for each device.
+        # We duplicate the index object because it cannot be pickled or shared across
+        # process boundaries easily, but it can be loaded multiple times.
+        self.indices: dict[str, Any] = {}
+        self.indices = _reload_index(
+            index_path=self.index,
+            devices=self.devices,
+            indices=self.indices,
         )
 
     def create(  # noqa: PLR0913
@@ -262,32 +219,7 @@ class FastPlaid:
         use_triton_kmeans: bool | None = None,
         metadata: list[dict[str, Any]] | None = None,
     ) -> "FastPlaid":
-        """Create and saves the FastPlaid index.
-
-        Args:
-        ----
-        documents_embeddings:
-            A list of document embedding tensors to be indexed.
-        kmeans_niters:
-            Number of iterations for the K-means algorithm.
-        max_points_per_centroid:
-            The maximum number of points per centroid for K-means.
-        nbits:
-            Number of bits to use for quantization (default is 4).
-        n_samples_kmeans:
-            Number of samples to use for K-means. If None, it will be calculated based
-            on the number of documents.
-        batch_size:
-            Batch size for processing embeddings during index creation.
-        seed:
-            Optional seed for the random number generator used in index creation.
-        use_triton_kmeans:
-            Whether to use the Triton-based K-means implementation. If None, it will be
-            set to True if the device is not "cpu".
-        metadata:
-            Optional list of dictionaries containing metadata for each document.
-
-        """
+        """Create and saves the FastPlaid index."""
         if isinstance(documents_embeddings, torch.Tensor):
             documents_embeddings = [
                 documents_embeddings[i] for i in range(documents_embeddings.shape[0])
@@ -312,12 +244,15 @@ class FastPlaid:
 
         dim = documents_embeddings[0].shape[-1]
 
+        # Use the first device for creation logic
+        primary_device = self.devices[0]
+
         print("Computing centroids of embeddings.")
         centroids = compute_kmeans(
             documents_embeddings=documents_embeddings,
             dim=dim,
             kmeans_niters=kmeans_niters,
-            device=self.devices[0],
+            device=primary_device,
             max_points_per_centroid=max_points_per_centroid,
             n_samples_kmeans=n_samples_kmeans,
             seed=seed,
@@ -328,7 +263,7 @@ class FastPlaid:
         fast_plaid_rust.create(
             index=self.index,
             torch_path=self.torch_path,
-            device=self.devices[0],
+            device=primary_device,
             embedding_dim=dim,
             nbits=nbits,
             embeddings=documents_embeddings,
@@ -340,12 +275,12 @@ class FastPlaid:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        if self.preload_index:
-            self._load_index(
-                index_path=self.index,
-                torch_path=self.torch_path,
-                device=self.devices[0],
-            )
+        # Reload indices on all devices now that creation is complete
+        self.indices = _reload_index(
+            index_path=self.index,
+            devices=self.devices,
+            indices=self.indices,
+        )
 
         return self
 
@@ -355,21 +290,7 @@ class FastPlaid:
         metadata: list[dict[str, Any]] | None = None,
         batch_size: int = 25_000,
     ) -> "FastPlaid":
-        """Update an existing FastPlaid index with new documents.
-
-        This method adds new embeddings to the index without re-training the quantizer,
-        making it much faster than re-creating the index from scratch.
-
-        Args:
-        ----
-        documents_embeddings:
-            A list of new document embedding tensors to add to the index.
-        metadata:
-            Optional list of dictionaries containing metadata for each new document.
-        batch_size:
-            Batch size for processing embeddings during the update.
-
-        """
+        """Update an existing FastPlaid index with new documents."""
         if isinstance(documents_embeddings, torch.Tensor):
             documents_embeddings = [
                 documents_embeddings[i] for i in range(documents_embeddings.shape[0])
@@ -402,20 +323,24 @@ class FastPlaid:
                 raise ValueError(error)
             update(index=self.index, metadata=metadata)
 
+        if self.indices[self.devices[0]] is None:
+            raise RuntimeError("Index not loaded for update.")
+
         fast_plaid_rust.update(
-            index=self.index,
+            index_path=self.index,
+            index=self.indices[self.devices[0]],
             torch_path=self.torch_path,
             device=self.devices[0],
             embeddings=documents_embeddings,
             batch_size=batch_size,
         )
 
-        if self.preload_index:
-            self._load_index(
-                index_path=self.index,
-                torch_path=self.torch_path,
-                device=self.devices[0],
-            )
+        # Reload indices on all devices to reflect the updates
+        self.indices = _reload_index(
+            index_path=self.index,
+            devices=self.devices,
+            indices=self.indices,
+        )
 
         return self
 
@@ -440,7 +365,7 @@ class FastPlaid:
             except OSError as e:
                 raise e
 
-    def search(  # noqa: PLR0913, C901, PLR0912, PLR0915
+    def search(  # noqa: PLR0912, PLR0913, PLR0915, C901
         self,
         queries_embeddings: torch.Tensor | list[torch.Tensor],
         top_k: int = 10,
@@ -449,30 +374,53 @@ class FastPlaid:
         n_ivf_probe: int = 8,
         show_progress: bool = True,
         subset: list[list[int]] | list[int] | None = None,
+        n_processes: int | None = None,
     ) -> list[list[tuple[int, float]]]:
         """Search the index for the given query embeddings.
 
         Args:
         ----
         queries_embeddings:
-            Embeddings of the queries to search for.
+            A tensor of shape (num_queries, n_tokens, embedding_dim) or a list of
+            tensors.
         top_k:
-            Number of top results to return.
+            The number of top results to return for each query.
         batch_size:
-            Internal batch size for the search, and also the size of query
-            chunks for parallel processing.
+            The number of queries to process in each batch.
         n_full_scores:
-            Number of full scores to compute for re-ranking.
+            The number of full scores to compute per query.
         n_ivf_probe:
-            Number of inverted file probes to use.
+            The number of IVF clusters to probe during search.
         show_progress:
-            Whether to show progress during the search.
+            Whether to display a progress bar during search.
         subset:
-            An optional list of lists of integers. If provided, the search
-            for each query will be restricted to the document IDs in the
-            corresponding inner list.
+            A list of lists specifying subsets of the index to search for each
+            query, or a single list applied to all queries. If None, searches
+            the entire index.
+        n_processes: Number of jobs to use for CPU search via joblib.
+                        Ignored if running on GPU(s). Defaults to 1.
 
         """
+        if any(idx is None for idx in self.indices.values()):
+            self.indices = _reload_index(
+                index_path=self.index,
+                devices=self.devices,
+                indices=self.indices,
+            )
+
+        if not os.path.exists(os.path.join(self.index, "metadata.json")):
+            error = f"""
+            Index metadata not found in '{self.index}'.
+            Please create the index before searching.
+            """
+            raise FileNotFoundError(error)
+
+        for device in self.devices:
+            if self.indices[device] is None:
+                error = f"""Index could not be loaded on device '{device}'.
+                Check CUDA memory or device availability."""
+                raise RuntimeError(error)
+
         if isinstance(queries_embeddings, list):
             queries_embeddings = torch.nn.utils.rnn.pad_sequence(
                 sequences=[
@@ -485,30 +433,64 @@ class FastPlaid:
 
         num_queries = queries_embeddings.shape[0]
 
+        # Standardize subset
         if subset is not None:
             if isinstance(subset, int):
                 subset = [subset] * num_queries
-
             if isinstance(subset, list) and len(subset) == 0:
                 subset = None
-
             if isinstance(subset, list) and isinstance(subset[0], int):
                 subset = [subset] * num_queries  # type: ignore
 
-        if subset is not None and len(subset) != num_queries:
-            error = """
-            The length of the subset must match the number of queries. You can
-            provide either a single subset for all queries or a list of subsets
-            with the same length as the number of queries.
-            """
-            raise ValueError(error)
+            if subset is not None and len(subset) != num_queries:
+                error = """
+                The length of the subset must match the number of queries.
+                """
+                raise ValueError(error)
 
-        # Check for small query count on CPU to avoid multiprocessing overhead
-        is_cpu = self.devices[0] == "cpu"
-        small_query_count = num_queries <= 10
+        is_cpu_only = self.devices[0] == "cpu"
+        use_joblib = (is_cpu_only and (num_queries > 10) and n_processes != 1) or (
+            is_cpu_only
+            and n_processes is not None
+            and n_processes != 1
+            and num_queries > 1
+        )
 
-        if small_query_count and is_cpu:
-            # Use single-device path directly, bypassing splitting and parallel logic
+        if n_processes is None:
+            n_processes = min(num_queries // 10, os.cpu_count() or 1)
+
+        if use_joblib:
+            num_workers = n_processes
+            chunk_size = math.ceil(num_queries / num_workers)
+
+            query_chunks = list(torch.split(queries_embeddings, chunk_size))
+
+            subset_chunks = []
+            if subset is not None:
+                for i in range(0, num_queries, chunk_size):
+                    subset_chunks.append(subset[i : i + chunk_size])
+            else:
+                subset_chunks = [None] * len(query_chunks)  # type: ignore
+
+            results = Parallel(n_jobs=num_workers, prefer="threads")(
+                delayed(search_on_device)(
+                    device="cpu",
+                    queries_embeddings=chunk,
+                    batch_size=batch_size,
+                    n_full_scores=n_full_scores,
+                    top_k=top_k,
+                    n_ivf_probe=n_ivf_probe,
+                    index_object=self.indices["cpu"],
+                    show_progress=(show_progress and i == 0),
+                    subset=sub_chunk,
+                )
+                for i, (chunk, sub_chunk) in enumerate(zip(query_chunks, subset_chunks))
+            )
+
+            return [item for sublist in results for item in sublist]
+
+        # Single device shortcut (GPU or CPU n=1)
+        if len(self.devices) == 1:
             return search_on_device(
                 device=self.devices[0],
                 queries_embeddings=queries_embeddings,
@@ -516,161 +498,58 @@ class FastPlaid:
                 n_full_scores=n_full_scores,
                 top_k=top_k,
                 n_ivf_probe=n_ivf_probe,
-                index=self.index,
-                torch_path=self.torch_path,
+                index_object=self.indices[self.devices[0]],
                 show_progress=show_progress,
-                preload_index=self.preload_index,
                 subset=subset,  # type: ignore
             )
 
-        # Check for parallel CPU processing (>= 10 queries, multiple CPUs)
-        if is_cpu and len(self.devices) > 1:
-            # Split queries based on the number of available CPUs
-            num_cpus = len(self.devices)
+        # Multi-GPU Split
+        num_devices = len(self.devices)
+        chunk_size = math.ceil(num_queries / num_devices)
+        futures = []
+        query_chunks = list(torch.split(queries_embeddings, chunk_size))
 
-            # Use torch.chunk to split the tensor into num_cpus
-            queries_embeddings_splits = torch.chunk(
-                input=queries_embeddings,
-                chunks=num_cpus,
-                dim=0,
-            )
+        subset_chunks = []
+        if subset is not None:
+            for i in range(0, num_queries, chunk_size):
+                subset_chunks.append(subset[i : i + chunk_size])
+        else:
+            subset_chunks = [None] * len(query_chunks)  # type: ignore
 
-            # Filter out empty chunks that torch.chunk might create
-            # if num_queries < num_cpus
-            non_empty_splits = [
-                split for split in queries_embeddings_splits if split.shape[0] > 0
-            ]
-            num_splits = len(non_empty_splits)
+        with ThreadPoolExecutor(max_workers=num_devices) as executor:
+            for i, device in enumerate(self.devices):
+                if i >= len(query_chunks):
+                    break
 
-            subset_splits: list[list[list[int]] | None] = (
-                [None] * num_splits if subset is None else []
-            )
-            if subset is not None:
-                current_idx = 0
-                for split in non_empty_splits:
-                    size = split.shape[0]
-                    subset_splits.append(subset[current_idx : current_idx + size])  # type: ignore
-                    current_idx += size
-
-            # Parallel CPU processing
-            tasks = []
-            for i in range(num_splits):
-                device = self.devices[i]  # Use i-th CPU for i-th split
-                dev_queries = non_empty_splits[i]  # Use the non-empty split
-                dev_subset = subset_splits[i]
-
-                tasks.append(
-                    delayed(function=search_on_device)(
+                futures.append(
+                    executor.submit(
+                        search_on_device,
                         device=device,
-                        queries_embeddings=dev_queries,
-                        batch_size=batch_size,  # Keep original batch_size for inside
+                        queries_embeddings=query_chunks[i],
+                        batch_size=batch_size,
                         n_full_scores=n_full_scores,
                         top_k=top_k,
                         n_ivf_probe=n_ivf_probe,
-                        index=self.index,
-                        torch_path=self.torch_path,
-                        show_progress=i == 0 and show_progress,
-                        preload_index=self.preload_index,
-                        subset=dev_subset,
+                        index_object=self.indices[device],
+                        show_progress=show_progress and (i == 0),
+                        subset=subset_chunks[i],  # type: ignore
                     )
                 )
 
-            # Use num_cpus for n_jobs to utilize all cores
-            scores_per_device = Parallel(n_jobs=num_cpus)(tasks)
+        all_results = []
+        for future in futures:
+            all_results.extend(future.result())
 
-            scores = []
-            for device_scores in scores_per_device:
-                scores.extend(device_scores)
-
-            return scores
-
-        if not self.multiple_gpus:
-            # Single device (1 GPU) processing
-            return search_on_device(
-                device=self.devices[0],
-                queries_embeddings=queries_embeddings,
-                batch_size=batch_size,
-                n_full_scores=n_full_scores,
-                top_k=top_k,
-                n_ivf_probe=n_ivf_probe,
-                index=self.index,
-                torch_path=self.torch_path,
-                show_progress=show_progress,
-                preload_index=self.preload_index,
-                subset=subset,  # type: ignore
-            )
-
-        queries_embeddings_splits = torch.split(
-            tensor=queries_embeddings,
-            split_size_or_sections=len(self.devices),
-        )
-
-        num_splits = len(queries_embeddings_splits)
-        if subset is not None:
-            current_idx = 0
-            for split in queries_embeddings_splits:
-                size = split.shape[0]
-                subset_splits.append(subset[current_idx : current_idx + size])  # type: ignore
-                current_idx += size
-        else:
-            # Initialize subset_splits with Nones if subset is None
-            subset_splits = [None] * num_splits
-
-        # Parallel GPU processing
-        args_for_starmap = []
-        for i in range(num_splits):
-            device = self.devices[i % len(self.devices)]  # Cycle through GPUs
-            dev_queries = queries_embeddings_splits[i]
-            dev_subset = subset_splits[i]  # This is now safe to access
-
-            args_for_starmap.append(
-                (
-                    device,
-                    dev_queries,
-                    batch_size,
-                    n_full_scores,
-                    top_k,
-                    n_ivf_probe,
-                    self.index,
-                    self.torch_path,
-                    i == 0 and show_progress,
-                    self.preload_index,
-                    dev_subset,
-                )
-            )
-
-        scores_devices = []
-
-        context = mp.get_context()
-        with context.Pool(processes=len(self.devices)) as pool:
-            scores_devices = pool.starmap(
-                func=search_on_device,
-                iterable=args_for_starmap,
-            )
-
-        scores = []
-        for scores_device in scores_devices:
-            scores.extend(scores_device)
-
-        return scores
+        return all_results
 
     def delete(self, subset: list[int]) -> "FastPlaid":
-        """Delete embeddings from an existing FastPlaid index.
+        """Delete embeddings from an existing FastPlaid index."""
+        primary_device = self.devices[0]
 
-        If a metadata database exists, the corresponding entries will also
-        be deleted.
-
-        Args:
-        ----
-        subset:
-            List of embeddings to delete from the index with respect to
-            the insertion order.
-
-        """
         fast_plaid_rust.delete(
             index=self.index,
             torch_path=self.torch_path,
-            device=self.devices[0],
+            device=primary_device,
             subset=subset,
         )
 
@@ -678,11 +557,10 @@ class FastPlaid:
         if os.path.exists(metadata_db_path):
             delete(index=self.index, subset=subset)
 
-        if self.preload_index:
-            self._load_index(
-                index_path=self.index,
-                torch_path=self.torch_path,
-                device=self.devices[0],
-            )
+        self.indices = _reload_index(
+            index_path=self.index,
+            devices=self.devices,
+            indices=self.indices,
+        )
 
         return self

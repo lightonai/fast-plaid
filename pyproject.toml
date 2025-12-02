@@ -137,6 +137,9 @@ ignore = [
   "B905",
   "UP037",
   "PLC0415",
+  "EM101",
+  "TRY003",
+  "EM102",
 ]
 select = ["ALL"]
 fixable = ["ALL"]

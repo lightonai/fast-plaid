@@ -75,38 +75,9 @@ documents_embeddings = [torch.tensor(doc_emb) for doc_emb in documents_embedding
 queries_embeddings = torch.cat(tensors=[queries_embeddings], dim=0)
 
 index = search.FastPlaid(index=os.path.join("benchmark", dataset_name), device="cuda")
-print(f"🏗️  Building index for {dataset_name} (Incremental)...")
+print(f"🏗️  Building index for {dataset_name}...")
 start_index = time.time()
-
-# --- MODIFIED SECTION START ---
-
-# 1. Define split sizes
-initial_size = 1000
-update_batch_size = 100
-
-# 2. Split embeddings into initial chunk and remaining chunks
-initial_embeddings = documents_embeddings[:initial_size]
-remaining_embeddings = documents_embeddings[initial_size:]
-
-# 3. Create index with the first 100 documents
-print(f"\tInitializing index with first {len(initial_embeddings)} documents...")
-index.create(documents_embeddings=initial_embeddings, kmeans_niters=4)
-
-# 4. Update index with the rest, 100 at a time
-if remaining_embeddings:
-    total_remaining = len(remaining_embeddings)
-    print(
-        f"\tUpdating index with {total_remaining} documents in batches of {update_batch_size}..."
-    )
-
-    for i in range(0, total_remaining, update_batch_size):
-        print("Step", i // update_batch_size + 1)
-        batch = remaining_embeddings[i : i + update_batch_size]
-        # print(f"\t\tBatch {i // update_batch_size + 1}: adding {len(batch)} documents")
-        index.update(documents_embeddings=batch)
-
-# --- MODIFIED SECTION END ---
-
+index.create(documents_embeddings=documents_embeddings, kmeans_niters=4)
 end_index = time.time()
 indexing_time = end_index - start_index
 print(f"\t✅ {dataset_name} indexing: {indexing_time:.2f} seconds")

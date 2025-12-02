@@ -3,7 +3,18 @@ use tch::{Device, Kind, Tensor};
 
 /// Computes a single quantile for a 1D tensor using `kthvalue`.
 ///
-/// https://github.com/pytorch/pytorch/issues/157431#issuecomment-3026856373
+/// This function calculates the value below which a given percentage of data falls.
+/// It employs linear interpolation between the two nearest ranks if the target
+/// index is not an integer.
+///
+/// # Arguments
+///
+/// * `tensor` - The input 1D tensor.
+/// * `q` - The quantile to compute (between 0.0 and 1.0).
+///
+/// # Returns
+///
+/// A scalar `Tensor` containing the computed quantile value.
 fn scalar_quantile_kthvalue(tensor: &Tensor, q: f64) -> Tensor {
     let n = tensor.size()[0];
 
@@ -12,11 +23,8 @@ fn scalar_quantile_kthvalue(tensor: &Tensor, q: f64) -> Tensor {
     let lower_idx = idx_float.floor() as i64;
     let upper_idx = idx_float.ceil() as i64;
 
-    // Note: kthvalue is 1-indexed in Torch, so we add 1 to our 0-indexed calculations.
-
     // Optimization: If the index is exactly an integer, we only need one lookup.
     if lower_idx == upper_idx {
-        // We take the 0-th element of the tuple returned by kthvalue (values, indices)
         return tensor.kthvalue(lower_idx + 1, 0, true).0;
     }
 
@@ -25,13 +33,38 @@ fn scalar_quantile_kthvalue(tensor: &Tensor, q: f64) -> Tensor {
     let (upper_val, _) = tensor.kthvalue(upper_idx + 1, 0, true);
 
     // 3. Linear Interpolation (Lerp)
-    // weight is the fractional part: idx_float - floor(idx_float)
     let weight = idx_float - lower_idx as f64;
-
-    // Performs: start + weight * (end - start)
     lower_val.lerp(&upper_val, weight)
 }
 
+/// Creates a sliding window view of a tensor without copying data.
+///
+/// This function generates a new tensor view by sliding a window of a specified
+/// length over the first dimension of the source tensor. It leverages the
+/// `as_strided` method to create this view efficiently, avoiding memory
+/// duplication.
+///
+///
+///
+/// # Arguments
+///
+/// * `source_tensor` - A reference to the input `Tensor`. The sliding window
+///   will be applied along its first dimension.
+/// * `stride_len` - The length of the sliding window. This determines the size
+///   of the second dimension in the output tensor.
+/// * `inner_dims` - A slice representing the remaining dimensions of the
+///   `source_tensor` that should be preserved within each window.
+///
+/// # Returns
+///
+/// A new `Tensor` that is a strided view of the original. The new shape will be
+/// `[source_tensor.size()[0] - stride_len + 1, stride_len, ...inner_dims]`.
+///
+/// # Panics
+///
+/// This function may panic if `stride_len` is greater than the size of the
+/// first dimension of `source_tensor`, as this would result in a negative
+/// output dimension.
 pub fn create_view(source_tensor: &Tensor, stride_len: i64, inner_dims: &[i64]) -> Tensor {
     let output_dim = source_tensor.size()[0] - stride_len + 1;
 
@@ -54,6 +87,8 @@ pub fn create_view(source_tensor: &Tensor, stride_len: i64, inner_dims: &[i64]) 
 /// It produces a boolean tensor where `true` values correspond to valid (non-padded)
 /// tokens and `false` values correspond to padded tokens.
 ///
+///
+///
 /// # Arguments
 ///
 /// * `lengths_tensor` - A 1-D `Tensor` of kind `Int64` representing the true
@@ -69,7 +104,6 @@ pub fn create_view(source_tensor: &Tensor, stride_len: i64, inner_dims: &[i64]) 
 /// A boolean `Tensor` of shape `[batch_size, max_len]`, potentially with
 /// additional trailing dimensions. For a sequence of length `L`, the first `L`
 /// elements in its corresponding mask row will be `true`, and the rest will be `false`.
-///
 pub fn create_mask(
     lengths_tensor: &Tensor,
     max_len: i64,
@@ -119,7 +153,8 @@ pub struct StridedTensor {
 impl StridedTensor {
     /// Computes optimal strides based on the distribution of element lengths.
     ///
-    /// This now uses the optimized `scalar_quantile_kthvalue` logic.
+    /// Strides are determined by sampling quantiles, ensuring that common sequence
+    /// lengths are well-represented. The maximum element length is always included.
     fn compute_strides(lengths: &Tensor, max_len: i64, device: Device) -> Vec<i64> {
         if lengths.numel() == 0 {
             return if max_len > 0 {
@@ -129,7 +164,6 @@ impl StridedTensor {
             };
         }
 
-        // Sample for quantile calculation to improve performance on large tensors.
         let sampled_lengths = if lengths.size()[0] >= 5000 {
             let indices = Tensor::randint(lengths.size()[0], &[2000], (Kind::Int64, device));
             lengths.index_select(0, &indices)
@@ -144,17 +178,15 @@ impl StridedTensor {
             .iter()
             .map(|&q| {
                 let val_tensor = scalar_quantile_kthvalue(&sampled_lengths, q);
-                val_tensor.int64_value(&[]) // Extract scalar result as i64
+                val_tensor.int64_value(&[])
             })
             .filter(|&s| s > 0)
             .collect();
 
-        // Always include the max length as a possible stride.
         strides.push(max_len);
         strides.sort_unstable();
         strides.dedup();
 
-        // If max_len is 0 and no other positive strides were found, return empty.
         if strides.len() == 1 && strides[0] == 0 {
             return Vec::new();
         }
@@ -178,6 +210,8 @@ impl StridedTensor {
         } else {
             Vec::new()
         };
+
+        // Lengths are small, safe to move immediately
         let element_lengths = lengths.to_device(device).to_kind(Kind::Int64);
 
         let max_element_len = if element_lengths.numel() > 0 {
@@ -187,30 +221,48 @@ impl StridedTensor {
         };
 
         let precomputed_strides = Self::compute_strides(&element_lengths, max_element_len, device);
+
         let cumulative_lengths = {
             let zero_start = Tensor::zeros(&[1], (Kind::Int64, device));
             Tensor::cat(&[zero_start, element_lengths.cumsum(0, Kind::Int64)], 0)
         };
 
-        // Pad the data tensor to ensure any view from any offset is safe.
         let underlying_data = {
-            let mut padded_data = data.to_device(device);
-            // Padding is only necessary if there are elements to process.
+            // Check if conversion is actually needed to avoid redundant copy
+            let data_on_dev = if data.device() != device {
+                data.to_device(device)
+            } else {
+                data
+            };
+
+            let current_size = data_on_dev.size()[0];
+            let mut required_len = current_size;
+
             if cumulative_lengths.size()[0] > 1 {
-                // Required length is the start of the last element plus the max possible length.
                 let last_element_offset =
                     cumulative_lengths.int64_value(&[cumulative_lengths.size()[0] - 2]);
-                let required_len = last_element_offset + max_element_len;
-
-                if required_len > padded_data.size()[0] {
-                    let padding_needed = required_len - padded_data.size()[0];
-                    let mut padding_shape = vec![padding_needed];
-                    padding_shape.extend_from_slice(&inner_dims);
-                    let padding = Tensor::zeros(&padding_shape, (padded_data.kind(), device));
-                    padded_data = Tensor::cat(&[padded_data, padding], 0);
-                }
+                required_len = last_element_offset + max_element_len;
             }
-            padded_data
+
+            if required_len > current_size {
+                // Calculate padding needed
+                let mut new_shape = vec![required_len];
+                new_shape.extend_from_slice(&inner_dims);
+
+                // Allocate the FULL target memory once (zeros)
+                // This respects the original data's kind (e.g., Uint8)
+                let result = Tensor::zeros(&new_shape, (data_on_dev.kind(), device));
+
+                // Copy the original data into the start of the new buffer
+                // This keeps memory usage at (Size_Original + Size_New) instead of
+                // (Size_Original + Size_Padding + Size_New) which `cat` would do.
+                result.narrow(0, 0, current_size).copy_(&data_on_dev);
+
+                result
+            } else {
+                // No padding needed, return the tensor as-is
+                data_on_dev
+            }
         };
 
         let views_by_stride = precomputed_strides

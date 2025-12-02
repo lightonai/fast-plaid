@@ -9,7 +9,7 @@ build-backend = "maturin"
 
 [project]
 name = "fast_plaid"
-version = "1.2.5.290"
+version = "1.3.0.290"
 description = "Fast Plaid."
 authors = [
   { name = "Raphael Sourty, LightOn", email = "raphael.sourty@lighton.ai" },
@@ -20,7 +20,7 @@ classifiers = [
   "Programming Language :: Rust",
   "Operating System :: OS Independent",
 ]
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
   "fastkmeans >= 0.5.0",
   "joblib>=1.5.1",

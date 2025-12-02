@@ -24,31 +24,41 @@ pub struct Metadata {
     pub num_embeddings: usize,
 }
 
-/// Optimizes an Inverted File (IVF) index by removing duplicate passage IDs (PIDs)
-/// from each inverted list.
+/// Optimizes an Inverted File (IVF) index by removing duplicate passage IDs (PIDs).
 ///
-/// This function maps each embedding in the IVF to its original passage ID and then,
-/// for each list in the IVF, retains only the unique PIDs. This is useful for retrieval
-/// tasks where scoring each passage once per query is sufficient.
+/// In a multi-vector model like ColBERT, a single document produces many embeddings.
+/// Consequently, a single centroid (inverted list) might contain multiple embeddings
+/// from the *same* document.
+///
+///
+///
+/// This function:
+/// 1. Maps every embedding ID in the IVF to its parent Passage ID (PID).
+/// 2. Iterates through every inverted list.
+/// 3. Deduplicates PIDs within each list.
+///
+/// This reduces the size of the index and speeds up retrieval, as we only need to
+/// know *that* a document has a token in a specific cluster, not *how many*
+/// (at this stage).
 ///
 /// # Arguments
 ///
-/// * `ivf` - A 1D tensor containing the indices of embeddings, forming the concatenated inverted lists.
-/// * `inverted_file_lengths` - A 1D tensor where each element specifies the length of the corresponding inverted list in `ivf`.
-/// * `index_path` - The path to the directory containing the index files, specifically the `doclens.*.json` files.
-/// * `device` - The `tch::Device` on which to perform tensor operations.
+/// * `ivf` - A 1D tensor of embedding indices (the concatenated inverted lists).
+/// * `inverted_file_lengths` - A 1D tensor of list lengths.
+/// * `index_path` - Path to the index directory (to read `doclens` for ID mapping).
+/// * `device` - The compute device.
 ///
 /// # Returns
 ///
-/// A `Result` containing a tuple of two tensors:
-/// * The new, optimized IVF tensor with unique PIDs per list.
-/// * A tensor with the new lengths of each optimized inverted list.
+/// A tuple `(optimized_ivf, optimized_lengths)` where `optimized_ivf` contains
+/// unique Passage IDs rather than Embedding IDs.
 pub fn optimize_ivf(
     ivf: &Tensor,
     inverted_file_lengths: &Tensor,
     index_path: &str,
     device: Device,
 ) -> Result<(Tensor, Tensor)> {
+    // 1. Map Chunk IDs to File Paths
     let mut doclen_files: BTreeMap<i64, String> = BTreeMap::new();
     let doclen_re =
         Regex::new(r"doclens\.(\d+)\.json").context("Failed to compile regex for doclens files")?;
@@ -72,6 +82,7 @@ pub fn optimize_ivf(
         }
     }
 
+    // 2. Load all doclens to build the Embedding-to-PID map
     let mut all_doclens: Vec<i64> = Vec::new();
     for (_id, fpath) in doclen_files {
         let file = fs::File::open(&fpath)
@@ -84,6 +95,8 @@ pub fn optimize_ivf(
 
     let total_embeddings: i64 = all_doclens.iter().sum();
 
+    // 3. Generate the Mapping Tensor
+    // [0, 0, 0, 1, 1, 2, 2, 2, 2 ...]
     let mut emb_to_pid_vec: Vec<i64> = Vec::with_capacity(total_embeddings as usize);
     let mut pid_counter: i64 = 0;
     for &doc_len in &all_doclens {
@@ -97,7 +110,10 @@ pub fn optimize_ivf(
         .to_device(device)
         .to_kind(Kind::Int64);
 
+    // 4. Translate IVF from EmbID to PID
     let pids_in_ivf = emb_to_pid.index_select(0, ivf);
+
+    // 5. Deduplicate within each list (partition)
     let mut unique_pids_list: Vec<Tensor> = Vec::new();
     let mut new_inverted_file_lengths_vec: Vec<i64> = Vec::new();
     let inverted_file_lengths_vec: Vec<i64> = Vec::<i64>::try_from(inverted_file_lengths)?;
@@ -105,6 +121,7 @@ pub fn optimize_ivf(
 
     for &len in &inverted_file_lengths_vec {
         let pids_seg = pids_in_ivf.narrow(0, ivf_offset, len);
+        // unique_dim: (output, inverse_indices, counts)
         let (unique_pids, _, _) = pids_seg.unique_dim(0, true, false, false);
         unique_pids_list.push(unique_pids.copy());
         new_inverted_file_lengths_vec.push(unique_pids.size1().unwrap_or(0));
@@ -121,22 +138,22 @@ pub fn optimize_ivf(
 
 /// Compresses embeddings into codes by finding the nearest centroid.
 ///
-/// This function performs vector quantization by computing the matrix multiplication
-/// between centroids and embedding batches, then finding the index of the maximum
-/// value (i.e., the closest centroid) for each embedding.
+/// This performs an exhaustive Nearest Neighbor search between the input `embeddings`
+/// and the codebook `centroids` using matrix multiplication.
 ///
 /// # Arguments
 ///
-/// * `embeddings` - A tensor of embeddings to be compressed, with shape `[num_embeddings, dim]`.
-/// * `centroids` - A tensor of centroids, with shape `[num_centroids, dim]`.
-/// * `batch_size` - The size of each batch for processing embeddings.
+/// * `embeddings` - Shape `[N, dim]`.
+/// * `centroids` - Shape `[K, dim]`.
+/// * `batch_size` - Process N in chunks of this size to avoid OOM.
 ///
 /// # Returns
 ///
-/// A 1D tensor of codes (indices of the nearest centroids).
+/// `codes` - Shape `[N]`, indices of the nearest centroid for each embedding.
 pub fn compress_into_codes(embeddings: &Tensor, centroids: &Tensor, batch_size: i64) -> Tensor {
     let mut codes = Vec::new();
     for mut emb_batch in embeddings.split(batch_size, 0) {
+        // argmax( X @ C.T ) corresponds to finding the centroid with max cosine similarity.
         codes.push(centroids.matmul(&emb_batch.t_()).argmax(0, false));
     }
     Tensor::cat(&codes, 0)
@@ -144,18 +161,11 @@ pub fn compress_into_codes(embeddings: &Tensor, centroids: &Tensor, batch_size: 
 
 /// Packs a tensor of bits (0s or 1s) into a tensor of `Uint8` bytes.
 ///
-/// The function reshapes the input tensor into rows of 8 bits and computes
-/// their byte representation using a weighted sum.
-///
-/// # Arguments
-///
-/// * `bits` - A 1D tensor containing bit values (0s or 1s).
-///
-/// # Returns
-///
-/// A 1D tensor of `Uint8` bytes.
+/// Reshapes the input bit stream into blocks of 8 and computes the byte value.
+/// Used for storing quantized residuals efficiently on disk.
 pub fn packbits(bits: &Tensor) -> Tensor {
     let bits_mat = bits.reshape(&[-1, 8]).to_kind(Kind::Half);
+    // Weights: [128, 64, 32, 16, 8, 4, 2, 1] (Big Endian per byte)
     let weights = Tensor::from_slice(&[128i64, 64, 32, 16, 8, 4, 2, 1])
         .to_device(bits.device())
         .to_kind(Kind::Half);
@@ -163,27 +173,28 @@ pub fn packbits(bits: &Tensor) -> Tensor {
     packed
 }
 
-/// Creates a compressed index from a collection of document embeddings.
+/// Creates a complete FastPlaid index from scratch.
 ///
-/// This function orchestrates the end-to-end process of building a quantized
-/// index. It trains a `ResidualCodec` on a sample of the embeddings,
-/// then processes all embeddings in chunks to generate codes and quantized
-/// residuals. Finally, it builds and optimizes an IVF index from the codes.
+/// This is the main function for indexing. It performs the following pipeline:
+///
+/// 1.  **Sampling**: Selects a subset of documents to train the quantization Codec.
+/// 2.  **Training**: Computes the average residual and quantiles (buckets) for compression.
+/// 3.  **Chunked Indexing**: Iterates over all documents, quantizes them, and writes
+///     chunk files (codes, residuals, metadata) to disk.
+/// 4.  **Global Indexing**: Merges chunk metadata and builds the Global Inverted File (IVF).
+///
+///
 ///
 /// # Arguments
 ///
-/// * `documents_embeddings` - A vector of tensors, where each tensor represents the embeddings for a single document.
-/// * `index_path` - The directory path where the generated index files will be stored.
-/// * `embedding_dim` - The dimensionality of the embeddings.
-/// * `nbits` - The number of bits to use for residual quantization.
-/// * `device` - The `tch::Device` (e.g., CPU or CUDA) on which to perform computations.
-/// * `centroids` - The initial centroids for the quantization codec.
-/// * `seed` - An optional seed for the random number generator.
-///
-/// # Returns
-///
-/// A `Result` indicating success or failure. On success, the `index_path`
-/// directory will contain all the necessary index files.
+/// * `documents_embeddings` - List of embedding tensors.
+/// * `index_path` - Output directory.
+/// * `embedding_dim` - Dimension of vectors (e.g., 128).
+/// * `nbits` - Compression level (e.g., 2 or 4 bits).
+/// * `device` - Compute device.
+/// * `centroids` - Pre-computed K-means centroids.
+/// * `batch_size` - Batch size for processing.
+/// * `seed` - Random seed for reproducibility.
 pub fn create_index(
     documents_embeddings: &Vec<Tensor>,
     index_path: &str,
@@ -195,9 +206,15 @@ pub fn create_index(
     seed: Option<u64>,
 ) -> Result<()> {
     let n_docs = documents_embeddings.len();
+    // Heuristic for number of chunks
     let n_chunks = (n_docs as f64 / (batch_size as f64).min(1.0 + n_docs as f64)).ceil() as usize;
     let n_passages = documents_embeddings.len();
 
+    // -------------------------------------------------------------------------
+    // 1. Sampling Strategy
+    // -------------------------------------------------------------------------
+    // We need a representative sample of embeddings to determine the bucket cutoffs
+    // for residual quantization.
     let sample_k_float = 16.0 * (120.0 * n_passages as f64).sqrt();
     let sample_count = (1.0 + sample_k_float).min(n_passages as f64) as usize;
 
@@ -212,7 +229,6 @@ pub fn create_index(
     let sample_pids: Vec<u32> = passage_indices.into_iter().take(sample_count).collect();
 
     let mut total_samples_i64: i64 = 0;
-    // Calculate avg_doc_len over all documents
     let avg_doc_len = documents_embeddings
         .iter()
         .map(|t| t.size()[0] as f64)
@@ -228,6 +244,7 @@ pub fn create_index(
         })
         .collect();
 
+    // Limit heldout size to ~5% or 50k embeddings to keep training fast
     let total_samples_f64 = total_samples_i64 as f64;
     let heldout_size = (0.05 * total_samples_f64).min(50_000f64).round() as i64;
 
@@ -253,7 +270,6 @@ pub fn create_index(
             current_heldout_count += needed;
         }
     }
-
     heldout_tensors_vec.reverse();
 
     let heldout_samples = if heldout_tensors_vec.is_empty() {
@@ -262,19 +278,30 @@ pub fn create_index(
         Tensor::cat(&heldout_tensors_vec, 0).to_device(device)
     };
 
+    // Calculate expected total embeddings for IVF sizing
     let mut est_total_embeddings_f64 = (n_passages as f64) * avg_doc_len;
     est_total_embeddings_f64 = (16.0 * est_total_embeddings_f64.sqrt()).log2().floor();
     let est_total_embeddings = 2f64.powf(est_total_embeddings_f64) as i64;
 
+    // Write preliminary plan
     let plan_fpath = Path::new(index_path).join("plan.json");
     let plan_data = json!({ "nbits": nbits, "num_chunks": n_chunks });
     let mut plan_file = File::create(plan_fpath)?;
     writeln!(plan_file, "{}", serde_json::to_string_pretty(&plan_data)?)?;
 
-    // Ensure we have samples to train on
     if heldout_samples.size()[0] == 0 {
-        return Err(anyhow!("Cannot train codec: no heldout samples were generated. Check sampling logic or input data."));
+        return Err(anyhow!(
+            "Cannot train codec: no heldout samples were generated."
+        ));
     }
+
+    // -------------------------------------------------------------------------
+    // 2. Train Codec (Residual Quantization)
+    // -------------------------------------------------------------------------
+    // We compute the average residual vector and the quantiles of the residuals
+    // to define the quantization buckets.
+    //
+    //
 
     let initial_codec = ResidualCodec::load(
         nbits,
@@ -285,8 +312,10 @@ pub fn create_index(
         device,
     )?;
 
+    // A. Assign samples to centroids
     let heldout_codes = compress_into_codes(&heldout_samples, &initial_codec.centroids, batch_size);
 
+    // B. Reconstruct centroids from codes
     let mut reconstructed_embeddings_vec = Vec::new();
     for code_batch_indexes in heldout_codes.split(batch_size, 0) {
         reconstructed_embeddings_vec
@@ -294,16 +323,20 @@ pub fn create_index(
     }
     let heldout_reconstructed_embeddings = Tensor::cat(&reconstructed_embeddings_vec, 0);
 
+    // C. Calculate Residuals (Float precision for training)
     let heldout_res_raw =
-        (&heldout_samples - &heldout_reconstructed_embeddings).to_kind(Kind::Float); // Here float on purpose
+        (&heldout_samples - &heldout_reconstructed_embeddings).to_kind(Kind::Float);
+
+    // D. Compute Average Residual
     let avg_res_per_dim = heldout_res_raw
         .abs()
-        .mean_dim(Some(&[0i64][..]), false, Kind::Float) // Here float on purpose
+        .mean_dim(Some(&[0i64][..]), false, Kind::Float)
         .to_device(device);
 
+    // E. Compute Bucket Cutoffs via Quantiles
     let n_options = 2_i32.pow(nbits as u32);
     let quantiles_base =
-        Tensor::arange_start(0, n_options.into(), (Kind::Float, device)) * (1.0 / n_options as f64); // Here float on purpose
+        Tensor::arange_start(0, n_options.into(), (Kind::Float, device)) * (1.0 / n_options as f64);
 
     let cutoff_quantiles = quantiles_base.narrow(0, 1, n_options as i64 - 1);
     let weight_quantiles = &quantiles_base + (0.5 / n_options as f64);
@@ -320,6 +353,7 @@ pub fn create_index(
         device,
     )?;
 
+    // Save Codec components
     let centroids_fpath = Path::new(index_path).join("centroids.npy");
     final_codec
         .centroids
@@ -342,8 +376,10 @@ pub fn create_index(
         .to_device(Device::Cpu)
         .write_npy(&avg_res_fpath)?;
 
+    // -------------------------------------------------------------------------
+    // 3. Process Chunks (Quantization & Writing)
+    // -------------------------------------------------------------------------
     let proc_chunk_sz = (batch_size as usize).min(1 + n_passages);
-
     let bar = ProgressBar::new(n_chunks.try_into().unwrap());
     bar.set_message("Creating index...");
 
@@ -363,9 +399,12 @@ pub fn create_index(
         let mut chk_codes_list: Vec<Tensor> = Vec::new();
         let mut chunk_residuals_list: Vec<Tensor> = Vec::new();
 
+        // Process batch-by-batch to save RAM
         for emb_batch in chk_embeddings_tensor.split(batch_size, 0) {
+            // 1. Get Centroids
             let code_batch = compress_into_codes(&emb_batch, &final_codec.centroids, batch_size);
 
+            // 2. Reconstruct
             let mut reconstructed_centroids_batches: Vec<Tensor> = Vec::new();
             for sub_code_batch in code_batch.split(batch_size, 0) {
                 reconstructed_centroids_batches
@@ -373,9 +412,11 @@ pub fn create_index(
             }
             let reconstructed_centroids = Tensor::cat(&reconstructed_centroids_batches, 0);
 
+            // 3. Compute Residuals & Quantize
             let mut res_batch = &emb_batch - &reconstructed_centroids;
             res_batch = Tensor::bucketize(&res_batch, &bucket_cutoffs, true, false);
 
+            // 4. Bit Packing
             let mut res_shape = res_batch.size();
             res_shape.push(nbits);
             res_batch = res_batch.unsqueeze(-1).expand(&res_shape, false);
@@ -384,7 +425,6 @@ pub fn create_index(
             res_batch = res_batch.bitwise_and_tensor(&ones);
 
             let res_flat = res_batch.flatten(0, -1);
-
             let res_packed = packbits(&res_flat);
 
             let shape = [res_batch.size()[0], embedding_dim / 8 * nbits];
@@ -395,6 +435,7 @@ pub fn create_index(
         let chk_codes = Tensor::cat(&chk_codes_list, 0);
         let chk_residuals = Tensor::cat(&chunk_residuals_list, 0);
 
+        // Write Chunk Files
         let chk_codes_fpath = Path::new(index_path).join(&format!("{}.codes.npy", chunk_index));
         chk_codes
             .to_device(Device::Cpu)
@@ -420,6 +461,11 @@ pub fn create_index(
         serde_json::to_writer(buf_writer_meta, &chk_meta)?;
     }
 
+    // -------------------------------------------------------------------------
+    // 4. Build Global Index (Merging & IVF)
+    // -------------------------------------------------------------------------
+
+    // A. Update Chunk Metadata with Global Offsets
     let mut current_emb_offset: usize = 0;
     let mut chk_emb_offsets: Vec<usize> = Vec::new();
 
@@ -455,6 +501,7 @@ pub fn create_index(
         }
     }
 
+    // B. Build Global IVF
     let total_num_embeddings = current_emb_offset;
     let all_codes = Tensor::zeros(&[total_num_embeddings as i64], (Kind::Int64, device));
 
@@ -476,6 +523,7 @@ pub fn create_index(
         optimize_ivf(&sorted_indices, &code_counts, index_path, device)
             .context("Failed to optimize IVF")?;
 
+    // C. Write Global IVF files
     let opt_ivf_fpath = Path::new(index_path).join("ivf.npy");
     opt_ivf
         .to_device(Device::Cpu)
@@ -488,6 +536,7 @@ pub fn create_index(
         .to_kind(Kind::Int)
         .write_npy(&opt_inverted_file_lengths_fpath)?;
 
+    // D. Write Global Metadata
     let final_meta_fpath = Path::new(index_path).join("metadata.json");
     let final_num_docs = documents_embeddings.len();
     let final_avg_doclen = if final_num_docs > 0 {

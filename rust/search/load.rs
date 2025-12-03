@@ -1,12 +1,40 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use serde::Deserialize;
-use std::fs::File;
-use std::io::BufReader;
-use std::path::Path;
 use tch::{Device, Kind, Tensor};
 
+use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
+use pyo3_tch::PyTensor;
+
 use crate::search::tensor::StridedTensor;
+use crate::utils::errors::anyhow_to_pyerr;
 use crate::utils::residual_codec::ResidualCodec;
+
+/// Parses a Python-style device string into a `tch::Device`.
+///
+/// Supports "cpu", "cuda", and specific GPU indices like "cuda:1".
+pub fn get_device(device: &str) -> Result<Device, PyErr> {
+    match device.to_lowercase().as_str() {
+        "cpu" => Ok(Device::Cpu),
+        "cuda" => Ok(Device::Cuda(0)),
+        s if s.starts_with("cuda:") => {
+            let parts: Vec<&str> = s.split(':').collect();
+            if parts.len() == 2 {
+                parts[1].parse::<usize>().map(Device::Cuda).map_err(|_| {
+                    PyValueError::new_err(format!("Invalid CUDA device index: '{}'", parts[1]))
+                })
+            } else {
+                Err(PyValueError::new_err(
+                    "Invalid CUDA device format. Expected 'cuda:N'.",
+                ))
+            }
+        },
+        _ => Err(PyValueError::new_err(format!(
+            "Unsupported device string: '{}'",
+            device
+        ))),
+    }
+}
 
 #[derive(Deserialize, Debug)]
 pub struct Metadata {
@@ -14,6 +42,11 @@ pub struct Metadata {
     pub nbits: i64,
 }
 
+/// The core struct holding all immutable data required for search operations.
+///
+/// This struct is designed to be shared across threads. It contains the
+/// quantization codec (centroids, weights) and the document index structures
+/// (IVF lists, compressed codes, and residuals).
 pub struct LoadedIndex {
     pub codec: ResidualCodec,
     pub ivf_index_strided: StridedTensor,
@@ -25,117 +58,206 @@ pub struct LoadedIndex {
 unsafe impl Send for LoadedIndex {}
 unsafe impl Sync for LoadedIndex {}
 
-pub fn load_index(index_dir_path_str: &str, device: Device) -> Result<LoadedIndex> {
-    let index_dir_path = Path::new(index_dir_path_str);
-    let metadata_content_raw = std::fs::read(index_dir_path.join("metadata.json"))
-        .map_err(|e| anyhow!("Failed to read metadata.json: {}", e))?;
-    let app_metadata: Metadata = serde_json::from_slice(&metadata_content_raw)
-        .map_err(|e| anyhow!("Failed to parse metadata.json: {}", e))?;
+// ----------------------------------------------------------------------------
+// PyLoadedIndex Wrapper
+// ----------------------------------------------------------------------------
 
-    let nbits_metadata: i64 = app_metadata.nbits;
-    let num_chunks_metadata: usize = app_metadata.num_chunks;
+/// A wrapper around the Rust `LoadedIndex` struct that can be held by Python.
+///
+/// This wrapper allows the Python runtime to manage the lifetime of the
+/// underlying Rust index structure. When the Python object is garbage collected,
+/// the Rust memory is freed.
+#[pyclass]
+pub struct PyLoadedIndex {
+    pub inner: LoadedIndex,
+}
 
-    let centroids_initial_data = Tensor::read_npy(index_dir_path.join("centroids.npy"))?
-        .to_kind(Kind::Half)
-        .to_device(device);
-    let avg_residual_initial_data = Tensor::read_npy(index_dir_path.join("avg_residual.npy"))?
-        .to_kind(Kind::Half)
-        .to_device(device);
-    let bucket_cutoffs_initial_data = Tensor::read_npy(index_dir_path.join("bucket_cutoffs.npy"))?
-        .to_kind(Kind::Half)
-        .to_device(device);
-    let bucket_weights_initial_data = Tensor::read_npy(index_dir_path.join("bucket_weights.npy"))?
-        .to_kind(Kind::Half)
-        .to_device(device);
+// ----------------------------------------------------------------------------
+// Helpers
+// ----------------------------------------------------------------------------
 
-    let index_dimension = centroids_initial_data.size()[1];
+/// Ensures the tensor is on the target device and kind without copying if not necessary.
+///
+/// This is critical for memory-mapped tensors. Calling `to_device` blindly on a
+/// CPU mmap tensor will force a load into RAM, even if the target is also CPU.
+fn ensure_tensor(t: PyTensor, device: Device, kind: Kind) -> Tensor {
+    // PyTensor derefs to Tensor. We take a shallow reference first.
+    let mut res: Tensor = t.shallow_clone();
 
-    let codec = ResidualCodec::load(
-        nbits_metadata,
-        centroids_initial_data,
-        avg_residual_initial_data,
-        Some(bucket_cutoffs_initial_data),
-        Some(bucket_weights_initial_data),
-        device,
-    )?;
-
-    let ivf_data = Tensor::read_npy(index_dir_path.join("ivf.npy"))?
-        .to_kind(Kind::Int64)
-        .to_device(device);
-    let ivf_lengths = Tensor::read_npy(index_dir_path.join("ivf_lengths.npy"))?
-        .to_kind(Kind::Int64)
-        .to_device(device);
-    let ivf_index_strided = StridedTensor::new(ivf_data, ivf_lengths, device);
-
-    let mut all_doc_lens_vec: Vec<i64> = Vec::new();
-    for chunk_idx in 0..num_chunks_metadata {
-        let chunk_doclens_path = index_dir_path.join(format!("doclens.{}.json", chunk_idx));
-        let doclens_file = File::open(&chunk_doclens_path)
-            .map_err(|e| anyhow!("Unable to open {:?}: {}", chunk_doclens_path, e))?;
-        let doclens_reader = BufReader::new(doclens_file);
-        let chunk_doc_lens: Vec<i64> = serde_json::from_reader(doclens_reader)
-            .map_err(|e| anyhow!("Failed to parse JSON from {:?}: {}", chunk_doclens_path, e))?;
-        all_doc_lens_vec.extend(chunk_doc_lens);
+    // Only convert device if different (avoids copy/move overhead)
+    if res.device() != device {
+        res = res.to_device(device);
     }
 
-    let all_doc_lengths = Tensor::from_slice(&all_doc_lens_vec)
-        .to_kind(Kind::Int64)
-        .to_device(device);
+    // Only convert kind if different (avoids casting overhead)
+    if res.kind() != kind {
+        res = res.to_kind(kind);
+    }
 
-    let total_embeddings_from_doclens = if all_doc_lengths.numel() > 0 {
-        all_doc_lengths.sum(Kind::Int64).int64_value(&[])
+    res
+}
+
+/// Validates that a memory-mapped tensor has sufficient padding for strided access.
+///
+/// `StridedTensor` creates a sliding window view over a flat array. For the very last
+/// element in the array, the window (stride) extends beyond the start of that element.
+/// If the physical file ends exactly at the last element's data, the stride view
+/// would access invalid memory.
+///
+///
+///
+/// This function calculates if the underlying storage has enough "ghost" padding
+/// at the end to allow for a zero-copy view. If not, it returns an error advising
+/// the user to pad the file in Python.
+///
+/// # Arguments
+///
+/// * `data_tensor` - The flat data tensor (possibly memory mapped).
+/// * `lengths_tensor` - The lengths of the sequences stored in `data_tensor`.
+/// * `tensor_name` - A label for the error message.
+fn check_mmap_padding(
+    data_tensor: &Tensor,
+    lengths_tensor: &Tensor,
+    tensor_name: &str,
+) -> PyResult<()> {
+    let num_docs = lengths_tensor.size()[0];
+    if num_docs == 0 {
+        return Ok(());
+    }
+
+    // Move computations to CPU for scalar extraction to avoid sync overhead if on GPU
+    let lengths_cpu = if lengths_tensor.device() != Device::Cpu {
+        lengths_tensor.to_device(Device::Cpu)
     } else {
-        0
+        lengths_tensor.shallow_clone()
     };
 
-    let full_codes_preallocated =
-        Tensor::empty(&[total_embeddings_from_doclens], (Kind::Int64, device));
-    let residual_element_size = (index_dimension * nbits_metadata) / 8;
-    let full_residuals_preallocated = Tensor::empty(
-        &[total_embeddings_from_doclens, residual_element_size],
-        (Kind::Uint8, device),
-    );
+    let max_len = lengths_cpu.max().int64_value(&[]);
+    let last_len = lengths_cpu.int64_value(&[num_docs - 1]);
 
-    let mut current_write_offset = 0i64;
-    for chunk_idx in 0..num_chunks_metadata {
-        let chunk_codes_path = index_dir_path.join(format!("{}.codes.npy", chunk_idx));
-        let chunk_residuals_path = index_dir_path.join(format!("{}.residuals.npy", chunk_idx));
+    // Calculate the logical end of the data
+    let total_len = lengths_cpu.sum(Kind::Int64).int64_value(&[]);
 
-        let chunk_codes_tensor = Tensor::read_npy(&chunk_codes_path)
-            .map_err(|e| anyhow!("Failed to read codes {:?}: {}", chunk_codes_path, e))?
-            .to_kind(Kind::Int64)
-            .to_device(device);
-        let chunk_residuals_tensor = Tensor::read_npy(&chunk_residuals_path)
-            .map_err(|e| anyhow!("Failed to read residuals {:?}: {}", chunk_residuals_path, e))?
-            .to_kind(Kind::Uint8)
-            .to_device(device);
+    // Logic:
+    // The view for the *last* element starts at: `total_len - last_len`.
+    // The view requires a width of `max_len` (the stride size).
+    // Therefore, valid memory must exist up to: `(total_len - last_len) + max_len`.
+    let start_of_last = total_len - last_len;
+    let required_size = start_of_last + max_len;
 
-        let num_elements_in_chunk = chunk_codes_tensor.size()[0];
+    let current_size = data_tensor.size()[0];
 
-        if num_elements_in_chunk > 0 {
-            full_codes_preallocated
-                .narrow(0, current_write_offset, num_elements_in_chunk)
-                .copy_(&chunk_codes_tensor);
-            full_residuals_preallocated
-                .narrow(0, current_write_offset, num_elements_in_chunk)
-                .copy_(&chunk_residuals_tensor);
-            current_write_offset += num_elements_in_chunk;
-        }
+    if current_size < required_size {
+        let missing = required_size - current_size;
+        return Err(PyValueError::new_err(format!(
+            "Memory Map Error: The '{}' tensor is too small for zero-copy strided access. \
+            It requires {} elements of padding at the end. \
+            Please pad the .npy file in Python (e.g. using .resize() or during creation) \
+            to avoid loading the entire file into RAM.",
+            tensor_name, missing
+        )));
     }
 
-    let final_codes = full_codes_preallocated.narrow(0, 0, current_write_offset);
-    let packed_residuals = full_residuals_preallocated.narrow(0, 0, current_write_offset);
+    Ok(())
+}
 
-    let doc_codes_strided =
-        StridedTensor::new(final_codes, all_doc_lengths.shallow_clone(), device);
-    let doc_residuals_strided =
-        StridedTensor::new(packed_residuals, all_doc_lengths.shallow_clone(), device);
+// ----------------------------------------------------------------------------
+// Index Construction
+// ----------------------------------------------------------------------------
 
-    Ok(LoadedIndex {
+/// Constructs the internal Index object from raw tensors loaded in Python.
+///
+/// This function acts as the bridge between Python's file loading and Rust's
+/// search engine. It organizes the raw tensors into a `LoadedIndex` struct.
+///
+///
+///
+/// # Key Behavior
+/// - **Zero-Copy Optimization**: If `device` is "cpu", large tensors (codes, residuals)
+///   are assumed to be memory-mapped. The function verifies padding and uses them
+///   directly without allocation.
+/// - **Codec Handling**: Small tensors (centroids, weights) are loaded into RAM/VRAM
+///   immediately for fast lookup during decompression.
+///
+/// # Arguments
+///
+/// * `nbits` - The quantization bit-width (e.g., 2 or 4).
+/// * `centroids` - The coarse centroids (float16).
+/// * `avg_residual` - The average residual vector (float16).
+/// * `bucket_cutoffs` - Quantization bucket boundaries (float16).
+/// * `bucket_weights` - Quantization bucket values (float16).
+/// * `ivf` - The Inverted File index structure (int64).
+/// * `ivf_lengths` - Lengths of the IVF lists (int32).
+/// * `doc_codes` - The compressed document codes (int64).
+/// * `doc_residuals` - The compressed document residuals (uint8).
+/// * `doc_lengths` - The true lengths of documents (int64).
+/// * `device` - The target device string.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub fn construct_index(
+    _py: Python<'_>,
+    nbits: i64,
+    centroids: PyTensor,
+    avg_residual: PyTensor,
+    bucket_cutoffs: PyTensor,
+    bucket_weights: PyTensor,
+    ivf: PyTensor,
+    ivf_lengths: PyTensor,
+    doc_codes: PyTensor,
+    doc_residuals: PyTensor,
+    doc_lengths: PyTensor,
+    device: String,
+) -> PyResult<PyLoadedIndex> {
+    let device_tch = get_device(&device)?;
+
+    // 1. Codec Loading
+    // These tensors are small (MBs), so we ensure they are on the correct device/kind immediately.
+    let codec = ResidualCodec::load(
+        nbits,
+        ensure_tensor(centroids, device_tch, Kind::Half),
+        ensure_tensor(avg_residual, device_tch, Kind::Half),
+        Some(ensure_tensor(bucket_cutoffs, device_tch, Kind::Half)),
+        Some(ensure_tensor(bucket_weights, device_tch, Kind::Half)),
+        device_tch,
+    )
+    .map_err(anyhow_to_pyerr)?;
+
+    // 2. IVF Index
+    // Standard strided tensor construction for the inverted file lists.
+    let ivf_index_strided = StridedTensor::new(
+        ensure_tensor(ivf, device_tch, Kind::Int64),
+        ensure_tensor(ivf_lengths, device_tch, Kind::Int),
+        device_tch,
+    );
+
+    // 3. Document Data
+    // These are the large tensors (GBs). We must handle them carefully.
+
+    // Lengths are needed for checking padding and structure.
+    let doc_lens_t = ensure_tensor(doc_lengths, device_tch, Kind::Int64);
+    let doc_codes_t = ensure_tensor(doc_codes, device_tch, Kind::Int64);
+    let doc_residuals_t = ensure_tensor(doc_residuals, device_tch, Kind::Uint8);
+
+    // We validate padding here to prevent `StridedTensor` from triggering a massive data copy
+    // to add padding in RAM, which would defeat the purpose of mmap.
+    if device_tch == Device::Cpu {
+        check_mmap_padding(&doc_codes_t, &doc_lens_t, "doc_codes")?;
+        check_mmap_padding(&doc_residuals_t, &doc_lens_t, "doc_residuals")?;
+    }
+
+    let doc_codes_strided = StridedTensor::new(doc_codes_t, doc_lens_t.shallow_clone(), device_tch);
+
+    let doc_residuals_strided = StridedTensor::new(doc_residuals_t, doc_lens_t, device_tch);
+
+    let loaded_index = LoadedIndex {
         codec,
         ivf_index_strided,
         doc_codes_strided,
         doc_residuals_strided,
-        nbits: nbits_metadata,
+        nbits,
+    };
+
+    Ok(PyLoadedIndex {
+        inner: loaded_index,
     })
 }

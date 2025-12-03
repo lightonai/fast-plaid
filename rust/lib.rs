@@ -5,15 +5,13 @@ pub mod utils;
 
 // External crate imports.
 use anyhow::anyhow;
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3_tch::PyTensor;
-use tch::{Device, Kind};
+use tch::Kind;
 
 // Standard library imports.
-use std::collections::HashMap;
 use std::ffi::CString;
-use std::sync::{Arc, RwLock};
 
 // Conditional imports for cross-platform dynamic library loading.
 #[cfg(windows)]
@@ -25,18 +23,9 @@ use winapi::um::libloaderapi::LoadLibraryA;
 use crate::index::create::create_index;
 use crate::index::delete::delete_from_index;
 use crate::index::update::update_index;
-use search::load::{load_index, LoadedIndex};
+use search::load::{construct_index, get_device, PyLoadedIndex};
 use search::search::{search_many, QueryResult, SearchParameters};
-
-use once_cell::sync::Lazy;
-
-static INDEX_CACHE: Lazy<RwLock<HashMap<(String, String), Arc<LoadedIndex>>>> =
-    Lazy::new(|| RwLock::new(HashMap::new()));
-
-/// Converts an `anyhow::Error` into a Python `PyValueError`.
-fn anyhow_to_pyerr(err: anyhow::Error) -> PyErr {
-    PyValueError::new_err(err.to_string())
-}
+use utils::errors::anyhow_to_pyerr;
 
 /// Dynamically loads the native Torch shared library (libtorch).
 ///
@@ -93,95 +82,6 @@ fn call_torch(torch_path: String) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// Parses a Python-style device string into a `tch::Device`.
-///
-/// # Arguments
-///
-/// * `device` - A string slice representing the device, e.g., "cpu", "cuda", "cuda:0".
-///
-/// # Returns
-///
-/// A `PyResult` containing the corresponding `tch::Device` if successful.
-///
-/// # Errors
-///
-/// Returns a `PyValueError` if the device string is unsupported or invalid
-/// (e.g., "cuda:foo" or "tpu").
-fn get_device(device: &str) -> Result<Device, PyErr> {
-    match device.to_lowercase().as_str() {
-        "cpu" => Ok(Device::Cpu),
-        "cuda" => Ok(Device::Cuda(0)),
-        s if s.starts_with("cuda:") => {
-            let parts: Vec<&str> = s.split(':').collect();
-            if parts.len() == 2 {
-                parts[1].parse::<usize>().map(Device::Cuda).map_err(|_| {
-                    PyValueError::new_err(format!("Invalid CUDA device index: '{}'", parts[1]))
-                })
-            } else {
-                Err(PyValueError::new_err(
-                    "Invalid CUDA device format. Expected 'cuda:N'.",
-                ))
-            }
-        },
-        _ => Err(PyValueError::new_err(format!(
-            "Unsupported device string: '{}'",
-            device
-        ))),
-    }
-}
-
-/// Retrieves a loaded index from the global cache or loads it if not present.
-///
-/// This function uses a `RwLock` on the `INDEX_CACHE` to ensure thread-safe
-/// access. It first attempts to retrieve the index with a read lock. If not
-/// found, it acquires a write lock to load the index and insert it into the cache.
-///
-/// # Arguments
-///
-/// * `index_path` - The file system path to the index directory.
-/// * `device_str` - The string representation of the device (e.g., "cuda:0"),
-///   used as part of the cache key.
-/// * `device` - The `tch::Device` to load the index onto.
-///
-/// # Returns
-///
-/// A `PyResult` containing an `Arc<LoadedIndex>` on success.
-///
-/// # Errors
-///
-/// Returns a `PyErr` if `load_index` fails.
-fn get_or_load_index(
-    index_path: &str,
-    device_str: &str,
-    device: Device,
-) -> PyResult<Arc<LoadedIndex>> {
-    let key = (index_path.to_string(), device_str.to_string());
-
-    // --- First check with a read lock ---
-    {
-        let cache = INDEX_CACHE.read().unwrap();
-        if let Some(index_arc) = cache.get(&key) {
-            return Ok(Arc::clone(index_arc));
-        }
-    }
-
-    // --- If not found, acquire a write lock ---
-    let mut cache = INDEX_CACHE.write().unwrap();
-
-    // --- Double-check in case another thread loaded it while we waited for the write lock ---
-    if let Some(index_arc) = cache.get(&key) {
-        return Ok(Arc::clone(index_arc));
-    }
-
-    // --- Load the index, insert into cache, and return ---
-    let loaded_index = load_index(index_path, device).map_err(anyhow_to_pyerr)?;
-    let index_arc = Arc::new(loaded_index);
-
-    cache.insert(key, Arc::clone(&index_arc));
-
-    Ok(index_arc)
-}
-
 /// Manually initializes and loads the libtorch shared library.
 ///
 /// This function is called automatically by other functions in this module,
@@ -199,13 +99,13 @@ fn initialize_torch(_py: Python<'_>, torch_path: String) -> PyResult<()> {
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to initialize Torch: {}", e)))
 }
 
-/// [Internal] Creates and saves a new FastPlaid index.
+/// Creates and saves a new FastPlaid index.
 ///
 /// This is the low-level Rust implementation called by `FastPlaid.create()`.
 /// It's generally recommended to use the `FastPlaid` class wrapper instead.
 ///
-/// This function builds the index from pre-computed centroids and embeddings,
-/// quantizes the embeddings, and saves the index files to disk.
+/// This function takes pre-computed centroids and embeddings, quantizes the
+/// embeddings using the centroids, and saves the index files to the specified directory.
 ///
 /// Args:
 ///     index (str): The file path to the directory to save the index.
@@ -216,7 +116,7 @@ fn initialize_torch(_py: Python<'_>, torch_path: String) -> PyResult<()> {
 ///     embeddings (list[torch.Tensor]): A list of 2D tensors
 ///         (num_tokens, embedding_dim), one for each document.
 ///     centroids (torch.Tensor): A 2D tensor of (num_centroids, embedding_dim)
-///         pre-computed by K-means.
+///         pre-computed by K-means on the Python side.
 ///     batch_size (int): Batch size for processing embeddings during creation.
 ///     seed (int | None): Optional seed for reproducible index creation.
 ///
@@ -237,9 +137,6 @@ fn create(
 ) -> PyResult<()> {
     call_torch(torch_path)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
-
-    let mut cache = INDEX_CACHE.write().unwrap();
-    cache.clear();
 
     let device = get_device(&device)?;
     let centroids = centroids.to_device(device).to_kind(Kind::Half);
@@ -264,96 +161,17 @@ fn create(
     result
 }
 
-/// [Internal] Adds new documents to an existing FastPlaid index.
-///
-/// This is the low-level Rust implementation called by `FastPlaid.update()`.
-/// It's generally recommended to use the `FastPlaid` class wrapper instead.
-///
-/// This function appends new quantized embeddings to the index files. It does
-/// not re-compute centroids and assumes the existing index structure.
-/// Clears the *entire* index cache upon successful completion.
-///
-/// Args:
-///     index (str): The file path to the directory of the existing index.
-///     torch_path (str): Path to the `libtorch` shared library.
-///     device (str): Device to use for computation (e.g., "cpu", "cuda:0").
-///     embeddings (list[torch.Tensor]): A list of 2D tensors
-///         (num_tokens, embedding_dim), one for each new document.
-///     batch_size (int): Batch size for processing new embeddings.
-///
-/// Raises:
-///     RuntimeError: If updating the index fails or `libtorch` fails to load.
-#[pyfunction]
-fn update(
-    _py: Python<'_>,
-    index: String,
-    torch_path: String,
-    device: String,
-    embeddings: Vec<PyTensor>,
-    batch_size: i64,
-) -> PyResult<()> {
-    call_torch(torch_path)
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
-
-    let mut cache = INDEX_CACHE.write().unwrap();
-    cache.clear();
-
-    let device = get_device(&device)?;
-
-    let embeddings: Vec<_> = embeddings
-        .into_iter()
-        .map(|tensor| tensor.to_device(device).to_kind(Kind::Half))
-        .collect();
-
-    let result = update_index(&embeddings, &index, device, batch_size)
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to update index: {}", e)));
-
-    result
-}
-
-/// [Internal] Loads an index into the global cache for fast access.
-///
-/// This is the low-level Rust implementation called by `FastPlaid._load_index()`.
-/// It's generally recommended to use the `FastPlaid` class wrapper instead.
-///
-/// If the index (for the specified path and device) is already in the cache,
-/// this function does nothing. Otherwise, it loads the index from disk
-/// and stores it in a global, thread-safe cache.
-///
-/// Args:
-///     index (str): The file path to the directory of the existing index.
-///     torch_path (str): Path to the `libtorch` shared library.
-///     device (str): Device to load the index onto (e.g., "cpu", "cuda:0").
-///
-/// Raises:
-///     RuntimeError: If loading the index fails or `libtorch` fails to load.
-#[pyfunction]
-fn preload_index(
-    _py: Python<'_>,
-    index: String,
-    torch_path: String,
-    device: String,
-) -> PyResult<()> {
-    call_torch(torch_path)
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
-    let device_tch = get_device(&device)?;
-    // Call get_or_load_index to trigger a load if not already cached
-    get_or_load_index(&index, &device, device_tch)?;
-
-    Ok(())
-}
-
-/// [Internal] Loads an index (from cache or disk) and performs a search.
+/// Performs a multi-vector search on a loaded index.
 ///
 /// This is the low-level Rust implementation called by `FastPlaid.search()`.
 /// It's generally recommended to use the `FastPlaid` class wrapper instead.
 ///
-/// This function first retrieves the index from the global cache (or loads it
-/// if not present), then executes the multi-vector search against it.
+/// Unlike previous versions, this function does not load the index from disk/cache.
+/// It accepts a `PyLoadedIndex` object that is managed by the Python side.
 ///
 /// Args:
-///     index (str): The file path to the directory of the existing index.
-///     torch_path (str): Path to the `libtorch` shared library.
+///     index (PyLoadedIndex): A reference to the loaded index object containing
+///         IVF structures and codebooks.
 ///     device (str): Device to perform the search on (e.g., "cpu", "cuda:0").
 ///     queries_embeddings (torch.Tensor): A 3D tensor of query embeddings
 ///         with shape (num_queries, num_query_tokens, embedding_dim).
@@ -368,56 +186,106 @@ fn preload_index(
 ///     list[QueryResult]: A list of `QueryResult` objects, one for each query.
 ///
 /// Raises:
-///     RuntimeError: If searching fails or `libtorch` fails to load.
+///     RuntimeError: If searching fails.
 ///     ValueError: If search parameters are invalid.
 #[pyfunction]
-fn load_and_search(
-    _py: Python<'_>,
-    index: String,
-    torch_path: String,
+fn pysearch(
+    py: Python<'_>,
+    index: &PyLoadedIndex,
     device: String,
     queries_embeddings: PyTensor,
     search_parameters: &SearchParameters,
     show_progress: bool,
-    preload_index: bool,
     subset: Option<Vec<Vec<i64>>>,
 ) -> PyResult<Vec<QueryResult>> {
+    let device_tch = get_device(&device)?;
+
+    // Prepare data for the search to ensure it is Send/Sync before releasing GIL.
+    let queries = queries_embeddings.to_kind(Kind::Half);
+    let params = search_parameters.clone();
+    let index_inner = &index.inner;
+
+    // Release the GIL to allow for parallel execution in Python threads.
+    let results = py
+        .allow_threads(move || {
+            search_many(
+                &queries,
+                index_inner,
+                &params,
+                device_tch,
+                show_progress,
+                subset,
+            )
+        })
+        .map_err(anyhow_to_pyerr)?;
+
+    Ok(results)
+}
+
+/// Adds new documents to an existing FastPlaid index.
+///
+/// This is the low-level Rust implementation called by `FastPlaid.update()`.
+/// It's generally recommended to use the `FastPlaid` class wrapper instead.
+///
+/// This function appends new quantized embeddings to the index files on disk.
+/// It uses the provided `index` object (which contains the current centroids
+/// and codecs) to quantize the new data without recalculating centroids.
+///
+/// Args:
+///     index_path (str): The file path to the directory where the index is stored.
+///         New data will be appended to files in this directory.
+///     index (PyLoadedIndex): The loaded index object. This is required to access
+///         the existing codebooks/centroids for quantizing the new embeddings.
+///     torch_path (str): Path to the `libtorch` shared library.
+///     device (str): Device to use for computation (e.g., "cpu", "cuda:0").
+///     embeddings (list[torch.Tensor]): A list of 2D tensors
+///         (num_tokens, embedding_dim), one for each new document.
+///     batch_size (int): Batch size for processing new embeddings.
+///
+/// Raises:
+///     RuntimeError: If updating the index fails or `libtorch` fails to load.
+#[pyfunction]
+fn update(
+    _py: Python<'_>,
+    index_path: String,
+    index: &PyLoadedIndex,
+    torch_path: String,
+    device: String,
+    embeddings: Vec<PyTensor>,
+    batch_size: i64,
+) -> PyResult<()> {
     call_torch(torch_path)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
 
     let device_tch = get_device(&device)?;
 
-    // Get the index from cache or load it
-    let index = if preload_index {
-        get_or_load_index(&index, &device, device_tch)
-    } else {
-        println!("Loading index from disk without caching.");
-        let loaded_index = load_index(&index, device_tch)
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to load index: {}", e)))?;
-        Ok(Arc::new(loaded_index))
-    }?;
+    let embeddings: Vec<_> = embeddings
+        .into_iter()
+        .map(|tensor| tensor.to_kind(Kind::Half))
+        .collect();
 
-    // Perform the search
-    let results = search_many(
-        &queries_embeddings.to_kind(Kind::Half),
-        &index,
-        search_parameters,
+    // We pass the full `index.inner` (LoadedIndex) to utilize the existing Codec
+    // and the existing IVF structure for incremental updates.
+    // The Python side handles reloading the data from disk after this returns.
+    update_index(
+        &embeddings,
+        &index_path,
         device_tch,
-        show_progress,
-        subset,
+        batch_size,
+        &index.inner,
     )
-    .map_err(anyhow_to_pyerr)?;
-    Ok(results)
+    .map_err(|e| PyRuntimeError::new_err(format!("Failed to update index: {}", e)))?;
+
+    Ok(())
 }
 
-/// [Internal] Deletes documents from an existing FastPlaid index.
+/// Deletes documents from an existing FastPlaid index.
 ///
 /// This is the low-level Rust implementation called by `FastPlaid.delete()`.
 /// It's generally recommended to use the `FastPlaid` class wrapper instead.
 ///
 /// This function removes the specified document IDs from the index files.
 /// The remaining documents are re-indexed to maintain sequential IDs.
-/// Clears the *entire* index cache upon successful completion.
 ///
 /// Args:
 ///     index (str): The file path to the directory of the existing index.
@@ -439,9 +307,6 @@ fn delete(
     call_torch(torch_path)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
 
-    let mut cache = INDEX_CACHE.write().unwrap();
-    cache.clear();
-
     let device = get_device(&device)?;
 
     let result = delete_from_index(&subset, &index, device)
@@ -450,23 +315,18 @@ fn delete(
     result
 }
 
-/// Defines the Python module `fast_plaid_rust`.
-///
-/// This function is the main entry point for the PyO3 library. It registers
-/// all the exposed Python functions (`create`, `update`, `load_and_search`, etc.)
-/// and classes (`SearchParameters`, `QueryResult`) to make them available
-/// for import in Python.
 #[pymodule]
 #[pyo3(name = "fast_plaid_rust")]
 fn python_module(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SearchParameters>()?;
     m.add_class::<QueryResult>()?;
+    m.add_class::<PyLoadedIndex>()?;
 
     m.add_function(wrap_pyfunction!(initialize_torch, m)?)?;
+    m.add_function(wrap_pyfunction!(construct_index, m)?)?;
     m.add_function(wrap_pyfunction!(create, m)?)?;
+    m.add_function(wrap_pyfunction!(pysearch, m)?)?;
     m.add_function(wrap_pyfunction!(update, m)?)?;
-    m.add_function(wrap_pyfunction!(preload_index, m)?)?;
-    m.add_function(wrap_pyfunction!(load_and_search, m)?)?;
     m.add_function(wrap_pyfunction!(delete, m)?)?;
     Ok(())
 }

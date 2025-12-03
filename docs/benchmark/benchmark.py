@@ -94,7 +94,12 @@ large_queries_embeddings = torch.cat(
 
 print(f"🔍 50_000 queries on {dataset_name}...")
 start_search = time.time()
-_ = index.search(queries_embeddings=large_queries_embeddings, top_k=10, n_full_scores=4096, n_ivf_probe=8)
+_ = index.search(
+    queries_embeddings=large_queries_embeddings,
+    top_k=10,
+    n_full_scores=4096,
+    n_ivf_probe=8,
+)
 end_search = time.time()
 heavy_search_time = end_search - start_search
 queries_per_second = large_queries_embeddings.shape[0] / heavy_search_time

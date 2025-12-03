@@ -20,7 +20,7 @@ classifiers = [
   "Programming Language :: Rust",
   "Operating System :: OS Independent",
 ]
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
   "fastkmeans >= 0.5.0",
   "joblib>=1.5.1",
@@ -137,6 +137,9 @@ ignore = [
   "B905",
   "UP037",
   "PLC0415",
+  "EM101",
+  "TRY003",
+  "EM102",
 ]
 select = ["ALL"]
 fixable = ["ALL"]

@@ -15,18 +15,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Free up disk space on Ubuntu
+      - name: Free Disk Space (Ubuntu)
         if: matrix.os == 'ubuntu-latest'
-        run: |
-          echo "Initial free space:"
-          df -h
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /usr/local/share/boost
-          sudo swapoff -a
-          sudo rm -f /swapfile
-          echo "Free space after cleanup:"
-          df -h
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
 
       - name: Prepare pyproject.toml
         shell: bash

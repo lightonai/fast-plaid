@@ -44,10 +44,10 @@ FastPlaid is available in multiple versions to support different PyTorch version
 
 | FastPlaid Version | PyTorch Version | Installation Command                |
 | ----------------- | --------------- | ----------------------------------- |
-| 1.2.5.290         | 2.9.0           | `pip install fast-plaid==1.2.5.290` |
-| 1.2.5.280         | 2.8.0           | `pip install fast-plaid==1.2.5.280` |
-| 1.2.5.271         | 2.7.1           | `pip install fast-plaid==1.2.5.271` |
-| 1.2.5.270         | 2.7.0           | `pip install fast-plaid==1.2.5.270` |
+| 1.3.0.290         | 2.9.0           | `pip install fast-plaid==1.3.0.290` |
+| 1.3.0.280         | 2.8.0           | `pip install fast-plaid==1.3.0.280` |
+| 1.3.0.271         | 2.7.1           | `pip install fast-plaid==1.3.0.271` |
+| 1.3.0.270         | 2.7.0           | `pip install fast-plaid==1.3.0.270` |
 
 ### Adding FastPlaid as a Dependency
 
@@ -56,7 +56,7 @@ You can add FastPlaid to your project dependencies with version ranges to ensure
 **For requirements.txt:**
 
 ```
-fast-plaid>=1.2.5.270,<=1.2.5.290
+fast-plaid>=1.3.0.270,<=1.3.0.290
 ```
 
 **For pyproject.toml:**
@@ -64,7 +64,7 @@ fast-plaid>=1.2.5.270,<=1.2.5.290
 ```toml
 [project]
 dependencies = [
-    "fast-plaid>=1.2.5.270,<=1.2.5.290"
+    "fast-plaid>=1.3.0.270,<=1.3.0.290"
 ]
 ```
 
@@ -72,7 +72,7 @@ dependencies = [
 
 ```python
 install_requires=[
-    "fast-plaid>=1.2.5.270,<=1.2.5.290"
+    "fast-plaid>=1.3.0.270,<=1.3.0.290"
 ]
 ```
 

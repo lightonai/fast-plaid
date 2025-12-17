@@ -15,6 +15,8 @@ __pycache__/
 cache/
 # C extensions
 *.so
+*.dat
+*.png
 
 # Distribution / packaging
 .Python

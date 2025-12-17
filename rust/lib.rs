@@ -141,11 +141,6 @@ fn create(
     let device = get_device(&device)?;
     let centroids = centroids.to_device(device).to_kind(Kind::Half);
 
-    let embeddings: Vec<_> = embeddings
-        .into_iter()
-        .map(|tensor| tensor.to_kind(Kind::Half))
-        .collect();
-
     let result = create_index(
         &embeddings,
         &index,

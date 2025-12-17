@@ -13,5 +13,4 @@ test:
 	uv run pytest tests/test.py
 
 evaluate:
-	CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 uv run mprof run --interval 0.5 python docs/benchmark/benchmark.py
-	mprof plot -o msmarco_usage.png
+	CUDA_VISIBLE_DEVICES=0,1,2,3 uv run python docs/benchmark/fast_benchmark.py

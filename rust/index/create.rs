@@ -402,7 +402,7 @@ pub fn create_index(
         res = res.bitwise_and_tensor(&ones);
 
         let res_flat = res.flatten(0, -1);
-        let packed = packbits(&res_flat); // Implement packbits as in original or import it
+        let packed = packbits(&res_flat);
         let shape = [res.size()[0], embedding_dim / 8 * nbits];
 
         Ok((codes, packed.reshape(&shape)))

@@ -33,6 +33,7 @@ def encode_worker(
             model_name_or_path=model_name,
             query_length=query_length,
             document_length=document_length,
+            model_kwargs={"torch_dtype": torch.float16},
         )
         model.to(device)
         model.eval()
@@ -77,7 +78,7 @@ def run_evaluation():
     parser.add_argument(
         "--dataset",
         type=str,
-        default="msmarco",
+        default="fever",
         help="Name of the dataset to process from the BEIR benchmark.",
     )
     args = parser.parse_args()
@@ -100,7 +101,7 @@ def run_evaluation():
         "fever": 32,
     }
 
-    MODEL_NAME = "answerdotai/answerai-colbert-small-v1"
+    MODEL_NAME = "lightonai/GTE-ModernColBERT-v1"
     QUERY_LENGTH = query_length_map.get(dataset_name, 32)
     DOC_LENGTH = 300
 
@@ -121,19 +122,27 @@ def run_evaluation():
         dataset_name=dataset_name,
         split="dev" if "msmarco" in dataset_name else "test",
     )
+
     num_queries = len(queries)
     document_texts = [document["text"] for document in documents]
     query_texts = list(queries.values())
 
+    print(len(documents), "documents loaded.")
+
+    def chunk_list(lst, n):
+        """Splits a list into n roughly equal parts without using NumPy."""
+        k, m = divmod(len(lst), n)
+        return [lst[i * k + min(i, m) : (i + 1) * k + min(i + 1, m)] for i in range(n)]
+
     print(f"🧠 Encoding {len(document_texts)} documents (in parallel)...")
-    doc_chunks = np.array_split(document_texts, NUM_GPUS)
+    doc_chunks = chunk_list(document_texts, NUM_GPUS)
 
     doc_worker_args = []
     for gpu_id in range(NUM_GPUS):
         doc_worker_args.append(
             (
                 gpu_id,
-                doc_chunks[gpu_id].tolist(),
+                doc_chunks[gpu_id],
                 MODEL_NAME,
                 QUERY_LENGTH,
                 DOC_LENGTH,
@@ -176,6 +185,7 @@ def run_evaluation():
         query_results_list = pool.starmap(encode_worker, query_worker_args)
 
     queries_embeddings = [item for sublist in query_results_list for item in sublist]
+
     end_time = time.time()
     print(f"✅ Query encoding finished in {end_time - start_time:.2f} seconds.")
 
@@ -185,9 +195,8 @@ def run_evaluation():
         )
         return
 
-    queries_embeddings_np = torch.Tensor(np.array(queries_embeddings))
     documents_embeddings = [torch.tensor(doc_emb) for doc_emb in documents_embeddings]
-    queries_embeddings = torch.cat(tensors=[queries_embeddings_np], dim=0)
+    queries_embeddings = [torch.Tensor(q) for q in queries_embeddings]
 
     index_device = "cuda:1"
     if NUM_GPUS < 2:

@@ -78,7 +78,7 @@ def run_evaluation():
     parser.add_argument(
         "--dataset",
         type=str,
-        default="fever",
+        default="msmarco",
         help="Name of the dataset to process from the BEIR benchmark.",
     )
     args = parser.parse_args()
@@ -198,17 +198,9 @@ def run_evaluation():
     documents_embeddings = [torch.tensor(doc_emb) for doc_emb in documents_embeddings]
     queries_embeddings = [torch.Tensor(q) for q in queries_embeddings]
 
-    index_device = "cuda:1"
-    if NUM_GPUS < 2:
-        print(f"⚠️ Warning: GPU count is {NUM_GPUS}. Defaulting index to cuda:0.")
-        index_device = "cuda:0"
-
-    print(f"Setting index and search device to: {index_device}")
-
     index = search.FastPlaid(
-        index=os.path.join("benchmark", dataset_name), device=index_device
+        index=os.path.join("benchmark", dataset_name),
     )
-    print(f"🏗️  Building index for {dataset_name} on {index_device}...")
     start_index = time.time()
 
     index.create(

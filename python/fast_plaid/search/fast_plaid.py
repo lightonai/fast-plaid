@@ -214,7 +214,7 @@ class FastPlaid:
         max_points_per_centroid: int = 256,
         nbits: int = 4,
         n_samples_kmeans: int | None = None,
-        batch_size: int = 25_000,
+        batch_size: int = 50_000,
         seed: int = 42,
         use_triton_kmeans: bool | None = None,
         metadata: list[dict[str, Any]] | None = None,
@@ -288,7 +288,7 @@ class FastPlaid:
         self,
         documents_embeddings: list[torch.Tensor] | torch.Tensor,
         metadata: list[dict[str, Any]] | None = None,
-        batch_size: int = 25_000,
+        batch_size: int = 50_000,
     ) -> "FastPlaid":
         """Update an existing FastPlaid index with new documents."""
         if isinstance(documents_embeddings, torch.Tensor):

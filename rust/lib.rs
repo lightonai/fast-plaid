@@ -194,9 +194,6 @@ fn pysearch(
     subset: Option<Vec<Vec<i64>>>,
 ) -> PyResult<Vec<QueryResult>> {
     let device_tch = get_device(&device)?;
-
-    // Prepare data for the search to ensure it is Send/Sync before releasing GIL.
-    let queries = queries_embeddings.to_kind(Kind::Half);
     let params = search_parameters.clone();
     let index_inner = &index.inner;
 
@@ -204,7 +201,7 @@ fn pysearch(
     let results = py
         .allow_threads(move || {
             search_many(
-                &queries,
+                &queries_embeddings,
                 index_inner,
                 &params,
                 device_tch,

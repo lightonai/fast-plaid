@@ -97,70 +97,6 @@ fn ensure_tensor(t: PyTensor, device: Device, kind: Kind) -> Tensor {
     res
 }
 
-/// Validates that a memory-mapped tensor has sufficient padding for strided access.
-///
-/// `StridedTensor` creates a sliding window view over a flat array. For the very last
-/// element in the array, the window (stride) extends beyond the start of that element.
-/// If the physical file ends exactly at the last element's data, the stride view
-/// would access invalid memory.
-///
-///
-///
-/// This function calculates if the underlying storage has enough "ghost" padding
-/// at the end to allow for a zero-copy view. If not, it returns an error advising
-/// the user to pad the file in Python.
-///
-/// # Arguments
-///
-/// * `data_tensor` - The flat data tensor (possibly memory mapped).
-/// * `lengths_tensor` - The lengths of the sequences stored in `data_tensor`.
-/// * `tensor_name` - A label for the error message.
-fn check_mmap_padding(
-    data_tensor: &Tensor,
-    lengths_tensor: &Tensor,
-    tensor_name: &str,
-) -> PyResult<()> {
-    let num_docs = lengths_tensor.size()[0];
-    if num_docs == 0 {
-        return Ok(());
-    }
-
-    // Move computations to CPU for scalar extraction to avoid sync overhead if on GPU
-    let lengths_cpu = if lengths_tensor.device() != Device::Cpu {
-        lengths_tensor.to_device(Device::Cpu)
-    } else {
-        lengths_tensor.shallow_clone()
-    };
-
-    let max_len = lengths_cpu.max().int64_value(&[]);
-    let last_len = lengths_cpu.int64_value(&[num_docs - 1]);
-
-    // Calculate the logical end of the data
-    let total_len = lengths_cpu.sum(Kind::Int64).int64_value(&[]);
-
-    // Logic:
-    // The view for the *last* element starts at: `total_len - last_len`.
-    // The view requires a width of `max_len` (the stride size).
-    // Therefore, valid memory must exist up to: `(total_len - last_len) + max_len`.
-    let start_of_last = total_len - last_len;
-    let required_size = start_of_last + max_len;
-
-    let current_size = data_tensor.size()[0];
-
-    if current_size < required_size {
-        let missing = required_size - current_size;
-        return Err(PyValueError::new_err(format!(
-            "Memory Map Error: The '{}' tensor is too small for zero-copy strided access. \
-            It requires {} elements of padding at the end. \
-            Please pad the .npy file in Python (e.g. using .resize() or during creation) \
-            to avoid loading the entire file into RAM.",
-            tensor_name, missing
-        )));
-    }
-
-    Ok(())
-}
-
 // ----------------------------------------------------------------------------
 // Index Construction
 // ----------------------------------------------------------------------------
@@ -237,13 +173,6 @@ pub fn construct_index(
     let doc_lens_t = ensure_tensor(doc_lengths, device_tch, Kind::Int64);
     let doc_codes_t = ensure_tensor(doc_codes, device_tch, Kind::Int64);
     let doc_residuals_t = ensure_tensor(doc_residuals, device_tch, Kind::Uint8);
-
-    // We validate padding here to prevent `StridedTensor` from triggering a massive data copy
-    // to add padding in RAM, which would defeat the purpose of mmap.
-    if device_tch == Device::Cpu {
-        check_mmap_padding(&doc_codes_t, &doc_lens_t, "doc_codes")?;
-        check_mmap_padding(&doc_residuals_t, &doc_lens_t, "doc_residuals")?;
-    }
 
     let doc_codes_strided = StridedTensor::new(doc_codes_t, doc_lens_t.shallow_clone(), device_tch);
 

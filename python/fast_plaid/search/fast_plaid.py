@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import gc
 import glob
 import math
 import os
-import random
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -51,7 +51,7 @@ def _load_torch_path(device: str) -> str:
 
 
 def compute_kmeans(  # noqa: PLR0913
-    documents_embeddings: list[torch.Tensor],
+    documents_embeddings: list[torch.Tensor] | torch.Tensor,
     dim: int,
     device: str,
     kmeans_niters: int,
@@ -71,22 +71,44 @@ def compute_kmeans(  # noqa: PLR0913
 
     n_samples_kmeans = min(num_passages, n_samples_kmeans)
 
-    sampled_pids = random.sample(
-        population=range(n_samples_kmeans),
-        k=n_samples_kmeans,
+    # Memory optimization: Use torch.randperm for efficient sampling
+    sampled_indices = torch.randperm(num_passages)[:n_samples_kmeans]
+
+    if isinstance(documents_embeddings, torch.Tensor):
+        # Indexing a tensor directly is a view-operation or efficient gather
+        samples_tensor = documents_embeddings[sampled_indices]
+    else:
+        # Optimization: Pre-calculate total tokens to allocate a single buffer
+        sampled_indices_list = sampled_indices.tolist()
+        total_sample_tokens = sum(
+            documents_embeddings[i].shape[0] for i in sampled_indices_list
+        )
+
+        # Optimization: Pre-allocate buffer in float16 to save 50% RAM immediately
+        samples_tensor = torch.empty(
+            (total_sample_tokens, dim), dtype=torch.float16, device="cpu"
+        )
+
+        # Optimization: Manual slice copy instead of torch.cat to avoid list-of-tensors copy
+        current_offset = 0
+        for i in sampled_indices_list:
+            tensor_slice = documents_embeddings[i]
+            length = tensor_slice.shape[0]
+            # Direct copy into the pre-allocated buffer
+            samples_tensor[current_offset : current_offset + length].copy_(tensor_slice)
+            current_offset += length
+
+    total_tokens = samples_tensor.shape[0]
+
+    # Calculate num_partitions based on the density of the sample relative to the whole
+    avg_tokens_per_doc = total_tokens / n_samples_kmeans
+    estimated_total_tokens = avg_tokens_per_doc * num_passages
+    num_partitions = int(
+        2 ** math.floor(math.log2(16 * math.sqrt(estimated_total_tokens)))
     )
 
-    samples: list[torch.Tensor] = [
-        documents_embeddings[pid] for pid in set(sampled_pids)
-    ]
-
-    total_tokens = sum([sample.shape[0] for sample in samples])
-    num_partitions = (total_tokens / len(samples)) * len(documents_embeddings)
-    num_partitions = int(2 ** math.floor(math.log2(16 * math.sqrt(num_partitions))))
-
-    tensors = torch.cat(tensors=samples)
-    if tensors.is_cuda:
-        tensors = tensors.to(device="cpu", dtype=torch.float16)
+    if samples_tensor.is_cuda:
+        samples_tensor = samples_tensor.to(device="cpu", dtype=torch.float16)
 
     kmeans = FastKMeans(
         d=dim,
@@ -99,7 +121,11 @@ def compute_kmeans(  # noqa: PLR0913
         use_triton=use_triton_kmeans,
     )
 
-    kmeans.train(data=tensors.numpy())
+    kmeans.train(data=samples_tensor)
+
+    # Explicitly clear the large sample buffer before creating centroids
+    del samples_tensor
+    gc.collect()
 
     centroids = torch.from_numpy(
         kmeans.centroids,
@@ -144,7 +170,7 @@ def search_on_device(  # noqa: PLR0913
     scores = fast_plaid_rust.pysearch(
         index=index_object,
         device=device,
-        queries_embeddings=queries_embeddings,
+        queries_embeddings=queries_embeddings.to(dtype=torch.float16),
         search_parameters=search_parameters,
         show_progress=show_progress,
         subset=subset,
@@ -207,6 +233,17 @@ class FastPlaid:
             indices=self.indices,
         )
 
+    def _format_embeddings(
+        self, embeddings: list[torch.Tensor] | torch.Tensor
+    ) -> list[torch.Tensor] | torch.Tensor:
+        """Helper to standardize embedding shapes without creating deep copies."""
+        if isinstance(embeddings, torch.Tensor):
+            return embeddings.squeeze(0) if embeddings.dim() == 3 else embeddings
+
+        # If it's a list, use a generator-like logic to squeeze items in-place (shallowly)
+        return [e.squeeze(0) if e.dim() == 3 else e for e in embeddings]
+
+    @torch.inference_mode()
     def create(  # noqa: PLR0913
         self,
         documents_embeddings: list[torch.Tensor] | torch.Tensor,
@@ -220,15 +257,8 @@ class FastPlaid:
         metadata: list[dict[str, Any]] | None = None,
     ) -> "FastPlaid":
         """Create and saves the FastPlaid index."""
-        if isinstance(documents_embeddings, torch.Tensor):
-            documents_embeddings = [
-                documents_embeddings[i] for i in range(documents_embeddings.shape[0])
-            ]
-
-        documents_embeddings = [
-            embedding.squeeze(0) if embedding.dim() == 3 else embedding
-            for embedding in documents_embeddings
-        ]
+        # Standardize format without forcing a full list-to-tensor or tensor-to-list conversion
+        documents_embeddings = self._format_embeddings(documents_embeddings)
         num_docs = len(documents_embeddings)
 
         self._prepare_index_directory(index_path=self.index)
@@ -242,7 +272,12 @@ class FastPlaid:
                 raise ValueError(error)
             create(index=self.index, metadata=metadata)
 
-        dim = documents_embeddings[0].shape[-1]
+        # Determine dimensionality from the first available element
+        dim = (
+            documents_embeddings[0].shape[-1]
+            if isinstance(documents_embeddings, list)
+            else documents_embeddings.shape[-1]
+        )
 
         # Use the first device for creation logic
         primary_device = self.devices[0]
@@ -272,10 +307,15 @@ class FastPlaid:
             seed=seed,
         )
 
+        # Explicit cleanup of create objects
+        del centroids
+        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
         # Reload indices on all devices now that creation is complete
+        # Optimization: clear old indices first to prevent peaks during reload
+        self.indices.clear()
         self.indices = _reload_index(
             index_path=self.index,
             devices=self.devices,
@@ -284,6 +324,7 @@ class FastPlaid:
 
         return self
 
+    @torch.inference_mode()
     def update(
         self,
         documents_embeddings: list[torch.Tensor] | torch.Tensor,
@@ -291,15 +332,7 @@ class FastPlaid:
         batch_size: int = 50_000,
     ) -> "FastPlaid":
         """Update an existing FastPlaid index with new documents."""
-        if isinstance(documents_embeddings, torch.Tensor):
-            documents_embeddings = [
-                documents_embeddings[i] for i in range(documents_embeddings.shape[0])
-            ]
-
-        documents_embeddings = [
-            embedding.squeeze(0) if embedding.dim() == 3 else embedding
-            for embedding in documents_embeddings
-        ]
+        documents_embeddings = self._format_embeddings(documents_embeddings)
         num_docs = len(documents_embeddings)
 
         if not os.path.exists(self.index) or not os.path.exists(
@@ -336,6 +369,7 @@ class FastPlaid:
         )
 
         # Reload indices on all devices to reflect the updates
+        self.indices.clear()
         self.indices = _reload_index(
             index_path=self.index,
             devices=self.devices,
@@ -365,6 +399,7 @@ class FastPlaid:
             except OSError as e:
                 raise e
 
+    @torch.inference_mode()
     def search(  # noqa: PLR0912, PLR0913, PLR0915, C901
         self,
         queries_embeddings: torch.Tensor | list[torch.Tensor],
@@ -557,6 +592,7 @@ class FastPlaid:
         if os.path.exists(metadata_db_path):
             delete(index=self.index, subset=subset)
 
+        self.indices.clear()
         self.indices = _reload_index(
             index_path=self.index,
             devices=self.devices,

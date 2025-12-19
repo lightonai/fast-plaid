@@ -58,10 +58,6 @@ pub struct LoadedIndex {
 unsafe impl Send for LoadedIndex {}
 unsafe impl Sync for LoadedIndex {}
 
-// ----------------------------------------------------------------------------
-// PyLoadedIndex Wrapper
-// ----------------------------------------------------------------------------
-
 /// A wrapper around the Rust `LoadedIndex` struct that can be held by Python.
 ///
 /// This wrapper allows the Python runtime to manage the lifetime of the
@@ -71,10 +67,6 @@ unsafe impl Sync for LoadedIndex {}
 pub struct PyLoadedIndex {
     pub inner: LoadedIndex,
 }
-
-// ----------------------------------------------------------------------------
-// Helpers
-// ----------------------------------------------------------------------------
 
 /// Ensures the tensor is on the target device and kind without copying if not necessary.
 ///
@@ -97,74 +89,6 @@ fn ensure_tensor(t: PyTensor, device: Device, kind: Kind) -> Tensor {
     res
 }
 
-/// Validates that a memory-mapped tensor has sufficient padding for strided access.
-///
-/// `StridedTensor` creates a sliding window view over a flat array. For the very last
-/// element in the array, the window (stride) extends beyond the start of that element.
-/// If the physical file ends exactly at the last element's data, the stride view
-/// would access invalid memory.
-///
-///
-///
-/// This function calculates if the underlying storage has enough "ghost" padding
-/// at the end to allow for a zero-copy view. If not, it returns an error advising
-/// the user to pad the file in Python.
-///
-/// # Arguments
-///
-/// * `data_tensor` - The flat data tensor (possibly memory mapped).
-/// * `lengths_tensor` - The lengths of the sequences stored in `data_tensor`.
-/// * `tensor_name` - A label for the error message.
-fn check_mmap_padding(
-    data_tensor: &Tensor,
-    lengths_tensor: &Tensor,
-    tensor_name: &str,
-) -> PyResult<()> {
-    let num_docs = lengths_tensor.size()[0];
-    if num_docs == 0 {
-        return Ok(());
-    }
-
-    // Move computations to CPU for scalar extraction to avoid sync overhead if on GPU
-    let lengths_cpu = if lengths_tensor.device() != Device::Cpu {
-        lengths_tensor.to_device(Device::Cpu)
-    } else {
-        lengths_tensor.shallow_clone()
-    };
-
-    let max_len = lengths_cpu.max().int64_value(&[]);
-    let last_len = lengths_cpu.int64_value(&[num_docs - 1]);
-
-    // Calculate the logical end of the data
-    let total_len = lengths_cpu.sum(Kind::Int64).int64_value(&[]);
-
-    // Logic:
-    // The view for the *last* element starts at: `total_len - last_len`.
-    // The view requires a width of `max_len` (the stride size).
-    // Therefore, valid memory must exist up to: `(total_len - last_len) + max_len`.
-    let start_of_last = total_len - last_len;
-    let required_size = start_of_last + max_len;
-
-    let current_size = data_tensor.size()[0];
-
-    if current_size < required_size {
-        let missing = required_size - current_size;
-        return Err(PyValueError::new_err(format!(
-            "Memory Map Error: The '{}' tensor is too small for zero-copy strided access. \
-            It requires {} elements of padding at the end. \
-            Please pad the .npy file in Python (e.g. using .resize() or during creation) \
-            to avoid loading the entire file into RAM.",
-            tensor_name, missing
-        )));
-    }
-
-    Ok(())
-}
-
-// ----------------------------------------------------------------------------
-// Index Construction
-// ----------------------------------------------------------------------------
-
 /// Constructs the internal Index object from raw tensors loaded in Python.
 ///
 /// This function acts as the bridge between Python's file loading and Rust's
@@ -178,6 +102,8 @@ fn check_mmap_padding(
 ///   directly without allocation.
 /// - **Codec Handling**: Small tensors (centroids, weights) are loaded into RAM/VRAM
 ///   immediately for fast lookup during decompression.
+/// - **Low Memory Mode**: If `low_memory` is true, the large document tensors are strictly
+///   kept on the CPU, even if the target `device` is CUDA.
 ///
 /// # Arguments
 ///
@@ -191,7 +117,8 @@ fn check_mmap_padding(
 /// * `doc_codes` - The compressed document codes (int64).
 /// * `doc_residuals` - The compressed document residuals (uint8).
 /// * `doc_lengths` - The true lengths of documents (int64).
-/// * `device` - The target device string.
+/// * `device` - The target device string (e.g. "cuda:0").
+/// * `low_memory` - If true, keeps document data on CPU.
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
 pub fn construct_index(
@@ -207,47 +134,40 @@ pub fn construct_index(
     doc_residuals: PyTensor,
     doc_lengths: PyTensor,
     device: String,
+    low_memory: bool,
 ) -> PyResult<PyLoadedIndex> {
-    let device_tch = get_device(&device)?;
+    let main_device = get_device(&device)?;
 
-    // 1. Codec Loading
-    // These tensors are small (MBs), so we ensure they are on the correct device/kind immediately.
+    // Force document tensors to CPU in low memory mode
+    let storage_device = if low_memory { Device::Cpu } else { main_device };
+
+    // Load codec (small tensors)
     let codec = ResidualCodec::load(
         nbits,
-        ensure_tensor(centroids, device_tch, Kind::Half),
-        ensure_tensor(avg_residual, device_tch, Kind::Half),
-        Some(ensure_tensor(bucket_cutoffs, device_tch, Kind::Half)),
-        Some(ensure_tensor(bucket_weights, device_tch, Kind::Half)),
-        device_tch,
+        ensure_tensor(centroids, main_device, Kind::Half),
+        ensure_tensor(avg_residual, main_device, Kind::Half),
+        Some(ensure_tensor(bucket_cutoffs, main_device, Kind::Half)),
+        Some(ensure_tensor(bucket_weights, main_device, Kind::Half)),
+        main_device,
     )
     .map_err(anyhow_to_pyerr)?;
 
-    // 2. IVF Index
-    // Standard strided tensor construction for the inverted file lists.
+    // Build IVF index
     let ivf_index_strided = StridedTensor::new(
-        ensure_tensor(ivf, device_tch, Kind::Int64),
-        ensure_tensor(ivf_lengths, device_tch, Kind::Int),
-        device_tch,
+        ensure_tensor(ivf, main_device, Kind::Int64),
+        ensure_tensor(ivf_lengths, main_device, Kind::Int),
+        main_device,
     );
 
-    // 3. Document Data
-    // These are the large tensors (GBs). We must handle them carefully.
+    // Load document data (large tensors, may stay on CPU in low memory mode)
+    let doc_lens_t = ensure_tensor(doc_lengths, storage_device, Kind::Int64);
+    let doc_codes_t = ensure_tensor(doc_codes, storage_device, Kind::Int64);
+    let doc_residuals_t = ensure_tensor(doc_residuals, storage_device, Kind::Uint8);
 
-    // Lengths are needed for checking padding and structure.
-    let doc_lens_t = ensure_tensor(doc_lengths, device_tch, Kind::Int64);
-    let doc_codes_t = ensure_tensor(doc_codes, device_tch, Kind::Int64);
-    let doc_residuals_t = ensure_tensor(doc_residuals, device_tch, Kind::Uint8);
+    let doc_codes_strided =
+        StridedTensor::new(doc_codes_t, doc_lens_t.shallow_clone(), storage_device);
 
-    // We validate padding here to prevent `StridedTensor` from triggering a massive data copy
-    // to add padding in RAM, which would defeat the purpose of mmap.
-    if device_tch == Device::Cpu {
-        check_mmap_padding(&doc_codes_t, &doc_lens_t, "doc_codes")?;
-        check_mmap_padding(&doc_residuals_t, &doc_lens_t, "doc_residuals")?;
-    }
-
-    let doc_codes_strided = StridedTensor::new(doc_codes_t, doc_lens_t.shallow_clone(), device_tch);
-
-    let doc_residuals_strided = StridedTensor::new(doc_residuals_t, doc_lens_t, device_tch);
+    let doc_residuals_strided = StridedTensor::new(doc_residuals_t, doc_lens_t, storage_device);
 
     let loaded_index = LoadedIndex {
         codec,

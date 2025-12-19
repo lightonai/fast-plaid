@@ -1,5 +1,3 @@
-// rust/index/delete.rs
-
 use anyhow::Result;
 use serde_json::json;
 use std::collections::HashSet;
@@ -33,13 +31,16 @@ pub fn delete_from_index(subset: &[i64], idx_path: &str, device: Device) -> Resu
     let main_meta_path = idx_path_obj.join("metadata.json");
     let main_meta_file = File::open(&main_meta_path)?;
     let main_meta: serde_json::Value = serde_json::from_reader(BufReader::new(main_meta_file))?;
+
     let num_chunks = main_meta["num_chunks"].as_u64().unwrap() as usize;
     let nbits = main_meta["nbits"].as_i64().unwrap();
-    let est_total_embs = main_meta["num_partitions"].as_i64().unwrap();
+    let est_num_embeddings = main_meta["num_partitions"].as_i64().unwrap();
+
+    let mut final_num_documents: usize = 0;
 
     let ids_to_delete_set: HashSet<i64> = subset.iter().cloned().collect();
     let mut current_doc_offset = 0;
-    let mut total_embs = 0;
+    let mut num_embeddings = 0;
 
     for chunk_idx in 0..num_chunks {
         let doclens_path = idx_path_obj.join(format!("doclens.{}.json", chunk_idx));
@@ -62,6 +63,8 @@ pub fn delete_from_index(subset: &[i64], idx_path: &str, device: Device) -> Resu
                 }
             }
         }
+
+        final_num_documents += new_doclens.len();
 
         if new_doclens.len() < doclens.len() {
             // Rewrite doclens
@@ -90,17 +93,17 @@ pub fn delete_from_index(subset: &[i64], idx_path: &str, device: Device) -> Resu
             let chunk_meta_file = File::open(&chunk_meta_path)?;
             let mut chunk_meta: serde_json::Value =
                 serde_json::from_reader(BufReader::new(chunk_meta_file))?;
-            chunk_meta["num_passages"] = serde_json::json!(new_doclens.len());
+            chunk_meta["num_documents"] = serde_json::json!(new_doclens.len());
             chunk_meta["num_embeddings"] = serde_json::json!(new_codes.size()[0]);
             let new_chunk_meta_file = File::create(&chunk_meta_path)?;
             serde_json::to_writer_pretty(BufWriter::new(new_chunk_meta_file), &chunk_meta)?;
         }
-        total_embs += new_doclens.iter().sum::<i64>();
+        num_embeddings += new_doclens.iter().sum::<i64>();
         current_doc_offset += doclens.len() as i64;
     }
 
     // Recreate IVF
-    let all_codes = Tensor::zeros(&[total_embs], (Kind::Int64, device));
+    let all_codes = Tensor::zeros(&[num_embeddings], (Kind::Int64, device));
     let mut current_emb_offset = 0;
     for chk_idx in 0..num_chunks {
         let codes_fpath_for_global = idx_path_obj.join(format!("{}.codes.npy", chk_idx));
@@ -113,29 +116,15 @@ pub fn delete_from_index(subset: &[i64], idx_path: &str, device: Device) -> Resu
     }
 
     let (sorted_codes, sorted_indices) = all_codes.sort(0, false);
-    let code_counts = sorted_codes.bincount::<Tensor>(None, est_total_embs);
+    let code_counts = sorted_codes.bincount::<Tensor>(None, est_num_embeddings);
     let (opt_ivf, opt_ivf_lens) = optimize_ivf(&sorted_indices, &code_counts, idx_path, device)?;
 
     opt_ivf.write_npy(&idx_path_obj.join("ivf.npy"))?;
     opt_ivf_lens.write_npy(&idx_path_obj.join("ivf_lengths.npy"))?;
 
     // Update main metadata
-    let doclens_re = regex::Regex::new(r"doclens\.(\d+)\.json")?;
-    let mut total_passages = 0;
-    for entry in fs::read_dir(idx_path)? {
-        let entry = entry?;
-        let fname = entry.file_name();
-        if let Some(fname_str) = fname.to_str() {
-            if doclens_re.is_match(fname_str) {
-                let file = File::open(entry.path())?;
-                let doclens: Vec<i64> = serde_json::from_reader(BufReader::new(file))?;
-                total_passages += doclens.len();
-            }
-        }
-    }
-
-    let final_avg_doclen = if total_passages > 0 {
-        total_embs as f64 / total_passages as f64
+    let final_avg_doclen = if final_num_documents > 0 {
+        num_embeddings as f64 / final_num_documents as f64
     } else {
         0.0
     };
@@ -143,9 +132,10 @@ pub fn delete_from_index(subset: &[i64], idx_path: &str, device: Device) -> Resu
     let final_meta_json = json!({
         "num_chunks": num_chunks,
         "nbits": nbits,
-        "num_partitions": est_total_embs,
-        "num_embeddings": total_embs,
+        "num_partitions": est_num_embeddings,
+        "num_embeddings": num_embeddings,
         "avg_doclen": final_avg_doclen,
+        "num_documents": final_num_documents,
     });
 
     let final_meta_file = fs::File::create(&main_meta_path)?;

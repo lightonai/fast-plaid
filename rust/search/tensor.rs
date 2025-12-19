@@ -15,24 +15,20 @@ use tch::{Device, Kind, Tensor};
 /// # Returns
 ///
 /// A scalar `Tensor` containing the computed quantile value.
-fn scalar_quantile_kthvalue(tensor: &Tensor, q: f64) -> Tensor {
+pub fn scalar_quantile_kthvalue(tensor: &Tensor, q: f64) -> Tensor {
     let n = tensor.size()[0];
 
-    // 1. Calculate target float index
     let idx_float = q * (n - 1) as f64;
     let lower_idx = idx_float.floor() as i64;
     let upper_idx = idx_float.ceil() as i64;
 
-    // Optimization: If the index is exactly an integer, we only need one lookup.
     if lower_idx == upper_idx {
         return tensor.kthvalue(lower_idx + 1, 0, true).0;
     }
 
-    // 2. Retrieve bounds
     let (lower_val, _) = tensor.kthvalue(lower_idx + 1, 0, true);
     let (upper_val, _) = tensor.kthvalue(upper_idx + 1, 0, true);
 
-    // 3. Linear Interpolation (Lerp)
     let weight = idx_float - lower_idx as f64;
     lower_val.lerp(&upper_val, weight)
 }
@@ -289,26 +285,33 @@ impl StridedTensor {
     /// This method efficiently looks up elements by selecting an optimal precomputed
     /// view and applying a mask to remove padding, returning a clean, packed tensor.
     ///
+    /// # Hybrid Storage Support:
+    /// This method is device-aware. If the `underlying_data` is on the CPU but the
+    /// `target_device` is the GPU, it will perform the gather operation on the CPU
+    /// (saving VRAM) and then stream the result to the GPU.
+    ///
     /// # Arguments
     /// * `indices` - A 1D `Int64` tensor of element indices to retrieve.
-    /// * `device` - The target `tch::Device` for the output tensors.
+    /// * `target_device` - The `tch::Device` where the result should end up.
     ///
     /// # Returns
-    /// A tuple containing the `(data, lengths)` for the requested indices.
-    pub fn lookup(&self, indices: &Tensor, device: Device) -> (Tensor, Tensor) {
-        let indices = indices.to_device(device).to_kind(Kind::Int64);
+    /// A tuple containing the `(data, lengths)` on the `target_device`.
+    pub fn lookup(&self, indices: &Tensor, target_device: Device) -> (Tensor, Tensor) {
+        let storage_device = self.underlying_data.device();
 
-        if indices.numel() == 0 {
+        let indices_local = indices.to_device(storage_device).to_kind(Kind::Int64);
+
+        if indices_local.numel() == 0 {
             let mut empty_shape = vec![0];
             empty_shape.extend_from_slice(&self.inner_dims);
             return (
-                Tensor::empty(&empty_shape, (self.underlying_data.kind(), device)),
-                Tensor::empty(&[0], (self.element_lengths.kind(), device)),
+                Tensor::empty(&empty_shape, (self.underlying_data.kind(), target_device)),
+                Tensor::empty(&[0], (self.element_lengths.kind(), target_device)),
             );
         }
 
-        let selected_lengths = self.element_lengths.index_select(0, &indices);
-        let selected_offsets = self.cumulative_lengths.index_select(0, &indices);
+        let selected_lengths = self.element_lengths.index_select(0, &indices_local);
+        let selected_offsets = self.cumulative_lengths.index_select(0, &indices_local);
 
         let max_selected_len = if selected_lengths.numel() > 0 {
             selected_lengths.max().int64_value(&[])
@@ -327,8 +330,8 @@ impl StridedTensor {
             let mut empty_shape = vec![0];
             empty_shape.extend_from_slice(&self.inner_dims);
             return (
-                Tensor::empty(&empty_shape, (self.underlying_data.kind(), device)),
-                selected_lengths,
+                Tensor::empty(&empty_shape, (self.underlying_data.kind(), target_device)),
+                selected_lengths.to_device(target_device),
             );
         }
 
@@ -339,10 +342,15 @@ impl StridedTensor {
             )
         });
 
+        // Select data and apply mask
         let strided_data = view.index_select(0, &selected_offsets);
-        let mask = create_mask(&selected_lengths, chosen_stride, None).to_kind(Kind::Bool);
+        let mask = crate::search::tensor::create_mask(&selected_lengths, chosen_stride, None)
+            .to_kind(Kind::Bool);
         let final_data = strided_data.index(&[Some(mask)]);
 
-        (final_data, selected_lengths)
+        (
+            final_data.to_device(target_device),
+            selected_lengths.to_device(target_device),
+        )
     }
 }

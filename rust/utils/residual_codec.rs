@@ -1,5 +1,3 @@
-use itertools::Itertools;
-use std::iter;
 use tch::{Device, Kind, Tensor};
 
 /// A codec that manages the quantization parameters and lookup tables for the index.
@@ -79,80 +77,61 @@ impl ResidualCodec {
         bucket_weights_tensor_initial: Option<Tensor>,
         device: Device,
     ) -> anyhow::Result<Self> {
-        // 1. Create Bit Helper
-        // Used for parallel bit extraction in some update routines.
         let bit_helper_tensor = Tensor::arange_start(0, nbits_param, (Kind::Int8, device));
 
-        // 2. Generate Bit Reversal Map (0..255)
-        // This handles potential endianness mismatches or specific packing formats
-        // by reversing the bits *within* each n-bit segment of a byte.
-        let mut reversed_bits_map_u8 = Vec::with_capacity(256);
+        // Build bit reversal map for unpacking
+        let mut reversed_bits_map_u8 = vec![0u8; 256];
         let nbits_mask = (1 << nbits_param) - 1;
 
-        for byte_val in 0..256u32 {
-            let mut reversed_bits = 0u32;
-            let mut bit_pos = 8;
+        for i in 0..256usize {
+            let val = i as u32;
+            let mut out = 0u32;
+            let mut pos = 8;
 
-            // Iterate through the byte in chunks of `nbits_param`
-            while bit_pos >= nbits_param {
-                let nbits_segment = (byte_val >> (bit_pos - nbits_param)) & nbits_mask;
-                let mut reversed_segment = 0u32;
+            while pos >= nbits_param {
+                let segment = (val >> (pos - nbits_param)) & nbits_mask;
 
-                // Reverse the bits inside the segment
+                let mut rev_segment = 0;
                 for k in 0..nbits_param {
-                    if (nbits_segment & (1 << k)) != 0 {
-                        reversed_segment |= 1 << (nbits_param - 1 - k);
+                    if (segment & (1 << k)) != 0 {
+                        rev_segment |= 1 << (nbits_param - 1 - k);
                     }
                 }
 
-                reversed_bits |= reversed_segment;
-                if bit_pos > nbits_param {
-                    reversed_bits <<= nbits_param;
+                out |= rev_segment;
+
+                if pos > nbits_param {
+                    out <<= nbits_param;
                 }
-                bit_pos -= nbits_param;
+
+                pos -= nbits_param;
             }
-            reversed_bits_map_u8.push((reversed_bits & 0xFF) as u8);
+            reversed_bits_map_u8[i] = out as u8;
         }
 
-        let byte_map_tensor = Tensor::from_slice(
-            &reversed_bits_map_u8
-                .iter()
-                .map(|&val| val as i64)
-                .collect::<Vec<_>>(),
-        )
-        .to_kind(Kind::Uint8)
-        .to_device(device);
+        let byte_map_tensor = Tensor::from_slice(&reversed_bits_map_u8)
+            .to_kind(Kind::Uint8)
+            .to_device(device);
 
-        // 3. Generate Decompression Lookup Table
-        // If we have weights (search mode), we pre-calculate the expansion of every
-        // possible byte into its constituent bucket indices.
-        //
-        // Example (nbits=2):
-        // A byte holds 4 codes. There are 4 possible buckets (0-3).
-        // We generate a table of size [256, 4].
-        // Entry 0 (0b00000000) -> [0, 0, 0, 0]
-        // Entry 255 (0b11111111) -> [3, 3, 3, 3]
-        let keys_per_byte = 8 / nbits_param;
+        // Build lookup table for bucket weight indices
+        let keys_per_byte = (8 / nbits_param) as usize;
+
         let opt_bucket_weight_indices_lookup_table =
-            if let Some(ref weights) = bucket_weights_tensor_initial {
-                let num_buckets = weights.size()[0] as usize;
-                let bucket_indices = (0..num_buckets as i64).collect::<Vec<_>>();
+            if let Some(ref _weights) = bucket_weights_tensor_initial {
+                let mask = (1 << nbits_param) - 1;
+                let mut table_data = Vec::with_capacity(256 * keys_per_byte);
 
-                // Generate Cartesian product: bucket_indices ^ keys_per_byte
-                let combinations = iter::repeat(bucket_indices)
-                    .take(keys_per_byte as usize)
-                    .multi_cartesian_product()
-                    .flatten()
-                    .collect::<Vec<_>>();
-
-                let lookup_shape = vec![
-                    (num_buckets as i64).pow(keys_per_byte as u32),
-                    keys_per_byte,
-                ];
+                for byte_val in 0..256 {
+                    for k in (0..keys_per_byte).rev() {
+                        let shift = k as i64 * nbits_param;
+                        let index = (byte_val >> shift) & mask;
+                        table_data.push(index);
+                    }
+                }
 
                 Some(
-                    Tensor::from_slice(&combinations)
-                        .reshape(&lookup_shape)
+                    Tensor::from_slice(&table_data)
+                        .reshape(&[256, keys_per_byte as i64])
                         .to_kind(Kind::Int64)
                         .to_device(device),
                 )

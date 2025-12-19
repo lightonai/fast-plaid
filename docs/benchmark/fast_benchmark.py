@@ -33,6 +33,7 @@ def encode_worker(
             model_name_or_path=model_name,
             query_length=query_length,
             document_length=document_length,
+            do_query_expansion=False,
             model_kwargs={"torch_dtype": torch.float16},
         )
         model.to(device)
@@ -78,7 +79,7 @@ def run_evaluation():
     parser.add_argument(
         "--dataset",
         type=str,
-        default="msmarco",
+        default="scifact",
         help="Name of the dataset to process from the BEIR benchmark.",
     )
     args = parser.parse_args()
@@ -116,6 +117,7 @@ def run_evaluation():
     shutil.rmtree(dataset_name, ignore_errors=True)
     os.makedirs(dataset_name, exist_ok=True)
     shutil.rmtree(f"{dataset_name}_pylate", ignore_errors=True)
+    shutil.rmtree(os.path.join("benchmark", dataset_name), ignore_errors=True)
 
     print(f"📚 Loading BEIR dataset: {dataset_name}")
     documents, queries, qrels, documents_ids = evaluation.load_beir(
@@ -158,12 +160,6 @@ def run_evaluation():
     end_time = time.time()
     print(f"✅ Document encoding finished in {end_time - start_time:.2f} seconds.")
 
-    if len(documents_embeddings) != len(document_texts):
-        print(
-            f"❌ Error: Expected {len(document_texts)} doc embeddings, but got {len(documents_embeddings)}."
-        )
-        return
-
     print(f"🧠 Encoding {len(query_texts)} queries (in parallel)...")
     query_chunks = np.array_split(query_texts, NUM_GPUS)
 
@@ -203,10 +199,12 @@ def run_evaluation():
     )
     start_index = time.time()
 
-    index.create(
-        documents_embeddings=documents_embeddings,
-        kmeans_niters=4,
-    )
+    batch_size = 1000
+    for i in range(0, len(documents_embeddings), batch_size):
+        index.update(
+            documents_embeddings=documents_embeddings[i : i + batch_size],
+        )
+
     end_index = time.time()
     indexing_time = end_index - start_index
     print(f"\t✅ {dataset_name} indexing: {indexing_time:.2f} seconds")
@@ -219,7 +217,7 @@ def run_evaluation():
         top_k=20,
     )
     end_search = time.time()
-    search_time = end_search - start_time
+    search_time = end_search - start_search
     print(f"\t✅ {dataset_name} search: {search_time:.2f} seconds")
 
     results = []
@@ -272,3 +270,7 @@ if __name__ == "__main__":
         )
 
     run_evaluation()
+
+# NQ create: 0.6177407392184667
+# MSMARCO create: 0.4554897209949491
+# FIQA streaming 0.4531436068439231 # 60400 centroids, 64820 centroids batch_size 100, vanilla: 32768 centroids

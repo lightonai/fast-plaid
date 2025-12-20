@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import functools
 import gc
 import glob
 import math
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+import psutil
 import torch
 from fast_plaid import fast_plaid_rust
 from fastkmeans import FastKMeans
@@ -14,6 +17,61 @@ from joblib import Parallel, delayed
 
 from ..filtering import create, delete, update
 from .load import _reload_index
+
+
+def profile_resources(func):
+    """Measure execution time, RAM usage (RSS), and GPU VRAM usage."""
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        process = psutil.Process(os.getpid())
+
+        # 1. Snapshot Start State
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            start_vram = torch.cuda.memory_allocated() / (1024**2)
+        else:
+            start_vram = 0.0
+
+        start_ram = process.memory_info().rss / (1024**2)  # Convert to MB
+        start_time = time.time()
+
+        try:
+            result = func(*args, **kwargs)
+        except Exception as e:
+            raise e
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                end_vram = torch.cuda.memory_allocated() / (1024**2)
+                peak_vram = torch.cuda.max_memory_allocated() / (1024**2)
+            else:
+                end_vram = 0.0
+                peak_vram = 0.0
+
+            end_ram = process.memory_info().rss / (1024**2)
+            end_time = time.time()
+
+            delta_ram = end_ram - start_ram
+            delta_vram = end_vram - start_vram
+
+            print(f"\n[PROFILE] Function: {func.__name__}")
+            print(f"  ├── Time:      {end_time - start_time:.4f}s")
+            print(
+                f"  ├── RAM (RSS): {start_ram:.2f}MB -> {end_ram:.2f}MB (Delta: {delta_ram:+.2f}MB)"  # noqa: E501
+            )
+            if torch.cuda.is_available():
+                print(
+                    f"  └── VRAM:      {start_vram:.2f}MB -> {end_vram:.2f}MB (Delta: {delta_vram:+.2f}MB, Peak: {peak_vram:.2f}MB)"  # noqa: E501
+                )
+            else:
+                print("  └── VRAM:      N/A (CPU only)")
+            print("-" * 40)
+
+        return result
+
+    return wrapper
 
 
 class TorchWithCudaNotFoundError(Exception):
@@ -50,6 +108,7 @@ def _load_torch_path(device: str) -> str:
     raise TorchWithCudaNotFoundError(error) from IndexError
 
 
+@profile_resources
 def compute_kmeans(  # noqa: PLR0913
     documents_embeddings: list[torch.Tensor] | torch.Tensor,
     dim: int,
@@ -84,12 +143,12 @@ def compute_kmeans(  # noqa: PLR0913
             documents_embeddings[i].shape[0] for i in sampled_indices_list
         )
 
-        # Optimization: Pre-allocate buffer in float16 to save 50% RAM immediately
         samples_tensor = torch.empty(
-            (total_sample_tokens, dim), dtype=torch.float16, device="cpu"
+            (total_sample_tokens, dim),
+            dtype=torch.float16,
+            device="cpu",
         )
 
-        # Optimization: Manual slice copy instead of torch.cat to avoid list-of-tensors copy
         current_offset = 0
         for i in sampled_indices_list:
             tensor_slice = documents_embeddings[i]
@@ -140,6 +199,7 @@ def compute_kmeans(  # noqa: PLR0913
     ).half()
 
 
+@profile_resources
 def search_on_device(  # noqa: PLR0913
     device: str,
     queries_embeddings: torch.Tensor,
@@ -195,13 +255,20 @@ class FastPlaid:
     device:
         The device(s) to use for computation (e.g., "cuda", ["cuda:0", "cuda:1"]).
         If None, defaults to ["cuda"].
+    low_memory:
+        If True, keeps document data on CPU RAM and streams it to the GPU
+        only when needed. This drastically reduces VRAM usage (often <1GB)
+        at the cost of some performance due to PCI-E bandwidth limits.
+        Default is False.
 
     """
 
+    @profile_resources
     def __init__(
         self,
         index: str,
         device: str | list[str] | None = None,
+        low_memory: bool = True,
         **kwargs: Any,  # noqa: ARG002
     ) -> None:
         """Initialize the FastPlaid instance."""
@@ -219,6 +286,7 @@ class FastPlaid:
 
         self.torch_path = _load_torch_path(device=self.devices[0])
         self.index = index
+        self.low_memory = low_memory
 
         # Initialize Torch environment once
         fast_plaid_rust.initialize_torch(torch_path=self.torch_path)
@@ -231,19 +299,20 @@ class FastPlaid:
             index_path=self.index,
             devices=self.devices,
             indices=self.indices,
+            low_memory=self.low_memory,
         )
 
     def _format_embeddings(
         self, embeddings: list[torch.Tensor] | torch.Tensor
     ) -> list[torch.Tensor] | torch.Tensor:
-        """Helper to standardize embedding shapes without creating deep copies."""
+        """Sandardize embedding shapes without creating deep copies."""
         if isinstance(embeddings, torch.Tensor):
             return embeddings.squeeze(0) if embeddings.dim() == 3 else embeddings
 
-        # If it's a list, use a generator-like logic to squeeze items in-place (shallowly)
         return [e.squeeze(0) if e.dim() == 3 else e for e in embeddings]
 
     @torch.inference_mode()
+    @profile_resources
     def create(  # noqa: PLR0913
         self,
         documents_embeddings: list[torch.Tensor] | torch.Tensor,
@@ -257,7 +326,6 @@ class FastPlaid:
         metadata: list[dict[str, Any]] | None = None,
     ) -> "FastPlaid":
         """Create and saves the FastPlaid index."""
-        # Standardize format without forcing a full list-to-tensor or tensor-to-list conversion
         documents_embeddings = self._format_embeddings(documents_embeddings)
         num_docs = len(documents_embeddings)
 
@@ -320,11 +388,13 @@ class FastPlaid:
             index_path=self.index,
             devices=self.devices,
             indices=self.indices,
+            low_memory=self.low_memory,
         )
 
         return self
 
     @torch.inference_mode()
+    @profile_resources
     def update(
         self,
         documents_embeddings: list[torch.Tensor] | torch.Tensor,
@@ -374,6 +444,7 @@ class FastPlaid:
             index_path=self.index,
             devices=self.devices,
             indices=self.indices,
+            low_memory=self.low_memory,
         )
 
         return self
@@ -400,6 +471,7 @@ class FastPlaid:
                 raise e
 
     @torch.inference_mode()
+    @profile_resources
     def search(  # noqa: PLR0912, PLR0913, PLR0915, C901
         self,
         queries_embeddings: torch.Tensor | list[torch.Tensor],
@@ -441,6 +513,7 @@ class FastPlaid:
                 index_path=self.index,
                 devices=self.devices,
                 indices=self.indices,
+                low_memory=self.low_memory,
             )
 
         if not os.path.exists(os.path.join(self.index, "metadata.json")):
@@ -597,6 +670,7 @@ class FastPlaid:
             index_path=self.index,
             devices=self.devices,
             indices=self.indices,
+            low_memory=self.low_memory,
         )
 
         return self

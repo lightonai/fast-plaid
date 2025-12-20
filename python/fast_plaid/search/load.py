@@ -326,16 +326,23 @@ def _load_index_tensors_cpu(index_path: str) -> dict[str, Any] | None:
     return data
 
 
-def _construct_index_from_tensors(data: dict[str, Any], device: str) -> Any:
+def _construct_index_from_tensors(
+    data: dict[str, Any], device: str, low_memory: bool
+) -> Any:
     """Move CPU tensors to specific device and build Rust index."""
     # Transfer tensors to the target device (GPU or CPU)
     # non_blocking=True helps parallelize the transfer on GPUs
-    gpu_data = {
-        key: (
-            val.to(device, non_blocking=True) if isinstance(val, torch.Tensor) else val
-        )
-        for key, val in data.items()
-    }
+    gpu_data = {}
+    for key, val in data.items():
+        if isinstance(val, torch.Tensor):
+            # If low_memory, do NOT move large docs to GPU here.
+            # We keep them on CPU to save VRAM.
+            if low_memory and key in ["doc_codes", "doc_residuals", "doc_lengths"]:
+                gpu_data[key] = val  # Keep on CPU
+            else:
+                gpu_data[key] = val.to(device, non_blocking=True)
+        else:
+            gpu_data[key] = val
 
     return fast_plaid_rust.construct_index(
         nbits=gpu_data["nbits"],
@@ -349,6 +356,7 @@ def _construct_index_from_tensors(data: dict[str, Any], device: str) -> Any:
         doc_residuals=gpu_data["doc_residuals"],
         doc_lengths=gpu_data["doc_lengths"],
         device=device,
+        low_memory=low_memory,
     )
 
 
@@ -356,6 +364,7 @@ def _reload_index(
     index_path: str,
     devices: list[str],
     indices: dict[str, Any],
+    low_memory: bool = False,
 ) -> dict[str, Any]:
     """Load or reload the index object for every configured device."""
     # Check existence first
@@ -379,11 +388,15 @@ def _reload_index(
             indices[device] = None
         return indices
 
-    # Helper: Provision GPU
     def _provision_gpu(device: str) -> tuple[str, Any]:
         try:
             # Constructs index by moving CPU tensors to target device
-            idx = _construct_index_from_tensors(data=cpu_tensors, device=device)  # noqa: F821
+            # or keeping them on CPU if low_memory is set.
+            idx = _construct_index_from_tensors(
+                data=cpu_tensors,  # noqa: F821
+                device=device,
+                low_memory=low_memory,
+            )
             return device, idx  # noqa: TRY300
         except Exception as e:
             print(f"Warning: Failed to load index on {device}: {e}")

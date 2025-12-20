@@ -114,6 +114,8 @@ fn ensure_tensor(t: PyTensor, device: Device, kind: Kind) -> Tensor {
 ///   directly without allocation.
 /// - **Codec Handling**: Small tensors (centroids, weights) are loaded into RAM/VRAM
 ///   immediately for fast lookup during decompression.
+/// - **Low Memory Mode**: If `low_memory` is true, the large document tensors are strictly
+///   kept on the CPU, even if the target `device` is CUDA.
 ///
 /// # Arguments
 ///
@@ -127,7 +129,8 @@ fn ensure_tensor(t: PyTensor, device: Device, kind: Kind) -> Tensor {
 /// * `doc_codes` - The compressed document codes (int64).
 /// * `doc_residuals` - The compressed document residuals (uint8).
 /// * `doc_lengths` - The true lengths of documents (int64).
-/// * `device` - The target device string.
+/// * `device` - The target device string (e.g. "cuda:0").
+/// * `low_memory` - If true, keeps document data on CPU.
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
 pub fn construct_index(
@@ -143,40 +146,45 @@ pub fn construct_index(
     doc_residuals: PyTensor,
     doc_lengths: PyTensor,
     device: String,
+    low_memory: bool,
 ) -> PyResult<PyLoadedIndex> {
-    let device_tch = get_device(&device)?;
+    let main_device = get_device(&device)?;
+
+    // If low_memory is True, we force the massive document tensors to reside on CPU.
+    // The main_device (GPU) is still used for IVF and centroids.
+    let storage_device = if low_memory { Device::Cpu } else { main_device };
 
     // 1. Codec Loading
     // These tensors are small (MBs), so we ensure they are on the correct device/kind immediately.
     let codec = ResidualCodec::load(
         nbits,
-        ensure_tensor(centroids, device_tch, Kind::Half),
-        ensure_tensor(avg_residual, device_tch, Kind::Half),
-        Some(ensure_tensor(bucket_cutoffs, device_tch, Kind::Half)),
-        Some(ensure_tensor(bucket_weights, device_tch, Kind::Half)),
-        device_tch,
+        ensure_tensor(centroids, main_device, Kind::Half),
+        ensure_tensor(avg_residual, main_device, Kind::Half),
+        Some(ensure_tensor(bucket_cutoffs, main_device, Kind::Half)),
+        Some(ensure_tensor(bucket_weights, main_device, Kind::Half)),
+        main_device,
     )
     .map_err(anyhow_to_pyerr)?;
 
     // 2. IVF Index
     // Standard strided tensor construction for the inverted file lists.
     let ivf_index_strided = StridedTensor::new(
-        ensure_tensor(ivf, device_tch, Kind::Int64),
-        ensure_tensor(ivf_lengths, device_tch, Kind::Int),
-        device_tch,
+        ensure_tensor(ivf, main_device, Kind::Int64),
+        ensure_tensor(ivf_lengths, main_device, Kind::Int),
+        main_device,
     );
 
     // 3. Document Data
-    // These are the large tensors (GBs). We must handle them carefully.
+    // These are the large tensors (GBs).
+    // In low_memory mode, these stay on CPU (mmap) to save VRAM.
+    let doc_lens_t = ensure_tensor(doc_lengths, storage_device, Kind::Int64);
+    let doc_codes_t = ensure_tensor(doc_codes, storage_device, Kind::Int64);
+    let doc_residuals_t = ensure_tensor(doc_residuals, storage_device, Kind::Uint8);
 
-    // Lengths are needed for checking padding and structure.
-    let doc_lens_t = ensure_tensor(doc_lengths, device_tch, Kind::Int64);
-    let doc_codes_t = ensure_tensor(doc_codes, device_tch, Kind::Int64);
-    let doc_residuals_t = ensure_tensor(doc_residuals, device_tch, Kind::Uint8);
+    let doc_codes_strided =
+        StridedTensor::new(doc_codes_t, doc_lens_t.shallow_clone(), storage_device);
 
-    let doc_codes_strided = StridedTensor::new(doc_codes_t, doc_lens_t.shallow_clone(), device_tch);
-
-    let doc_residuals_strided = StridedTensor::new(doc_residuals_t, doc_lens_t, device_tch);
+    let doc_residuals_strided = StridedTensor::new(doc_residuals_t, doc_lens_t, storage_device);
 
     let loaded_index = LoadedIndex {
         codec,

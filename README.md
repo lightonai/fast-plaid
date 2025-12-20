@@ -44,10 +44,10 @@ FastPlaid is available in multiple versions to support different PyTorch version
 
 | FastPlaid Version | PyTorch Version | Installation Command                |
 | ----------------- | --------------- | ----------------------------------- |
-| 1.3.1.290         | 2.9.0           | `pip install fast-plaid==1.3.1.290` |
-| 1.3.1.280         | 2.8.0           | `pip install fast-plaid==1.3.1.280` |
-| 1.3.1.271         | 2.7.1           | `pip install fast-plaid==1.3.1.271` |
-| 1.3.1.270         | 2.7.0           | `pip install fast-plaid==1.3.1.270` |
+| 1.3.2.290         | 2.9.0           | `pip install fast-plaid==1.3.2.290` |
+| 1.3.2.280         | 2.8.0           | `pip install fast-plaid==1.3.2.280` |
+| 1.3.2.271         | 2.7.1           | `pip install fast-plaid==1.3.2.271` |
+| 1.3.2.270         | 2.7.0           | `pip install fast-plaid==1.3.2.270` |
 
 ### Adding FastPlaid as a Dependency
 
@@ -56,7 +56,7 @@ You can add FastPlaid to your project dependencies with version ranges to ensure
 **For requirements.txt:**
 
 ```
-fast-plaid>=1.3.1.270,<=1.3.1.290
+fast-plaid>=1.3.2.270,<=1.3.2.290
 ```
 
 **For pyproject.toml:**
@@ -64,7 +64,7 @@ fast-plaid>=1.3.1.270,<=1.3.1.290
 ```toml
 [project]
 dependencies = [
-    "fast-plaid>=1.3.1.270,<=1.3.1.290"
+    "fast-plaid>=1.3.2.270,<=1.3.2.290"
 ]
 ```
 
@@ -72,7 +72,7 @@ dependencies = [
 
 ```python
 install_requires=[
-    "fast-plaid>=1.3.1.270,<=1.3.1.290"
+    "fast-plaid>=1.3.2.270,<=1.3.2.290"
 ]
 ```
 
@@ -97,6 +97,7 @@ import torch
 from fast_plaid import search
 
 fast_plaid = search.FastPlaid(index="index", device="cpu") # or "cuda" for GPU.
+# Leave blank for auto-detect, including multi-GPU.
 # On CPU, specifying device speeds up initialization.
 
 embedding_dim = 128
@@ -217,6 +218,35 @@ Providing a `subset` filter can significantly speed up the search process, espec
 
 &nbsp;
 
+## ⚖️ Settings Trade-offs
+
+### Initialization
+
+```python
+Parameter         Default     Memory                        Speed                     Description
+low_memory       True        lower = less VRAM usage     True = slower   No effect when device is "cpu", only used when device is GPU. Load index tensors on CPU and move to device only when needed. Accelerate search at the cost of higher VRAM usage when False.
+```
+
+
+### Indexing
+
+```python
+Parameter         Default     Speed                        Accuracy                     Description
+n_samples_kmeans  None        lower = faster               lower = less precise         Number of samples to compute centroids
+nbits             4           lower  = faster              lower  = less precise        product quantization bits
+kmeans_niters     4           higher = slower indexing     higher = better clusters     K-means iterations
+```
+
+### Search
+
+```python
+Parameter         Default     Speed               Accuracy                    Description
+n_ivf_probe       8           higher = slower     higher = better recall      cluster probes per query
+n_full_scores     4096        higher = slower     higher = better ranking     candidates for full scoring
+```
+
+&nbsp;
+
 ## 📊 Benchmarks
 
 FastPlaid significantly outperforms the original PLAID engine across various datasets, delivering comparable accuracy with faster indexing and query speeds.
@@ -250,27 +280,6 @@ webis-touche2020 382545 PLAID         0.25             128.11                   
 ```
 
 _All benchmarks were performed on an H100 GPU. It's important to note that PLAID relies on Just-In-Time (JIT) compilation. This means the very first execution can exhibit longer runtimes. To ensure our performance analysis is representative, we've excluded these initial JIT-affected runs from the reported results. In contrast, FastPlaid does not employ JIT compilation, so its performance on the first run is directly indicative of its typical execution speed._
-
-&nbsp;
-
-## ⚖️ Settings Trade-offs
-
-### Indexing
-
-```python
-Parameter         Default     Speed                        Accuracy                     Description
-n_samples_kmeans  None        lower = faster               lower = less precise         Number of samples to compute centroids
-nbits             4           lower  = faster              lower  = less precise        product quantization bits
-kmeans_niters     4           higher = slower indexing     higher = better clusters     K-means iterations
-```
-
-### Search
-
-```python
-Parameter         Default     Speed               Accuracy                    Description
-n_ivf_probe       8           higher = slower     higher = better recall      cluster probes per query
-n_full_scores     4096        higher = slower     higher = better ranking     candidates for full scoring
-```
 
 &nbsp;
 
@@ -317,6 +326,7 @@ class FastPlaid:
         self,
         index: str,
         device: str | list[str] | None = None,
+        low_memory: bool = True,
     ) -> None:
 ```
 
@@ -333,6 +343,9 @@ device: str | list[str] | None = None
     - Can be a list of device strings (e.g., ["cuda:0", "cuda:1"]).
     - If multiple GPUs are specified and available, multiprocessing is automatically set up for parallel execution.
       Remember to include your code within an `if __name__ == "__main__":` block for proper multiprocessing behavior.
+    
+low_memory: bool = True
+    If True, the index is loaded in a memory-efficient manner, keeping tensors on CPU and moving them to the target device only when needed. This reduces VRAM usage at the cost of some performance. No effect when device is "cpu".
 
 ```
 
@@ -348,7 +361,7 @@ The **`create` method** builds the multi-vector index from your document embeddi
         max_points_per_centroid: int = 256,
         nbits: int = 4,
         n_samples_kmeans: int | None = None,
-        batch_size: int = 25_000,
+        batch_size: int = 50_000,
         seed: int = 42,
         use_triton_kmeans: bool | None = None,
         metadata: list[dict[str, Any]] | None = None,
@@ -380,7 +393,7 @@ n_samples_kmeans: int | None = None (optional)
     clustering quality. If you have a large dataset, you might want to set this to a
     smaller value to speed up the indexing process and save some memory.
 
-batch_size: int = 25_000 (optional)
+batch_size: int = 50_000 (optional)
     Batch size for processing embeddings during index creation.
 
 seed: int = 42 (optional)

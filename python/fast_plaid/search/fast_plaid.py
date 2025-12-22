@@ -650,6 +650,8 @@ class FastPlaid:
 
         return all_results
 
+    @torch.inference_mode()
+    @profile_resources
     def delete(self, subset: list[int]) -> "FastPlaid":
         """Delete embeddings from an existing FastPlaid index."""
         primary_device = self.devices[0]

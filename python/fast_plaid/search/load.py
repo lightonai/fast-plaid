@@ -289,6 +289,16 @@ def _load_index_tensors_cpu(index_path: str) -> dict[str, Any] | None:
         ),
     }
 
+    # Load average residual norm if available
+    avg_res_norm_path = os.path.join(index_path, "average_residual_norm.npy")
+    if os.path.exists(avg_res_norm_path):
+        data["average_residual_norm"] = _load_small_tensor(
+            index_path=index_path,
+            name="average_residual_norm.npy",
+            dtype=torch.float32,
+            device=device,
+        )
+
     all_doc_lens = []
     for i in range(num_chunks):
         dl_path = os.path.join(index_path, f"doclens.{i}.json")

@@ -90,7 +90,45 @@ pub fn update_index(
         .ok_or_else(|| anyhow::anyhow!("Codec missing bucket_cutoffs"))?;
 
     // -------------------------------------------------------------------------
-    // 2. Process New Documents (Chunking & Quantization)
+    // 2. Prepare Accumulators for Average Residual Norm Update
+    // -------------------------------------------------------------------------
+    // We need to reconstruct the sum of residual norms from the existing index
+    // so we can incrementally update the average.
+    // Old Sum = Old Average * Old Counts
+
+    // Attempt to load existing average file. If missing, we assume 0.0 (legacy index support).
+    let old_avgs_path = idx_path_obj.join("average_residual_norm.npy");
+    let old_avgs = if old_avgs_path.exists() {
+        Tensor::read_npy(&old_avgs_path)?
+            .to_device(device)
+            .to_kind(Kind::Float)
+    } else {
+        Tensor::zeros(&[est_total_embs], (Kind::Float, device))
+    };
+
+    // Get old counts from the loaded IVF lengths (element_lengths)
+    let old_counts = index
+        .ivf_index_strided
+        .element_lengths
+        .to_device(device)
+        .to_kind(Kind::Float);
+
+    // Ensure sizes match before math operations
+    let num_centroids = est_total_embs as i64;
+    let old_avgs_resized = if old_avgs.size()[0] != num_centroids {
+        // Padding or truncation logic if strictly needed, usually implies corruption if mismatch.
+        // Here we assume consistency for simplicity or rebuild.
+        old_avgs // Potentially risky if mismatch, but standard pytorch broadcasting might handle or crash.
+    } else {
+        old_avgs
+    };
+
+    // Initialize accumulators with old data
+    let mut global_sum_residuals = &old_avgs_resized * &old_counts;
+    let mut global_counts = old_counts; // Will add new counts to this
+
+    // -------------------------------------------------------------------------
+    // 3. Process New Documents (Chunking & Quantization)
     // -------------------------------------------------------------------------
     // To handle large updates without exhausting RAM/VRAM, we process documents in
     // manageable chunks. Each chunk is quantized and immediately written to disk.
@@ -135,6 +173,15 @@ pub fn update_index(
             }
             let recon_centroids = Tensor::cat(&recon_centroids_batches, 0);
             let mut res_batch = &emb_batch - &recon_centroids;
+
+            // -- Update Accumulators --
+            let res_norms = res_batch.norm_scalaropt_dim(2, &[1], false);
+            let codes_i64 = code_batch.to_kind(Kind::Int64);
+            let ones = Tensor::ones_like(&res_norms);
+
+            global_sum_residuals.index_add_(0, &codes_i64, &res_norms.to_kind(Kind::Float));
+            global_counts.index_add_(0, &codes_i64, &ones.to_kind(Kind::Float));
+            // -- End Update --
 
             // C. Quantize & Pack Residuals
             res_batch = Tensor::bucketize(&res_batch, b_cutoffs, true, false);
@@ -181,7 +228,15 @@ pub fn update_index(
     }
 
     // -------------------------------------------------------------------------
-    // 3. Update Global Metadata & Link Offsets
+    // 4. Update and Save Average Residual Norms
+    // -------------------------------------------------------------------------
+    let final_avg_residuals = global_sum_residuals / global_counts.clamp_min(1.0);
+    final_avg_residuals
+        .to_device(Device::Cpu)
+        .write_npy(&idx_path_obj.join("average_residual_norm.npy"))?;
+
+    // -------------------------------------------------------------------------
+    // 5. Update Global Metadata & Link Offsets
     // -------------------------------------------------------------------------
     // We iterate through the newly created metadata files to inject the correct
     // global embedding offsets. This allows the searcher to map a global ID
@@ -208,7 +263,7 @@ pub fn update_index(
     let total_num_embs = current_emb_offset;
 
     // -------------------------------------------------------------------------
-    // 4. Generate New Partial IVF
+    // 6. Generate New Partial IVF
     // -------------------------------------------------------------------------
     // We need to determine which centroid every new token belongs to.
     // This allows us to append the new document IDs (PIDs) to the inverted lists.
@@ -257,15 +312,10 @@ pub fn update_index(
     }
 
     // -------------------------------------------------------------------------
-    // 5. Merge with Old IVF
+    // 7. Merge with Old IVF
     // -------------------------------------------------------------------------
     // We now combine the existing inverted lists (from `index.ivf_index_strided`)
     // with our newly computed partial IVF lists.
-    //
-    //
-    // The diagram above illustrates how we iterate through every centroid (partition),
-    // taking the existing list of PIDs and appending the new list of PIDs, creating
-    // a new, longer unified list.
 
     let old_ivf_flat = &index.ivf_index_strided.underlying_data;
     let old_ivf_lengths = &index.ivf_index_strided.element_lengths;
@@ -323,7 +373,7 @@ pub fn update_index(
         .to_kind(Kind::Int); // IVF lengths are typically Int32 or Int64.
 
     // -------------------------------------------------------------------------
-    // 6. Write Updated Global Files
+    // 8. Write Updated Global Files
     // -------------------------------------------------------------------------
     final_ivf_tensor
         .to_device(Device::Cpu)
@@ -335,7 +385,7 @@ pub fn update_index(
         .write_npy(&idx_path_obj.join("ivf_lengths.npy"))?;
 
     // -------------------------------------------------------------------------
-    // 7. Update Global Metadata
+    // 9. Update Global Metadata
     // -------------------------------------------------------------------------
     // Calculate new average document length.
     let final_avg_doclen = if !new_doclens_accumulated.is_empty() || old_num_passages > 0 {

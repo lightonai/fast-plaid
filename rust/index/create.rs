@@ -378,7 +378,12 @@ pub fn create_index(
     let bar = ProgressBar::new(n_chunks.try_into().unwrap());
     bar.set_message("Creating index...");
 
-    let process_batch = |batch_tensor: Tensor| -> Result<(Tensor, Tensor)> {
+    // Cluster density estimation for updating IVF
+    // Initialize accumulators for average residual norm per centroid
+    let mut global_sum_residuals = Tensor::zeros(&[est_total_embeddings], (Kind::Float, device));
+    let mut global_counts = Tensor::zeros(&[est_total_embeddings], (Kind::Float, device));
+
+    let mut process_batch = |batch_tensor: Tensor| -> Result<(Tensor, Tensor)> {
         // 1. Get Centroids (batch_tensor is on device)
         let codes = compress_into_codes(&batch_tensor, &final_codec.centroids, batch_size);
 
@@ -391,6 +396,23 @@ pub fn create_index(
 
         // 3. Residuals & Quantize
         let mut res = &batch_tensor - &reconstructed;
+
+        // Accumulate Average Residual Norm in order to score centroids quality on update.
+        // Compute L2 norm of residuals: ||x - c||_2
+        let res_norms = res.norm_scalaropt_dim(2, &[1], false); // [batch_size]
+
+        // Accumulate norms into global stats based on cluster assignment (codes)
+        // We use index_add_ which is in-place and efficient.
+        let codes_i64 = codes.to_kind(Kind::Int64);
+        let ones = Tensor::ones_like(&res_norms);
+
+        // Note: Using &mut inside closure works because it captures the environment.
+        global_sum_residuals.index_add_(0, &codes_i64, &res_norms.to_kind(Kind::Float));
+        global_counts.index_add_(0, &codes_i64, &ones.to_kind(Kind::Float));
+
+        drop(res_norms);
+        // End average residual norm accumulation
+
         res = Tensor::bucketize(&res, &bucket_cutoffs, true, false);
 
         // 4. Bit Packing
@@ -486,6 +508,16 @@ pub fn create_index(
         drop(chk_codes_list);
         drop(chk_residuals_list);
     }
+
+    // -------------------------------------------------------------------------
+    // 4. Finalize Average Residual Norms
+    // -------------------------------------------------------------------------
+    // Compute mean: sum / count. Avoid division by zero by clamping min count to 1.
+    let avg_residual_norms = global_sum_residuals / global_counts.clamp_min(1.0);
+    let avg_res_norm_fpath = Path::new(index_path).join("average_residual_norm.npy");
+    avg_residual_norms
+        .to_device(Device::Cpu)
+        .write_npy(&avg_res_norm_fpath)?;
 
     // A. Update Chunk Metadata with Global Offsets
     let mut current_emb_offset: usize = 0;

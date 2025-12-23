@@ -3,12 +3,14 @@ from __future__ import annotations
 import functools
 import gc
 import glob
+import json
 import math
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+import numpy as np
 import psutil
 import torch
 from fast_plaid import fast_plaid_rust
@@ -105,7 +107,7 @@ def _load_torch_path(device: str) -> str:
     Could not find torch binary.
     Please ensure PyTorch is installed.
     """
-    raise TorchWithCudaNotFoundError(error) from IndexError
+    raise TorchWithCudaNotFoundError(error)
 
 
 @profile_resources
@@ -246,22 +248,7 @@ def search_on_device(  # noqa: PLR0913
 
 
 class FastPlaid:
-    """A class for creating and searching a FastPlaid index.
-
-    Args:
-    ----
-    index:
-        Path to the directory where the index is stored or will be stored.
-    device:
-        The device(s) to use for computation (e.g., "cuda", ["cuda:0", "cuda:1"]).
-        If None, defaults to ["cuda"].
-    low_memory:
-        If True, keeps document data on CPU RAM and streams it to the GPU
-        only when needed. This drastically reduces VRAM usage (often <1GB)
-        at the cost of some performance due to PCI-E bandwidth limits.
-        Default is False.
-
-    """
+    """A class for creating and searching a FastPlaid index."""
 
     @profile_resources
     def __init__(
@@ -292,8 +279,6 @@ class FastPlaid:
         fast_plaid_rust.initialize_torch(torch_path=self.torch_path)
 
         # Load an index object for each device.
-        # We duplicate the index object because it cannot be pickled or shared across
-        # process boundaries easily, but it can be loaded multiple times.
         self.indices: dict[str, Any] = {}
         self.indices = _reload_index(
             index_path=self.index,
@@ -305,7 +290,7 @@ class FastPlaid:
     def _format_embeddings(
         self, embeddings: list[torch.Tensor] | torch.Tensor
     ) -> list[torch.Tensor] | torch.Tensor:
-        """Sandardize embedding shapes without creating deep copies."""
+        """Standardize embedding shapes without creating deep copies."""
         if isinstance(embeddings, torch.Tensor):
             return embeddings.squeeze(0) if embeddings.dim() == 3 else embeddings
 
@@ -382,7 +367,6 @@ class FastPlaid:
             torch.cuda.empty_cache()
 
         # Reload indices on all devices now that creation is complete
-        # Optimization: clear old indices first to prevent peaks during reload
         self.indices.clear()
         self.indices = _reload_index(
             index_path=self.index,
@@ -400,8 +384,19 @@ class FastPlaid:
         documents_embeddings: list[torch.Tensor] | torch.Tensor,
         metadata: list[dict[str, Any]] | None = None,
         batch_size: int = 50_000,
+        cluster_threshold: float = 0.1,
     ) -> "FastPlaid":
-        """Update an existing FastPlaid index with new documents."""
+        """Update an existing FastPlaid index with new documents.
+
+        Args:
+            documents_embeddings: New embeddings to add.
+            metadata: Optional metadata for the new documents.
+            batch_size: Batch size for processing.
+            cluster_threshold: L2 Distance threshold to trigger creation of new centroids.
+                               Embeddings further than this from any existing centroid
+                               will be clustered to form new centroids.
+
+        """
         documents_embeddings = self._format_embeddings(documents_embeddings)
         num_docs = len(documents_embeddings)
 
@@ -429,6 +424,27 @@ class FastPlaid:
         if self.indices[self.devices[0]] is None:
             raise RuntimeError("Index not loaded for update.")
 
+        # 1. Expand Centroids
+        # Perform outlier detection and centroid expansion BEFORE adding documents.
+        _update_centroids(
+            index_path=self.index,
+            new_embeddings=documents_embeddings,
+            cluster_threshold=cluster_threshold,
+            device=self.devices[0],
+        )
+
+        # 2. Reload Index to pick up new centroids
+        # The Python objects need to be refreshed so the Rust backend sees the updated
+        # centroid files (centroids.npy, ivf_lengths.npy, etc.)
+        self.indices.clear()
+        self.indices = _reload_index(
+            index_path=self.index,
+            devices=self.devices,
+            indices=self.indices,
+            low_memory=self.low_memory,
+        )
+
+        # 3. Append new documents (Rust logic)
         fast_plaid_rust.update(
             index_path=self.index,
             index=self.indices[self.devices[0]],
@@ -438,7 +454,7 @@ class FastPlaid:
             batch_size=batch_size,
         )
 
-        # Reload indices on all devices to reflect the updates
+        # 4. Final Reload for Searching
         self.indices.clear()
         self.indices = _reload_index(
             index_path=self.index,
@@ -472,7 +488,7 @@ class FastPlaid:
 
     @torch.inference_mode()
     @profile_resources
-    def search(  # noqa: PLR0912, PLR0913, PLR0915, C901
+    def search(  # noqa: PLR0912, PLR0913, C901
         self,
         queries_embeddings: torch.Tensor | list[torch.Tensor],
         top_k: int = 10,
@@ -483,31 +499,7 @@ class FastPlaid:
         subset: list[list[int]] | list[int] | None = None,
         n_processes: int | None = None,
     ) -> list[list[tuple[int, float]]]:
-        """Search the index for the given query embeddings.
-
-        Args:
-        ----
-        queries_embeddings:
-            A tensor of shape (num_queries, n_tokens, embedding_dim) or a list of
-            tensors.
-        top_k:
-            The number of top results to return for each query.
-        batch_size:
-            The number of queries to process in each batch.
-        n_full_scores:
-            The number of full scores to compute per query.
-        n_ivf_probe:
-            The number of IVF clusters to probe during search.
-        show_progress:
-            Whether to display a progress bar during search.
-        subset:
-            A list of lists specifying subsets of the index to search for each
-            query, or a single list applied to all queries. If None, searches
-            the entire index.
-        n_processes: Number of jobs to use for CPU search via joblib.
-                        Ignored if running on GPU(s). Defaults to 1.
-
-        """
+        """Search the index for the given query embeddings."""
         if any(idx is None for idx in self.indices.values()):
             self.indices = _reload_index(
                 index_path=self.index,
@@ -551,10 +543,7 @@ class FastPlaid:
                 subset = [subset] * num_queries  # type: ignore
 
             if subset is not None and len(subset) != num_queries:
-                error = """
-                The length of the subset must match the number of queries.
-                """
-                raise ValueError(error)
+                raise ValueError("Subset length must match number of queries.")
 
         is_cpu_only = self.devices[0] == "cpu"
         use_joblib = (is_cpu_only and (num_queries > 10) and n_processes != 1) or (
@@ -570,9 +559,7 @@ class FastPlaid:
         if use_joblib:
             num_workers = n_processes
             chunk_size = math.ceil(num_queries / num_workers)
-
             query_chunks = list(torch.split(queries_embeddings, chunk_size))
-
             subset_chunks = []
             if subset is not None:
                 for i in range(0, num_queries, chunk_size):
@@ -594,10 +581,8 @@ class FastPlaid:
                 )
                 for i, (chunk, sub_chunk) in enumerate(zip(query_chunks, subset_chunks))
             )
-
             return [item for sublist in results for item in sublist]
 
-        # Single device shortcut (GPU or CPU n=1)
         if len(self.devices) == 1:
             return search_on_device(
                 device=self.devices[0],
@@ -616,7 +601,6 @@ class FastPlaid:
         chunk_size = math.ceil(num_queries / num_devices)
         futures = []
         query_chunks = list(torch.split(queries_embeddings, chunk_size))
-
         subset_chunks = []
         if subset is not None:
             for i in range(0, num_queries, chunk_size):
@@ -628,7 +612,6 @@ class FastPlaid:
             for i, device in enumerate(self.devices):
                 if i >= len(query_chunks):
                     break
-
                 futures.append(
                     executor.submit(
                         search_on_device,
@@ -674,5 +657,151 @@ class FastPlaid:
             indices=self.indices,
             low_memory=self.low_memory,
         )
-
         return self
+
+
+def _update_centroids(
+    index_path: str,
+    new_embeddings: list[torch.Tensor] | torch.Tensor,
+    cluster_threshold: float,
+    device: str = "cpu",
+) -> None:
+    """Subsample new embeddings that are too far from existing centroids,
+    run K-Means on them, and append new centroids to the index.
+    """
+    # TODO: ADD A BUFFER SIZE.
+    # TODO: Find a better number of centroids to create by default.
+    # ALSO choose distance based on the index statistics.
+    # Understand why fastkmeans fail on gpu when called repeatedly.
+    # Delete average residual norm or replace by average distance to centroid, as a smart threshold.
+    # When the index is big enough remove the buffer.
+    # Re-craate the index until buffer is full.
+    print("--- Step 1: Checking for new centroids in update data ---")
+
+    # 1. Load Existing Centroids
+    centroids_path = os.path.join(index_path, "centroids.npy")
+    if not os.path.exists(centroids_path):
+        return
+
+    existing_centroids_np = np.load(centroids_path)
+    existing_centroids = torch.from_numpy(existing_centroids_np).to(device)
+
+    # 2. Prepare New Embeddings
+    # Flatten if list of tensors
+    if isinstance(new_embeddings, list):
+        flat_embeddings = torch.cat(new_embeddings).to(device)
+    else:
+        flat_embeddings = new_embeddings.to(device)
+
+    if flat_embeddings.ndim == 3:
+        flat_embeddings = flat_embeddings.squeeze(0)
+
+    # Ensure Dtype Compatibility
+    if existing_centroids.dtype != flat_embeddings.dtype:
+        existing_centroids = existing_centroids.to(dtype=flat_embeddings.dtype)
+
+    # 3. Compute Distances (L2) to find closest existing centroid for each new point
+    # Optimization: Process in chunks if embeddings are very large to avoid OOM
+    batch_size = 4096
+    num_embeddings = flat_embeddings.shape[0]
+    outlier_mask = torch.zeros(num_embeddings, dtype=torch.bool, device=device)
+
+    # Square of threshold for comparison (avoids sqrt)
+    threshold_sq = cluster_threshold**2
+
+    for i in range(0, num_embeddings, batch_size):
+        batch = flat_embeddings[i : i + batch_size]
+
+        # L2 Distance squared: ||x-y||^2 = ||x||^2 + ||y||^2 - 2<x,y>
+        x2 = torch.sum(batch**2, dim=1, keepdim=True)
+        y2 = torch.sum(existing_centroids**2, dim=1)
+
+        dists_sq = x2 + y2 - 2 * torch.matmul(batch, existing_centroids.T)
+
+        # Get min distance for each point
+        min_dists_sq, _ = torch.min(dists_sq, dim=1)
+
+        # Mark as outlier if closest centroid is too far
+        outlier_mask[i : i + batch_size] = min_dists_sq > threshold_sq
+
+    # 4. Filter "Subsample" Outliers
+    outliers = flat_embeddings[outlier_mask]
+    num_outliers = outliers.shape[0]
+
+    print(
+        f"Found {num_outliers} embeddings exceeding distance threshold {cluster_threshold}."
+    )
+
+    # 5. Apply K-Means on Outliers (if enough exist)
+    # min_points_for_cluster = 256  # Heuristic minimum to justify new clusters
+    # if num_outliers < min_points_for_cluster:
+    #    print("Not enough outliers to form new clusters. Skipping centroid expansion.")
+    #    return
+
+    # Determine K for new data
+    k_new = int(2 ** math.floor(math.log2(16 * math.sqrt(num_outliers))))
+
+    print(f"Clustering outliers into {k_new} new centroids.")
+
+    # Force CPU for clustering stability on small datasets
+    kmeans = FastKMeans(
+        d=outliers.shape[1],
+        k=min(k_new, num_outliers),
+        niter=4,
+        gpu=False,
+        verbose=False,
+        seed=42,
+        max_points_per_centroid=256,
+    )
+
+    kmeans.train(outliers.detach().cpu().to(dtype=torch.float16))
+
+    new_centroids_np = kmeans.centroids
+
+    # Normalize new centroids (important for consistency with index assumptions)
+    new_centroids_t = torch.from_numpy(new_centroids_np)
+    new_centroids_t = torch.nn.functional.normalize(new_centroids_t, dim=-1)
+    new_centroids_np = new_centroids_t.numpy()
+
+    # 6. Update Set of Existing Centroids & Metadata
+    final_centroids = np.concatenate([existing_centroids_np, new_centroids_np], axis=0)
+
+    # Save Centroids
+    np.save(centroids_path, final_centroids)
+
+    # Update IVF Lengths (append 0s for new centroids)
+    ivf_path = os.path.join(index_path, "ivf_lengths.npy")
+    if os.path.exists(ivf_path):
+        ivf_lengths = np.load(ivf_path)
+        new_lengths = np.zeros(k_new, dtype=ivf_lengths.dtype)
+        final_ivf = np.concatenate([ivf_lengths, new_lengths])
+        np.save(ivf_path, final_ivf)
+
+    # Update Average Residual Norms
+    # We pad with the mean of existing norms as a safe default
+    avg_res_path = os.path.join(index_path, "average_residual_norm.npy")
+    if os.path.exists(avg_res_path):
+        avg_res = np.load(avg_res_path)
+        mean_res = np.mean(avg_res) if avg_res.size > 0 else 1.0
+        new_res = np.full(k_new, mean_res, dtype=avg_res.dtype)
+        final_avg_res = np.concatenate([avg_res, new_res])
+        np.save(avg_res_path, final_avg_res)
+
+    # Update Metadata JSON
+    meta_path = os.path.join(index_path, "metadata.json")
+    if os.path.exists(meta_path):
+        with open(meta_path) as f:
+            meta = json.load(f)
+
+        meta["num_partitions"] = int(final_centroids.shape[0])
+
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=4)
+
+    print(f"Added {k_new} new centroids. Total centroids: {final_centroids.shape[0]}")
+
+    # Explicit cleanup
+    del outliers, existing_centroids, flat_embeddings
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()

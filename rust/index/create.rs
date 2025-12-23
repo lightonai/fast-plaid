@@ -593,6 +593,7 @@ pub fn create_index(
         "num_partitions": est_total_embeddings,
         "num_embeddings": total_num_embeddings,
         "avg_doclen": final_avg_doclen,
+        "num_passages": n_passages,
     });
 
     serde_json::to_writer_pretty(

@@ -260,7 +260,7 @@ pub fn update_index(
             serde_json::to_writer_pretty(BufWriter::new(meta_f_w_updated), &json_val)?;
         }
     }
-    let total_num_embs = current_emb_offset;
+    let _iterated_total_embs = current_emb_offset;
 
     // -------------------------------------------------------------------------
     // 6. Generate New Partial IVF
@@ -387,12 +387,15 @@ pub fn update_index(
     // -------------------------------------------------------------------------
     // 9. Update Global Metadata
     // -------------------------------------------------------------------------
+    let new_tokens_count: i64 = new_doclens_accumulated.iter().sum();
+    let total_num_embs = old_total_embs + new_tokens_count as usize;
+    let total_num_passages = old_num_passages as usize + n_new_docs;
+
     // Calculate new average document length.
-    let final_avg_doclen = if !new_doclens_accumulated.is_empty() || old_num_passages > 0 {
+    let final_avg_doclen = if total_num_passages > 0 {
         let old_avg = main_meta["avg_doclen"].as_f64().unwrap_or(0.0);
         let old_sum = old_avg * (old_num_passages as f64);
-        let new_sum: i64 = new_doclens_accumulated.iter().sum();
-        (old_sum + new_sum as f64) / ((old_num_passages as usize + n_new_docs) as f64)
+        (old_sum + new_tokens_count as f64) / (total_num_passages as f64)
     } else {
         0.0
     };
@@ -402,8 +405,9 @@ pub fn update_index(
         "nbits": nbits,
         "num_partitions": est_total_embs,
         "num_embeddings": total_num_embs,
-        "num_passages": old_num_passages as usize + n_new_docs,
+        "num_passages": total_num_passages,
         "avg_doclen": final_avg_doclen,
+        "num_documents": main_meta["num_documents"].as_u64().unwrap_or(0) as usize + n_new_docs,
     });
 
     let final_meta_file = fs::File::create(&main_meta_path)?;

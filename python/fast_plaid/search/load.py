@@ -429,3 +429,11 @@ def _reload_index(
     # Explicitly clean up CPU reference (optional, but good for clarity)
     del cpu_tensors
     return indices
+
+
+def save_list_tensors_on_disk(path: str, tensors: list[torch.Tensor]) -> None:
+    """Save a list of tensors to a .npy file on disk."""
+    data_array = np.empty(len(tensors), dtype=object)
+    for i, t in enumerate(tensors):
+        data_array[i] = t.cpu().numpy()
+    np.save(path, data_array, allow_pickle=True)

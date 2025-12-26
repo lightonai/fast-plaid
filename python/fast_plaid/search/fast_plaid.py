@@ -18,7 +18,7 @@ from fastkmeans import FastKMeans
 from joblib import Parallel, delayed
 
 from ..filtering import create, delete, update
-from .load import _reload_index
+from .load import _reload_index, save_list_tensors_on_disk
 
 
 def profile_resources(func):
@@ -120,8 +120,15 @@ def compute_kmeans(  # noqa: PLR0913
     seed: int,
     n_samples_kmeans: int | None = None,
     use_triton_kmeans: bool | None = None,
+    num_partitions: int | None = None,
 ) -> torch.Tensor:
-    """Compute K-means centroids for document embeddings."""
+    """Compute K-means centroids for document embeddings.
+
+    Args:
+        num_partitions: If provided, explicitly sets the number of centroids (K).
+                        If None, K is calculated using a heuristic based on dataset size.
+
+    """
     num_passages = len(documents_embeddings)
 
     if n_samples_kmeans is None:
@@ -161,21 +168,26 @@ def compute_kmeans(  # noqa: PLR0913
 
     total_tokens = samples_tensor.shape[0]
 
-    # Calculate num_partitions based on the density of the sample relative to the whole
-    avg_tokens_per_doc = total_tokens / n_samples_kmeans
-    estimated_total_tokens = avg_tokens_per_doc * num_passages
-    num_partitions = int(
-        2 ** math.floor(math.log2(16 * math.sqrt(estimated_total_tokens)))
-    )
+    # Calculate num_partitions only if not provided by the caller
+    if num_partitions is None:
+        # Calculate num_partitions based on the density of the sample relative to the whole
+        avg_tokens_per_doc = total_tokens / n_samples_kmeans
+        estimated_total_tokens = avg_tokens_per_doc * num_passages
+        num_partitions = int(
+            2 ** math.floor(math.log2(16 * math.sqrt(estimated_total_tokens)))
+        )
 
     if samples_tensor.is_cuda:
         samples_tensor = samples_tensor.to(device="cpu", dtype=torch.float16)
 
+    # The actual K that will be used by FastKMeans
+    actual_k = min(num_partitions, total_tokens)
+
     kmeans = FastKMeans(
         d=dim,
-        k=min(num_partitions, total_tokens),
+        k=actual_k,
         niter=kmeans_niters,
-        gpu=device != "cpu",
+        gpu=device.startswith("cuda"),
         verbose=False,
         seed=seed,
         max_points_per_centroid=max_points_per_centroid,
@@ -309,11 +321,11 @@ class FastPlaid:
         seed: int = 42,
         use_triton_kmeans: bool | None = None,
         metadata: list[dict[str, Any]] | None = None,
+        start_from_scratch: int = 1000,
     ) -> "FastPlaid":
         """Create and saves the FastPlaid index."""
         documents_embeddings = self._format_embeddings(documents_embeddings)
         num_docs = len(documents_embeddings)
-
         self._prepare_index_directory(index_path=self.index)
 
         if metadata is not None:
@@ -324,6 +336,15 @@ class FastPlaid:
                 """
                 raise ValueError(error)
             create(index=self.index, metadata=metadata)
+
+        if len(documents_embeddings) <= start_from_scratch:
+            save_list_tensors_on_disk(
+                path=os.path.join(
+                    self.index,
+                    "embeddings.npy",
+                ),
+                tensors=documents_embeddings,
+            )
 
         # Determine dimensionality from the first available element
         dim = (
@@ -385,6 +406,12 @@ class FastPlaid:
         metadata: list[dict[str, Any]] | None = None,
         batch_size: int = 50_000,
         cluster_threshold: float = 0.1,
+        kmeans_niters: int = 4,
+        max_points_per_centroid: int = 256,
+        n_samples_kmeans: int | None = None,
+        seed: int = 42,
+        start_from_scratch: int = 1000,
+        use_triton_kmeans: bool | None = False,
     ) -> "FastPlaid":
         """Update an existing FastPlaid index with new documents.
 
@@ -395,19 +422,66 @@ class FastPlaid:
             cluster_threshold: L2 Distance threshold to trigger creation of new centroids.
                                Embeddings further than this from any existing centroid
                                will be clustered to form new centroids.
+            kmeans_niters: Number of iterations for K-Means (if new centroids are created).
+            max_points_per_centroid: Constraint for centroid creation.
+            n_samples_kmeans: Number of samples to use for K-Means (if None, auto-calculated).
+            seed: Random seed for K-Means.
 
         """
-        documents_embeddings = self._format_embeddings(documents_embeddings)
-        num_docs = len(documents_embeddings)
-
+        # Brand new index creation
         if not os.path.exists(self.index) or not os.path.exists(
             os.path.join(self.index, "metadata.json")
         ):
-            error = f"""
-            Index directory '{self.index}' does not exist or is invalid.
-            Please create an index first using the .create() method.
-            """
-            raise FileNotFoundError(error)
+            return self.create(
+                documents_embeddings=documents_embeddings,
+                kmeans_niters=kmeans_niters,
+                max_points_per_centroid=max_points_per_centroid,
+                n_samples_kmeans=n_samples_kmeans,
+                batch_size=batch_size,
+                seed=seed,
+                use_triton_kmeans=use_triton_kmeans,
+                metadata=metadata,
+                start_from_scratch=start_from_scratch,
+            )
+
+        documents_embeddings = self._format_embeddings(documents_embeddings)
+
+        with open(os.path.join(self.index, "metadata.json")) as f:
+            meta = json.load(f)
+            # If num_documents is missing, default to start_from_scratch + 1
+            # Assert backward compatibility
+            num_documents_in_index = meta.get("num_documents", start_from_scratch + 1)
+
+        num_docs = len(documents_embeddings)
+
+        if num_documents_in_index <= start_from_scratch:
+            # Re-create index from scratch if there are too few documents used
+            # to compute centroids.
+            if os.path.exists(os.path.join(self.index, "embeddings.npy")):
+                existing_embeddings = np.load(
+                    os.path.join(self.index, "embeddings.npy"),
+                    allow_pickle=True,
+                )
+
+                existing_embeddings = [
+                    torch.from_numpy(tensor) for tensor in existing_embeddings
+                ]
+
+                documents_embeddings = existing_embeddings + documents_embeddings
+
+            _ = self.create(
+                documents_embeddings=documents_embeddings,
+                kmeans_niters=kmeans_niters,
+                max_points_per_centroid=max_points_per_centroid,
+                n_samples_kmeans=n_samples_kmeans,
+                batch_size=batch_size,
+                seed=seed,
+                use_triton_kmeans=use_triton_kmeans,
+                metadata=metadata,
+                start_from_scratch=start_from_scratch,
+            )
+
+            return self
 
         if os.path.exists(os.path.join(self.index, "metadata.db")):
             if metadata is None:
@@ -431,6 +505,11 @@ class FastPlaid:
             new_embeddings=documents_embeddings,
             cluster_threshold=cluster_threshold,
             device=self.devices[0],
+            kmeans_niters=kmeans_niters,
+            max_points_per_centroid=max_points_per_centroid,
+            n_samples_kmeans=n_samples_kmeans,
+            seed=seed,
+            use_triton_kmeans=use_triton_kmeans,
         )
 
         # 2. Reload Index to pick up new centroids
@@ -664,20 +743,16 @@ def _update_centroids(
     index_path: str,
     new_embeddings: list[torch.Tensor] | torch.Tensor,
     cluster_threshold: float,
-    device: str = "cpu",
+    device: str,
+    kmeans_niters: int,
+    max_points_per_centroid: int,
+    seed: int,
+    n_samples_kmeans: int | None = None,
+    use_triton_kmeans: bool | None = None,
 ) -> None:
     """Subsample new embeddings that are too far from existing centroids,
     run K-Means on them, and append new centroids to the index.
     """
-    # TODO: ADD A BUFFER SIZE.
-    # TODO: Find a better number of centroids to create by default.
-    # ALSO choose distance based on the index statistics.
-    # Understand why fastkmeans fail on gpu when called repeatedly.
-    # Delete average residual norm or replace by average distance to centroid, as a smart threshold.
-    # When the index is big enough remove the buffer.
-    # Re-craate the index until buffer is full.
-    print("--- Step 1: Checking for new centroids in update data ---")
-
     # 1. Load Existing Centroids
     centroids_path = os.path.join(index_path, "centroids.npy")
     if not os.path.exists(centroids_path):
@@ -728,40 +803,31 @@ def _update_centroids(
     outliers = flat_embeddings[outlier_mask]
     num_outliers = outliers.shape[0]
 
-    print(
-        f"Found {num_outliers} embeddings exceeding distance threshold {cluster_threshold}."
+    # If no outliers found, nothing to do
+    if num_outliers == 0:
+        return
+
+    # 5. Compute New Centroids using existing helper
+    # We pass the outliers directly; compute_kmeans handles K calculation,
+    # normalization, and memory optimization.
+    target_k = math.ceil(num_outliers / max_points_per_centroid)
+    k_update = max(1, target_k * 4)
+
+    new_centroids_t = compute_kmeans(
+        documents_embeddings=outliers,
+        dim=outliers.shape[1],
+        device=device,
+        kmeans_niters=kmeans_niters,
+        max_points_per_centroid=max_points_per_centroid,
+        seed=seed,
+        n_samples_kmeans=n_samples_kmeans,
+        use_triton_kmeans=use_triton_kmeans,
+        num_partitions=k_update,
     )
 
-    # 5. Apply K-Means on Outliers (if enough exist)
-    # min_points_for_cluster = 256  # Heuristic minimum to justify new clusters
-    # if num_outliers < min_points_for_cluster:
-    #    print("Not enough outliers to form new clusters. Skipping centroid expansion.")
-    #    return
-
-    # Determine K for new data
-    k_new = int(2 ** math.floor(math.log2(16 * math.sqrt(num_outliers))))
-
-    print(f"Clustering outliers into {k_new} new centroids.")
-
-    # Force CPU for clustering stability on small datasets
-    kmeans = FastKMeans(
-        d=outliers.shape[1],
-        k=min(k_new, num_outliers),
-        niter=4,
-        gpu=False,
-        verbose=False,
-        seed=42,
-        max_points_per_centroid=256,
-    )
-
-    kmeans.train(outliers.detach().cpu().to(dtype=torch.float16))
-
-    new_centroids_np = kmeans.centroids
-
-    # Normalize new centroids (important for consistency with index assumptions)
-    new_centroids_t = torch.from_numpy(new_centroids_np)
-    new_centroids_t = torch.nn.functional.normalize(new_centroids_t, dim=-1)
-    new_centroids_np = new_centroids_t.numpy()
+    # Convert back to numpy for concatenation and storage
+    new_centroids_np = new_centroids_t.detach().cpu().numpy().astype(np.float32)
+    k_new = new_centroids_np.shape[0]
 
     # 6. Update Set of Existing Centroids & Metadata
     final_centroids = np.concatenate([existing_centroids_np, new_centroids_np], axis=0)
@@ -801,7 +867,7 @@ def _update_centroids(
     print(f"Added {k_new} new centroids. Total centroids: {final_centroids.shape[0]}")
 
     # Explicit cleanup
-    del outliers, existing_centroids, flat_embeddings
+    del outliers, existing_centroids, flat_embeddings, new_centroids_t
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()

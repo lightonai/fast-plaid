@@ -176,7 +176,7 @@ The **`.update()` method** efficiently adds new documents to an existing index w
 
 3. **Efficient Small Updates**: For small batches of documents (below `buffer_size`), the update is performed immediately without centroid expansion, ensuring fast incremental updates.
 
-This approach balances efficiency with accuracy: small updates are fast, while larger batches automatically adapt the index structure to accommodate new data distributions. To update an existing embedding, you should delete it first and then add the new version with the `.update()` method.
+This approach balances efficiency with accuracy: small updates are fast, while larger batches automatically adapt the index structure to accommodate new data distributions.
 
 &nbsp;
 
@@ -431,7 +431,7 @@ metadata: list[dict[str, Any]] | None = None (optional)
 
 ### Updating the Index
 
-The **`update` method** provides an efficient way to add new documents to an existing index while automatically maintaining centroid quality. It uses a buffered expansion mechanism: documents are accumulated until reaching `buffer_size`, at which point embeddings far from existing centroids are identified and used to create new centroids that are appended to the index structure. This ensures the index adapts to new data distributions over time. To update an existing embedding, you should delete it first and then add the new version with the `.update()` method. Warning, when using the `delete` method, the remaining documents are re-indexed to maintain a sequential order. If you delete document k, all documents with id > k will have their id decreased by 1.
+The **`update` method** provides an efficient way to add new documents to an existing index while automatically maintaining centroid quality. It uses a buffered expansion mechanism: documents are accumulated until reaching `buffer_size`, at which point embeddings far from existing centroids are identified and used to create new centroids that are appended to the index structure. This ensures the index adapts to new data distributions over time.
 
 ```python
     def update(

@@ -9,7 +9,7 @@ build-backend = "maturin"
 
 [project]
 name = "fast_plaid"
-version = "1.4.0.280"
+version = "1.4.1.280"
 description = "Fast Plaid."
 authors = [
   { name = "Raphael Sourty, LightOn", email = "raphael.sourty@lighton.ai" },

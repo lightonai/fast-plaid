@@ -1,3 +1,4 @@
+import gc
 import io
 import json
 import os
@@ -11,14 +12,27 @@ from fast_plaid import fast_plaid_rust
 
 
 def _load_small_tensor(index_path: str, name: str, dtype, device: str) -> torch.Tensor:
-    """Load a small tensor from a .npy file."""
+    """Load a tensor from a .npy file.
+
+    Args:
+    ----
+    index_path:
+        The path to the index directory.
+    name:
+        The filename of the tensor to load.
+    dtype:
+        The dtype to convert the tensor to.
+    device:
+        The device to load the tensor to.
+
+    """
     path = os.path.join(index_path, name)
     if not os.path.exists(path):
         raise FileNotFoundError(f"Missing index file: {path}")
     return torch.from_numpy(np.load(path)).to(device=device, dtype=dtype)
 
 
-def _get_merged_mmap(  # noqa: C901,PLR0913,PLR0912,PLR0915
+def _get_merged_mmap(  # noqa: PLR0912
     name_suffix: str,
     dtype: torch.dtype,
     numpy_dtype: np.dtype,
@@ -27,23 +41,34 @@ def _get_merged_mmap(  # noqa: C901,PLR0913,PLR0912,PLR0915
     index_path: str,
     num_chunks: int,
 ) -> torch.Tensor:
-    """Merge multiple chunked .npy files into a single monolithic memory-mapped file.
+    """Merge chunked .npy files into a single memory-mapped file.
 
-    Incremental Persistence: Uses a sidecar manifest (.json) to track chunk
-        modification times.
-    Zero-Copy Skippage: If a chunk hasn't changed and its offset hasn't shifted,
-        we skip I/O entirely.
-    In-Place Resizing: Manually manipulates the NPY header to grow the file
-        without a full rewrite.
+    Uses incremental persistence with a manifest to track chunk modification times.
+    Skips unchanged chunks and resizes files in-place when possible.
+
+    Args:
+    ----
+    name_suffix:
+        The suffix for the chunk files (e.g., "codes" or "residuals").
+    dtype:
+        The torch dtype for the output tensor.
+    numpy_dtype:
+        The numpy dtype for the memory-mapped file.
+    padding_needed:
+        Number of padding rows to add at the end.
+    device:
+        The device to load the final tensor to.
+    index_path:
+        The path to the index directory.
+    num_chunks:
+        The number of chunks to merge.
+
     """
     merged_filename = f"merged_{name_suffix}.npy"
     merged_path = os.path.join(index_path, merged_filename)
     manifest_path = os.path.join(index_path, f"merged_{name_suffix}.manifest.json")
 
-    # -------------------------------------------------------------------------
-    # Phase 1: State Restoration
-    # -------------------------------------------------------------------------
-    # We attempt to load the previous manifest to determine which chunks are dirty.
+    # Load previous manifest for change detection
     manifest = {}
     if os.path.exists(merged_path) and os.path.exists(manifest_path):
         try:
@@ -52,17 +77,10 @@ def _get_merged_mmap(  # noqa: C901,PLR0913,PLR0912,PLR0915
         except (json.JSONDecodeError, OSError):
             manifest = {}
 
-    # -------------------------------------------------------------------------
-    # Phase 2: Change Detection & Work Plan
-    # -------------------------------------------------------------------------
+    # Scan chunks and detect changes
     total_rows_scan = 0
     cols = 0
-    valid_chunks = []  # Payload: (path, size, mtime, needs_write)
-
-    # CRITICAL: Contiguity Check.
-    # If chunk N changes size, all subsequent chunks (N+1, N+2...) shift positions
-    # in the monolithic array. Therefore, once the 'chain' is broken, we must
-    # rewrite everything following it, regardless of mtime.
+    valid_chunks = []
     chain_broken = False
 
     for i in range(num_chunks):
@@ -71,13 +89,12 @@ def _get_merged_mmap(  # noqa: C901,PLR0913,PLR0912,PLR0915
 
         if os.path.exists(path):
             try:
-                # Lightweight stat check before opening file
                 stat = os.stat(path)  # noqa: PTH116
                 current_mtime = stat.st_mtime
-
-                # Peek at header for shape using mmap_mode="c" (copy-on-write)
-                # to avoid reading data into RAM.
-                shape = np.load(path, mmap_mode="c").shape
+                # Use mmap_mode="c" but ensure the reference is released
+                mmap_arr = np.load(path, mmap_mode="c")
+                shape = mmap_arr.shape
+                del mmap_arr
 
                 if len(shape) > 0 and shape[0] > 0:
                     rows = shape[0]
@@ -85,10 +102,7 @@ def _get_merged_mmap(  # noqa: C901,PLR0913,PLR0912,PLR0915
                     if len(shape) > 1:
                         cols = shape[1]
 
-                    # Verify against previous state
                     prev_entry = manifest.get(filename)
-
-                    needs_write = True
                     is_clean = (
                         prev_entry
                         and prev_entry["mtime"] == current_mtime
@@ -96,10 +110,8 @@ def _get_merged_mmap(  # noqa: C901,PLR0913,PLR0912,PLR0915
                     )
 
                     if not chain_broken and is_clean:
-                        # Happy path: File is untouched and offset is stable.
                         needs_write = False
                     else:
-                        # Dirty path: Either content changed or offset shifted.
                         chain_broken = True
                         needs_write = True
 
@@ -113,8 +125,9 @@ def _get_merged_mmap(  # noqa: C901,PLR0913,PLR0912,PLR0915
                         }
                     )
             except ValueError:
-                # Handle corrupted partial chunks gracefully
                 pass
+    # Ensure all mmap handles from scanning are released before proceeding
+    gc.collect()
 
     if total_rows_scan == 0:
         return torch.empty(0, device=device, dtype=dtype)
@@ -122,19 +135,13 @@ def _get_merged_mmap(  # noqa: C901,PLR0913,PLR0912,PLR0915
     final_rows = total_rows_scan + padding_needed
     final_shape = (final_rows, cols) if cols > 0 else (final_rows,)
 
-    # -------------------------------------------------------------------------
-    # Phase 3: Disk Allocation (Smart Resize)
-    # -------------------------------------------------------------------------
-    file_mode = "w+"  # Default: Destructive overwrite
-
-    # Attempt to resize in-place using low-level header manipulation.
-    # This prevents rewriting terabytes of data just because we appended 1KB.
+    # Attempt in-place resize to avoid full rewrite
+    file_mode = "w+"
     if os.path.exists(merged_path):
         try:
             with open(merged_path, "rb+") as f:
                 version = np_fmt.read_magic(f)
 
-                # Parse existing header to check compatibility
                 if version == (1, 0):
                     shape, fortran_order, _ = np_fmt.read_array_header_1_0(f)
                 elif version == (2, 0):
@@ -147,8 +154,6 @@ def _get_merged_mmap(  # noqa: C901,PLR0913,PLR0912,PLR0915
                 current_cols = shape[1] if len(shape) > 1 else 0
                 cols_match = (current_cols == cols) if cols > 0 else (len(shape) == 1)
 
-                # If columns match, we can simply update the
-                # header shape and truncate/extend
                 if cols_match:
                     buffer = io.BytesIO()
                     header_opts = {
@@ -164,79 +169,65 @@ def _get_merged_mmap(  # noqa: C901,PLR0913,PLR0912,PLR0915
 
                     new_header_bytes = buffer.getvalue()
 
-                    # Safety: Ensure new header fits in the old padding space
                     if len(new_header_bytes) == header_len:
                         f.seek(0)
                         f.write(new_header_bytes)
 
-                        # Calculate exact byte size including data payload
                         row_size = np.dtype(numpy_dtype).itemsize * (
                             cols if cols > 0 else 1
                         )
                         total_bytes = header_len + (final_rows * row_size)
-
-                        # OS level resize
                         f.truncate(total_bytes)
-                        file_mode = "r+"  # Switch to update mode
+                        file_mode = "r+"
         except (ValueError, OSError, EOFError):
-            # Fallback to full rewrite if corruption or version mismatch occurs
             pass
 
-    # -------------------------------------------------------------------------
-    # Phase 4: Stream Execution
-    # -------------------------------------------------------------------------
-    # Open the target file as a memory-mapped array.
-    # This allows us to assign slice ranges (arr[a:b] = ...) which the OS
-    # translates to direct disk writes, bypassing Python memory overhead.
+    # Write chunks to memory-mapped output
     output_mmap = np.lib.format.open_memmap(
         merged_path, mode=file_mode, dtype=numpy_dtype, shape=final_shape
     )
 
     current_idx = 0
     new_manifest = {}
-
-    # If we are in 'w+' mode, previous data is gone; we must write everything.
     force_write_all = file_mode == "w+"
 
     for chunk in valid_chunks:
         n_elems = chunk["rows"]
 
         if force_write_all or chunk["write"]:
-            # I/O Bound: Load chunk into RAM, dump to mmap
             chunk_data = np.load(chunk["path"])
             output_mmap[current_idx : current_idx + n_elems] = chunk_data
-            # Explicit delete to hint GC in tight memory loops
             del chunk_data
-        else:
-            # CPU Bound: Skip.
-            # This is the performance win. We touch nothing.
-            pass
 
-        # Update tracking for next run
         new_manifest[chunk["filename"]] = {"rows": n_elems, "mtime": chunk["mtime"]}
         current_idx += n_elems
 
-    # Ensure OS flushes buffers to disk
     output_mmap.flush()
     del output_mmap
+    gc.collect()
 
-    # -------------------------------------------------------------------------
-    # Phase 5: Finalize
-    # -------------------------------------------------------------------------
+    # Save manifest and return tensor
     try:
         with open(manifest_path, "w") as f:
             json.dump(new_manifest, f)
     except OSError:
         pass
 
-    # Return a read-only view for PyTorch consumption
     arr = np.load(merged_path, mmap_mode="c")
-    t = torch.from_numpy(arr)
-    return t.to(device=device, dtype=dtype)
+    return torch.from_numpy(arr).to(device=device, dtype=dtype)
 
 
 def _load_index_tensors_cpu(index_path: str) -> dict[str, Any] | None:
-    """Load index data into CPU tensors (Memory Mapped where applicable)."""
+    """Load index data into CPU tensors.
+
+    Uses memory mapping for large tensors to avoid loading everything into RAM.
+
+    Args:
+    ----
+    index_path:
+        The path to the index directory.
+
+    """
     metadata_path = os.path.join(index_path, "metadata.json")
     if not os.path.exists(metadata_path):
         return None
@@ -245,8 +236,6 @@ def _load_index_tensors_cpu(index_path: str) -> dict[str, Any] | None:
         metadata = json.load(f)
 
     num_chunks = metadata["num_chunks"]
-
-    # Always load to CPU first to ensure single-threaded disk I/O safety
     device = "cpu"
 
     data = {
@@ -326,16 +315,30 @@ def _load_index_tensors_cpu(index_path: str) -> dict[str, Any] | None:
     return data
 
 
-def _construct_index_from_tensors(data: dict[str, Any], device: str) -> Any:
-    """Move CPU tensors to specific device and build Rust index."""
-    # Transfer tensors to the target device (GPU or CPU)
-    # non_blocking=True helps parallelize the transfer on GPUs
-    gpu_data = {
-        key: (
-            val.to(device, non_blocking=True) if isinstance(val, torch.Tensor) else val
-        )
-        for key, val in data.items()
-    }
+def _construct_index_from_tensors(
+    data: dict[str, Any], device: str, low_memory: bool
+) -> Any:
+    """Build Rust index from CPU tensors.
+
+    Args:
+    ----
+    data:
+        Dictionary of tensors loaded on CPU.
+    device:
+        The target device for the index.
+    low_memory:
+        If True, keeps large document tensors on CPU to save VRAM.
+
+    """
+    gpu_data = {}
+    for key, val in data.items():
+        if isinstance(val, torch.Tensor):
+            if low_memory and key in ["doc_codes", "doc_residuals", "doc_lengths"]:
+                gpu_data[key] = val
+            else:
+                gpu_data[key] = val.to(device, non_blocking=True)
+        else:
+            gpu_data[key] = val
 
     return fast_plaid_rust.construct_index(
         nbits=gpu_data["nbits"],
@@ -349,6 +352,7 @@ def _construct_index_from_tensors(data: dict[str, Any], device: str) -> Any:
         doc_residuals=gpu_data["doc_residuals"],
         doc_lengths=gpu_data["doc_lengths"],
         device=device,
+        low_memory=low_memory,
     )
 
 
@@ -356,16 +360,27 @@ def _reload_index(
     index_path: str,
     devices: list[str],
     indices: dict[str, Any],
+    low_memory: bool = False,
 ) -> dict[str, Any]:
-    """Load or reload the index object for every configured device."""
-    # Check existence first
+    """Load or reload the index for all configured devices.
+
+    Args:
+    ----
+    index_path:
+        The path to the index directory.
+    devices:
+        List of devices to load the index on.
+    indices:
+        Dictionary mapping devices to index objects.
+    low_memory:
+        If True, keeps large document tensors on CPU.
+
+    """
     if not os.path.exists(os.path.join(index_path, "metadata.json")):
         for device in devices:
             indices[device] = None
         return indices
 
-    # 1. Load raw data to CPU (RAM) sequentially.
-    # This handles the safely check for disk merging/metadata.
     try:
         cpu_tensors = _load_index_tensors_cpu(index_path=index_path)
     except Exception as e:
@@ -379,30 +394,42 @@ def _reload_index(
             indices[device] = None
         return indices
 
-    # Helper: Provision GPU
     def _provision_gpu(device: str) -> tuple[str, Any]:
         try:
-            # Constructs index by moving CPU tensors to target device
-            idx = _construct_index_from_tensors(data=cpu_tensors, device=device)  # noqa: F821
+            idx = _construct_index_from_tensors(
+                data=cpu_tensors,  # noqa: F821
+                device=device,
+                low_memory=low_memory,
+            )
             return device, idx  # noqa: TRY300
         except Exception as e:
             print(f"Warning: Failed to load index on {device}: {e}")
-
         return device, None
 
-    # Scenario A: Single Device (CPU or 1 GPU)
-    # Avoid ThreadPoolExecutor overhead for the simple case
     if len(devices) == 1:
         dev, idx = _provision_gpu(devices[0])
         indices[dev] = idx
-
-    # Scenario B: Multiple Devices (Multi-GPU)
-    # Use ThreadPool to saturate bandwidth by copying from RAM to all GPUs at once
     else:
         with ThreadPoolExecutor(max_workers=len(devices)) as executor:
             results = executor.map(_provision_gpu, devices)
             indices = dict(results)
 
-    # Explicitly clean up CPU reference (optional, but good for clarity)
     del cpu_tensors
     return indices
+
+
+def save_list_tensors_on_disk(path: str, tensors: list[torch.Tensor]) -> None:
+    """Save a list of tensors to a .npy file.
+
+    Args:
+    ----
+    path:
+        The file path to save to.
+    tensors:
+        List of tensors to save.
+
+    """
+    data_array = np.empty(len(tensors), dtype=object)
+    for i, t in enumerate(tensors):
+        data_array[i] = t.cpu().numpy()
+    np.save(path, data_array, allow_pickle=True)

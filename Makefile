@@ -13,4 +13,9 @@ test:
 	uv run pytest tests/test.py
 
 evaluate:
-	CUDA_VISIBLE_DEVICES=0,1,2,3 uv run python docs/benchmark/fast_benchmark.py
+	uv run python docs/benchmark/benchmark.py
+	rm -rf *.dat
+	
+evaluate-test:
+	mprof run --include-children uv run python test.py && mprof plot -o chart_test.png
+	rm -rf *.dat	

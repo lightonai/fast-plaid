@@ -1,19 +1,27 @@
 from __future__ import annotations
 
+import gc
 import glob
 import math
 import os
-import random
+import threading
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import types
 
 import torch
 from fast_plaid import fast_plaid_rust
-from fastkmeans import FastKMeans
+from filelock import FileLock
+from filelock import Timeout as FileLockTimeout
 from joblib import Parallel, delayed
 
-from ..filtering import create, delete, update
-from .load import _reload_index
+from ..filtering import create, delete
+from .kmeans import FastKMeans
+from .load import _reload_index, save_list_tensors_on_disk
+from .update import process_update
 
 
 class TorchWithCudaNotFoundError(Exception):
@@ -21,7 +29,14 @@ class TorchWithCudaNotFoundError(Exception):
 
 
 def _load_torch_path(device: str) -> str:
-    """Find the path to the shared library for PyTorch with CUDA."""
+    """Find the path to the shared library for PyTorch with CUDA.
+
+    Args:
+    ----
+    device:
+        The target device identifier (e.g., 'cuda', 'cpu').
+
+    """
     search_paths = [
         os.path.join(os.path.dirname(torch.__file__), "lib", f"libtorch_{device}.so"),
         os.path.join(os.path.dirname(torch.__file__), "**", f"libtorch_{device}.so"),
@@ -47,11 +62,11 @@ def _load_torch_path(device: str) -> str:
     Could not find torch binary.
     Please ensure PyTorch is installed.
     """
-    raise TorchWithCudaNotFoundError(error) from IndexError
+    raise TorchWithCudaNotFoundError(error)
 
 
-def compute_kmeans(  # noqa: PLR0913
-    documents_embeddings: list[torch.Tensor],
+def compute_kmeans(
+    documents_embeddings: list[torch.Tensor] | torch.Tensor,
     dim: int,
     device: str,
     kmeans_niters: int,
@@ -59,54 +74,107 @@ def compute_kmeans(  # noqa: PLR0913
     seed: int,
     n_samples_kmeans: int | None = None,
     use_triton_kmeans: bool | None = None,
+    num_partitions: int | None = None,
 ) -> torch.Tensor:
-    """Compute K-means centroids for document embeddings."""
-    num_passages = len(documents_embeddings)
+    """Compute K-means centroids for document embeddings.
+
+    Args:
+    ----
+    documents_embeddings:
+        The embeddings to cluster.
+    dim:
+        The dimensionality of the embeddings.
+    device:
+        The device to run the computation on.
+    kmeans_niters:
+        The number of iterations for the K-means algorithm.
+    max_points_per_centroid:
+        The maximum number of points to support per centroid.
+    seed:
+        The random seed for initialization.
+    n_samples_kmeans:
+        The number of samples to use for K-means training.
+    use_triton_kmeans:
+        Whether to use the Triton implementation of K-means.
+    num_partitions:
+        If provided, explicitly sets the number of centroids (K).
+        If None, K is calculated using a heuristic based on dataset size.
+
+    """
+    num_documents = len(documents_embeddings)
 
     if n_samples_kmeans is None:
         n_samples_kmeans = min(
-            1 + int(16 * math.sqrt(120 * num_passages)),
-            num_passages,
+            1 + int(16 * math.sqrt(120 * num_documents)),
+            num_documents,
         )
 
-    n_samples_kmeans = min(num_passages, n_samples_kmeans)
+    n_samples_kmeans = min(num_documents, n_samples_kmeans)
 
-    sampled_pids = random.sample(
-        population=range(n_samples_kmeans),
-        k=n_samples_kmeans,
-    )
+    # Memory optimization: Use torch.randperm for efficient sampling
+    sampled_indices = torch.randperm(num_documents)[:n_samples_kmeans]
 
-    samples: list[torch.Tensor] = [
-        documents_embeddings[pid] for pid in set(sampled_pids)
-    ]
+    if isinstance(documents_embeddings, torch.Tensor):
+        # Indexing a tensor directly is a view-operation or efficient gather
+        samples_tensor = documents_embeddings[sampled_indices]
+    else:
+        # Optimization: Pre-calculate total tokens to allocate a single buffer
+        sampled_indices_list = sampled_indices.tolist()
+        total_sample_tokens = sum(
+            documents_embeddings[i].shape[0] for i in sampled_indices_list
+        )
 
-    total_tokens = sum([sample.shape[0] for sample in samples])
-    num_partitions = (total_tokens / len(samples)) * len(documents_embeddings)
-    num_partitions = int(2 ** math.floor(math.log2(16 * math.sqrt(num_partitions))))
+        samples_tensor = torch.empty(
+            (total_sample_tokens, dim),
+            dtype=torch.float16,
+            device="cpu",
+        )
 
-    tensors = torch.cat(tensors=samples)
-    if tensors.is_cuda:
-        tensors = tensors.to(device="cpu", dtype=torch.float16)
+        current_offset = 0
+        for i in sampled_indices_list:
+            tensor_slice = documents_embeddings[i]
+            length = tensor_slice.shape[0]
+            # Direct copy into the pre-allocated buffer
+            samples_tensor[current_offset : current_offset + length].copy_(tensor_slice)
+            current_offset += length
+
+    total_tokens = samples_tensor.shape[0]
+
+    # Calculate num_partitions only if not provided by the caller
+    if num_partitions is None:
+        # Calculate num_partitions based on the density of the sample relative to
+        # the whole dataset.
+        avg_tokens_per_doc = total_tokens / n_samples_kmeans
+        estimated_total_tokens = avg_tokens_per_doc * num_documents
+        num_partitions = int(
+            2 ** math.floor(math.log2(16 * math.sqrt(estimated_total_tokens)))
+        )
+
+    if samples_tensor.is_cuda:
+        samples_tensor = samples_tensor.to(device="cpu", dtype=torch.float16)
+
+    # The actual K that will be used by FastKMeans
+    actual_k = min(num_partitions, total_tokens)
 
     kmeans = FastKMeans(
         d=dim,
-        k=min(num_partitions, total_tokens),
+        k=actual_k,
         niter=kmeans_niters,
-        gpu=device != "cpu",
+        gpu=device.startswith("cuda"),
         verbose=False,
         seed=seed,
         max_points_per_centroid=max_points_per_centroid,
         use_triton=use_triton_kmeans,
     )
 
-    kmeans.train(data=tensors.numpy())
-
-    centroids = torch.from_numpy(
-        kmeans.centroids,
-    ).to(
+    centroids = kmeans.train(data=samples_tensor).to(
         device=device,
         dtype=torch.float32,
     )
+
+    # Explicitly clear the large sample buffer before creating centroids
+    del samples_tensor
+    gc.collect()
 
     return torch.nn.functional.normalize(
         input=centroids,
@@ -114,7 +182,7 @@ def compute_kmeans(  # noqa: PLR0913
     ).half()
 
 
-def search_on_device(  # noqa: PLR0913
+def search_on_device(
     device: str,
     queries_embeddings: torch.Tensor,
     batch_size: int,
@@ -125,7 +193,30 @@ def search_on_device(  # noqa: PLR0913
     show_progress: bool,
     subset: list[list[int]] | None = None,
 ) -> list[list[tuple[int, float]]]:
-    """Perform a search on a single specified device using the passed object."""
+    """Perform a search on a single specified device using the passed object.
+
+    Args:
+    ----
+    device:
+        The device identifier to perform the search on.
+    queries_embeddings:
+        The query embeddings to search for.
+    batch_size:
+        The batch size for processing queries.
+    n_full_scores:
+        The number of full scores to compute per query.
+    top_k:
+        The number of top results to return.
+    n_ivf_probe:
+        The number of IVF clusters to probe.
+    index_object:
+        The loaded index object for the specific device.
+    show_progress:
+        Whether to show a progress bar.
+    subset:
+        Optional subset of document IDs to search within.
+
+    """
     # Guard clause to prevent the TypeError in Rust binding
     if index_object is None:
         error = f"""
@@ -144,7 +235,7 @@ def search_on_device(  # noqa: PLR0913
     scores = fast_plaid_rust.pysearch(
         index=index_object,
         device=device,
-        queries_embeddings=queries_embeddings,
+        queries_embeddings=queries_embeddings.to(dtype=torch.float16),
         search_parameters=search_parameters,
         show_progress=show_progress,
         subset=subset,
@@ -160,25 +251,29 @@ def search_on_device(  # noqa: PLR0913
 
 
 class FastPlaid:
-    """A class for creating and searching a FastPlaid index.
-
-    Args:
-    ----
-    index:
-        Path to the directory where the index is stored or will be stored.
-    device:
-        The device(s) to use for computation (e.g., "cuda", ["cuda:0", "cuda:1"]).
-        If None, defaults to ["cuda"].
-
-    """
+    """A class for creating and searching a FastPlaid index with concurrent safety."""
 
     def __init__(
         self,
         index: str,
         device: str | list[str] | None = None,
+        low_memory: bool = True,
         **kwargs: Any,  # noqa: ARG002
     ) -> None:
-        """Initialize the FastPlaid instance."""
+        """Initialize the FastPlaid instance.
+
+        Args:
+        ----
+        index:
+            Path to the directory where the index is stored.
+        device:
+            The device(s) to use for index operations (e.g., 'cuda:0', 'cpu').
+        low_memory:
+            Whether to use low memory mode when loading the index.
+        kwargs:
+            Additional keyword arguments.
+
+        """
         if device is not None and isinstance(device, str):
             self.devices = [device]
         elif isinstance(device, list):
@@ -188,26 +283,166 @@ class FastPlaid:
         else:
             self.devices = ["cpu"]
 
+        # Normalize bare "cuda" to "cuda:0" for consistency
+        self.devices = ["cuda:0" if d == "cuda" else d for d in self.devices]
+
         # Ensure devices are unique to avoid redundant loading
         self.devices = list(dict.fromkeys(self.devices))
 
         self.torch_path = _load_torch_path(device=self.devices[0])
         self.index = index
+        self.low_memory = low_memory
+
+        # Concurrency Control
+        if not os.path.exists(self.index):
+            os.makedirs(self.index, exist_ok=True)
+        self.lock_path = os.path.join(self.index, "plaid.lock")
+        self.lock = FileLock(self.lock_path)
+        self._last_known_mtime = 0.0
+
+        # In-memory lock for atomic index swaps (allows search during update)
+        self._index_swap_lock = threading.Lock()
 
         # Initialize Torch environment once
         fast_plaid_rust.initialize_torch(torch_path=self.torch_path)
 
         # Load an index object for each device.
-        # We duplicate the index object because it cannot be pickled or shared across
-        # process boundaries easily, but it can be loaded multiple times.
         self.indices: dict[str, Any] = {}
-        self.indices = _reload_index(
+
+        # Initial Load
+        self._check_and_reload_index()
+
+    def close(self) -> None:
+        """Release all resources held by the index.
+
+        This method should be called before deleting the index directory,
+        especially on Windows where memory-mapped files must be unmapped
+        before they can be deleted.
+        """
+        with self._index_swap_lock:
+            self.indices.clear()
+        gc.collect()
+
+    def __enter__(self) -> "FastPlaid":
+        """Enable context manager usage."""
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: types.TracebackType | None,
+    ) -> None:
+        """Clean up resources when exiting context."""
+        self.close()
+
+    def _format_embeddings(
+        self, embeddings: list[torch.Tensor] | torch.Tensor
+    ) -> list[torch.Tensor] | torch.Tensor:
+        """Standardize embedding shapes without creating deep copies.
+
+        Args:
+        ----
+        embeddings:
+            The input embeddings to format.
+
+        """
+        if isinstance(embeddings, torch.Tensor):
+            return embeddings.squeeze(0) if embeddings.dim() == 3 else embeddings
+
+        return [e.squeeze(0) if e.dim() == 3 else e for e in embeddings]
+
+    def _update_mtime(self) -> None:
+        """Update internal state with current disk mtime to prevent dumb reloads."""
+        meta_path = os.path.join(self.index, "metadata.json")
+        if os.path.exists(meta_path):
+            self._last_known_mtime = Path(meta_path).stat().st_mtime
+
+    def _check_and_reload_index(self, blocking: bool = True) -> bool:
+        """Check if index on disk is newer than memory and reload if necessary.
+
+        This performs an optimistic check first, and if a change is detected,
+        acquires the lock to perform a safe reload.
+
+        Args:
+        ----
+        blocking:
+            If True, waits for the file lock (default behavior for writes).
+            If False, skips reload if lock is held (used by search to avoid blocking).
+
+        Returns:
+        -------
+        True if reload was performed or not needed, False if skipped due to lock.
+
+        """
+        meta_path = os.path.join(self.index, "metadata.json")
+        if not os.path.exists(meta_path):
+            # No index to load
+            with self._index_swap_lock:
+                for device in self.devices:
+                    self.indices[device] = None
+            return True
+
+        # 1. Optimistic Check (Fast, No Lock)
+        current_mtime = Path(meta_path).stat().st_mtime
+        if current_mtime <= self._last_known_mtime and any(
+            idx is not None for idx in self.indices.values()
+        ):
+            return True
+
+        # 2. Critical Section (Lock Required for disk operations)
+        # For non-blocking mode (search), try to acquire lock without waiting
+        if not blocking:
+            try:
+                _ = self.lock.acquire(timeout=0)
+            except FileLockTimeout:
+                # Lock is held by update - search can proceed with current index
+                return False
+            try:
+                return self._reload_under_lock(current_mtime)
+            finally:
+                self.lock.release()
+        else:
+            with self.lock:
+                return self._reload_under_lock(current_mtime)
+
+    def _reload_under_lock(self, current_mtime: float) -> bool:
+        """Perform the actual reload while holding the file lock.
+
+        Args:
+        ----
+        current_mtime:
+            The mtime that triggered the reload check.
+
+        Returns:
+        -------
+        True after successful reload.
+
+        """
+        meta_path = os.path.join(self.index, "metadata.json")
+        # Re-check mtime under lock (Double-Checked Locking pattern)
+        current_mtime = Path(meta_path).stat().st_mtime
+        if current_mtime <= self._last_known_mtime and any(
+            idx is not None for idx in self.indices.values()
+        ):
+            return True
+
+        new_indices = _reload_index(
             index_path=self.index,
             devices=self.devices,
             indices=self.indices,
+            low_memory=self.low_memory,
         )
 
-    def create(  # noqa: PLR0913
+        # Atomic swap of indices dictionary
+        with self._index_swap_lock:
+            self.indices = new_indices
+            self._last_known_mtime = current_mtime
+
+        return True
+
+    @torch.inference_mode()
+    def create(
         self,
         documents_embeddings: list[torch.Tensor] | torch.Tensor,
         kmeans_niters: int = 4,
@@ -218,135 +453,198 @@ class FastPlaid:
         seed: int = 42,
         use_triton_kmeans: bool | None = None,
         metadata: list[dict[str, Any]] | None = None,
+        start_from_scratch: int = 1000,
     ) -> "FastPlaid":
-        """Create and saves the FastPlaid index."""
-        if isinstance(documents_embeddings, torch.Tensor):
-            documents_embeddings = [
-                documents_embeddings[i] for i in range(documents_embeddings.shape[0])
-            ]
+        """Create and saves the FastPlaid index.
 
-        documents_embeddings = [
-            embedding.squeeze(0) if embedding.dim() == 3 else embedding
-            for embedding in documents_embeddings
-        ]
-        num_docs = len(documents_embeddings)
+        Args:
+        ----
+        documents_embeddings:
+            The embeddings used to build the index.
+        kmeans_niters:
+            The number of iterations for K-means clustering.
+        max_points_per_centroid:
+            The maximum number of points allowed per centroid.
+        nbits:
+            The number of bits used for compression.
+        n_samples_kmeans:
+            The number of samples used for K-means training.
+        batch_size:
+            The batch size for processing embeddings.
+        seed:
+            The random seed for initialization.
+        use_triton_kmeans:
+            Whether to use the Triton implementation of K-means.
+        metadata:
+            A list of metadata dictionaries corresponding to the documents.
+        start_from_scratch:
+            Threshold of documents below which the index is built from scratch.
 
-        self._prepare_index_directory(index_path=self.index)
+        """
+        # Exclusive Lock for Modification
+        with self.lock:
+            documents_embeddings = self._format_embeddings(documents_embeddings)
+            num_docs = len(documents_embeddings)
+            self._prepare_index_directory(index_path=self.index)
 
-        if metadata is not None:
-            if len(metadata) != num_docs:
-                error = f"""
-                The length of metadata ({len(metadata)}) must match the number of
-                documents_embeddings ({num_docs}).
-                """
-                raise ValueError(error)
-            create(index=self.index, metadata=metadata)
+            if metadata is not None:
+                if len(metadata) != num_docs:
+                    error = f"""
+                    The length of metadata ({len(metadata)}) must match the number of
+                    documents_embeddings ({num_docs}).
+                    """
+                    raise ValueError(error)
+                create(index=self.index, metadata=metadata)
 
-        dim = documents_embeddings[0].shape[-1]
+            if len(documents_embeddings) <= start_from_scratch:
+                save_list_tensors_on_disk(
+                    path=os.path.join(
+                        self.index,
+                        "embeddings.npy",
+                    ),
+                    tensors=documents_embeddings,
+                )
 
-        # Use the first device for creation logic
-        primary_device = self.devices[0]
+            # Determine dimensionality from the first available element
+            dim = (
+                documents_embeddings[0].shape[-1]
+                if isinstance(documents_embeddings, list)
+                else documents_embeddings.shape[-1]
+            )
 
-        print("Computing centroids of embeddings.")
-        centroids = compute_kmeans(
-            documents_embeddings=documents_embeddings,
-            dim=dim,
-            kmeans_niters=kmeans_niters,
-            device=primary_device,
-            max_points_per_centroid=max_points_per_centroid,
-            n_samples_kmeans=n_samples_kmeans,
-            seed=seed,
-            use_triton_kmeans=use_triton_kmeans,
-        )
+            # Use the first device for creation logic
+            primary_device = self.devices[0]
 
-        print("Creating FastPlaid index.")
-        fast_plaid_rust.create(
-            index=self.index,
-            torch_path=self.torch_path,
-            device=primary_device,
-            embedding_dim=dim,
-            nbits=nbits,
-            embeddings=documents_embeddings,
-            centroids=centroids,
-            batch_size=batch_size,
-            seed=seed,
-        )
+            centroids = compute_kmeans(
+                documents_embeddings=documents_embeddings,
+                dim=dim,
+                kmeans_niters=kmeans_niters,
+                device=primary_device,
+                max_points_per_centroid=max_points_per_centroid,
+                n_samples_kmeans=n_samples_kmeans,
+                seed=seed,
+                use_triton_kmeans=use_triton_kmeans,
+            )
 
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            fast_plaid_rust.create(
+                index=self.index,
+                torch_path=self.torch_path,
+                device=primary_device,
+                embedding_dim=dim,
+                nbits=nbits,
+                embeddings=documents_embeddings,
+                centroids=centroids,
+                batch_size=batch_size,
+                seed=seed,
+            )
 
-        # Reload indices on all devices now that creation is complete
-        self.indices = _reload_index(
-            index_path=self.index,
-            devices=self.devices,
-            indices=self.indices,
-        )
+            # Explicit cleanup of create objects
+            del centroids
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            # Reload indices on all devices now that creation is complete
+            new_indices = _reload_index(
+                index_path=self.index,
+                devices=self.devices,
+                indices={},
+                low_memory=self.low_memory,
+            )
+
+            # Atomic swap of indices dictionary
+            with self._index_swap_lock:
+                self.indices = new_indices
+                self._update_mtime()
 
         return self
 
+    @torch.inference_mode()
     def update(
         self,
         documents_embeddings: list[torch.Tensor] | torch.Tensor,
         metadata: list[dict[str, Any]] | None = None,
         batch_size: int = 50_000,
+        kmeans_niters: int = 4,
+        max_points_per_centroid: int = 256,
+        n_samples_kmeans: int | None = None,
+        seed: int = 42,
+        start_from_scratch: int = 999,
+        buffer_size: int = 100,
+        use_triton_kmeans: bool | None = False,
     ) -> "FastPlaid":
-        """Update an existing FastPlaid index with new documents."""
-        if isinstance(documents_embeddings, torch.Tensor):
-            documents_embeddings = [
-                documents_embeddings[i] for i in range(documents_embeddings.shape[0])
-            ]
+        """Update an existing FastPlaid index with new documents.
 
-        documents_embeddings = [
-            embedding.squeeze(0) if embedding.dim() == 3 else embedding
-            for embedding in documents_embeddings
-        ]
-        num_docs = len(documents_embeddings)
+        Args:
+        ----
+        documents_embeddings:
+            New embeddings to add to the index.
+        metadata:
+            Optional metadata for the new documents.
+        batch_size:
+            Batch size for processing the update.
+        kmeans_niters:
+            Number of iterations for K-Means (if new centroids are created).
+        max_points_per_centroid:
+            Constraint for centroid creation during updates.
+        n_samples_kmeans:
+            Number of samples to use for K-Means (if None, auto-calculated).
+        seed:
+            Random seed for K-Means.
+        start_from_scratch:
+            If the existing index has fewer documents than this,
+            the index will be re-created from scratch.
+        buffer_size:
+            Number of embeddings needed to trigger centroid expansion.
+        use_triton_kmeans:
+            Whether to use the Triton implementation of K-means.
 
-        if not os.path.exists(self.index) or not os.path.exists(
-            os.path.join(self.index, "metadata.json")
-        ):
-            error = f"""
-            Index directory '{self.index}' does not exist or is invalid.
-            Please create an index first using the .create() method.
-            """
-            raise FileNotFoundError(error)
+        """
+        # Exclusive Lock for Modification
+        with self.lock:
+            # Get current indices snapshot for the update operation
+            with self._index_swap_lock:
+                current_indices = dict(self.indices)
 
-        if os.path.exists(os.path.join(self.index, "metadata.db")):
-            if metadata is None:
-                metadata = [{} for _ in range(num_docs)]
+            new_indices = process_update(
+                index_path=self.index,
+                devices=self.devices,
+                torch_path=self.torch_path,
+                low_memory=self.low_memory,
+                indices_dict=current_indices,
+                documents_embeddings=documents_embeddings,
+                metadata=metadata,
+                batch_size=batch_size,
+                kmeans_niters=kmeans_niters,
+                max_points_per_centroid=max_points_per_centroid,
+                n_samples_kmeans=n_samples_kmeans,
+                seed=seed,
+                start_from_scratch=start_from_scratch,
+                buffer_size=buffer_size,
+                use_triton_kmeans=use_triton_kmeans,
+                create_fn=self.create,
+                delete_fn=self.delete,
+                compute_kmeans_fn=compute_kmeans,
+                format_embeddings_fn=self._format_embeddings,
+            )
 
-            if len(metadata) != num_docs:
-                error = f"""
-                The length of metadata ({len(metadata)}) must match the number of
-                documents_embeddings ({num_docs}).
-                """
-                raise ValueError(error)
-            update(index=self.index, metadata=metadata)
-
-        if self.indices[self.devices[0]] is None:
-            raise RuntimeError("Index not loaded for update.")
-
-        fast_plaid_rust.update(
-            index_path=self.index,
-            index=self.indices[self.devices[0]],
-            torch_path=self.torch_path,
-            device=self.devices[0],
-            embeddings=documents_embeddings,
-            batch_size=batch_size,
-        )
-
-        # Reload indices on all devices to reflect the updates
-        self.indices = _reload_index(
-            index_path=self.index,
-            devices=self.devices,
-            indices=self.indices,
-        )
+            # Atomic swap of indices dictionary
+            with self._index_swap_lock:
+                self.indices = new_indices
+                self._update_mtime()
 
         return self
 
     @staticmethod
     def _prepare_index_directory(index_path: str) -> None:
-        """Prepare the index directory by cleaning or creating it."""
+        """Prepare the index directory by cleaning or creating it.
+
+        Args:
+        ----
+        index_path:
+            The path to the index directory.
+
+        """
         if os.path.exists(index_path) and os.path.isdir(index_path):
             for json_file in glob.glob(os.path.join(index_path, "*.json")):
                 try:
@@ -365,7 +663,8 @@ class FastPlaid:
             except OSError as e:
                 raise e
 
-    def search(  # noqa: PLR0912, PLR0913, PLR0915, C901
+    @torch.inference_mode()
+    def search(  # noqa: PLR0912
         self,
         queries_embeddings: torch.Tensor | list[torch.Tensor],
         top_k: int = 10,
@@ -397,16 +696,23 @@ class FastPlaid:
             A list of lists specifying subsets of the index to search for each
             query, or a single list applied to all queries. If None, searches
             the entire index.
-        n_processes: Number of jobs to use for CPU search via joblib.
-                        Ignored if running on GPU(s). Defaults to 1.
+        n_processes:
+            Number of jobs to use for CPU search via joblib.
+            Ignored if running on GPU(s). Defaults to 1.
 
         """
-        if any(idx is None for idx in self.indices.values()):
-            self.indices = _reload_index(
-                index_path=self.index,
-                devices=self.devices,
-                indices=self.indices,
-            )
+        # Non-blocking reload: if an update is in progress, continue with current index
+        self._check_and_reload_index(blocking=False)
+
+        # Get a snapshot of current indices (atomic read)
+        with self._index_swap_lock:
+            search_indices = dict(self.indices)
+
+        if any(idx is None for idx in search_indices.values()):
+            # Try blocking reload if we have no valid index
+            self._check_and_reload_index(blocking=True)
+            with self._index_swap_lock:
+                search_indices = dict(self.indices)
 
         if not os.path.exists(os.path.join(self.index, "metadata.json")):
             error = f"""
@@ -416,7 +722,7 @@ class FastPlaid:
             raise FileNotFoundError(error)
 
         for device in self.devices:
-            if self.indices[device] is None:
+            if search_indices[device] is None:
                 error = f"""Index could not be loaded on device '{device}'.
                 Check CUDA memory or device availability."""
                 raise RuntimeError(error)
@@ -443,10 +749,7 @@ class FastPlaid:
                 subset = [subset] * num_queries  # type: ignore
 
             if subset is not None and len(subset) != num_queries:
-                error = """
-                The length of the subset must match the number of queries.
-                """
-                raise ValueError(error)
+                raise ValueError("Subset length must match number of queries.")
 
         is_cpu_only = self.devices[0] == "cpu"
         use_joblib = (is_cpu_only and (num_queries > 10) and n_processes != 1) or (
@@ -462,9 +765,7 @@ class FastPlaid:
         if use_joblib:
             num_workers = n_processes
             chunk_size = math.ceil(num_queries / num_workers)
-
             query_chunks = list(torch.split(queries_embeddings, chunk_size))
-
             subset_chunks = []
             if subset is not None:
                 for i in range(0, num_queries, chunk_size):
@@ -480,16 +781,14 @@ class FastPlaid:
                     n_full_scores=n_full_scores,
                     top_k=top_k,
                     n_ivf_probe=n_ivf_probe,
-                    index_object=self.indices["cpu"],
+                    index_object=search_indices["cpu"],
                     show_progress=(show_progress and i == 0),
                     subset=sub_chunk,
                 )
                 for i, (chunk, sub_chunk) in enumerate(zip(query_chunks, subset_chunks))
             )
-
             return [item for sublist in results for item in sublist]
 
-        # Single device shortcut (GPU or CPU n=1)
         if len(self.devices) == 1:
             return search_on_device(
                 device=self.devices[0],
@@ -498,7 +797,7 @@ class FastPlaid:
                 n_full_scores=n_full_scores,
                 top_k=top_k,
                 n_ivf_probe=n_ivf_probe,
-                index_object=self.indices[self.devices[0]],
+                index_object=search_indices[self.devices[0]],
                 show_progress=show_progress,
                 subset=subset,  # type: ignore
             )
@@ -508,7 +807,6 @@ class FastPlaid:
         chunk_size = math.ceil(num_queries / num_devices)
         futures = []
         query_chunks = list(torch.split(queries_embeddings, chunk_size))
-
         subset_chunks = []
         if subset is not None:
             for i in range(0, num_queries, chunk_size):
@@ -520,7 +818,6 @@ class FastPlaid:
             for i, device in enumerate(self.devices):
                 if i >= len(query_chunks):
                     break
-
                 futures.append(
                     executor.submit(
                         search_on_device,
@@ -530,7 +827,7 @@ class FastPlaid:
                         n_full_scores=n_full_scores,
                         top_k=top_k,
                         n_ivf_probe=n_ivf_probe,
-                        index_object=self.indices[device],
+                        index_object=search_indices[device],
                         show_progress=show_progress and (i == 0),
                         subset=subset_chunks[i],  # type: ignore
                     )
@@ -542,25 +839,70 @@ class FastPlaid:
 
         return all_results
 
-    def delete(self, subset: list[int]) -> "FastPlaid":
-        """Delete embeddings from an existing FastPlaid index."""
-        primary_device = self.devices[0]
+    @torch.inference_mode()
+    def delete(self, subset: list[int], _delete_metadata: bool = True) -> "FastPlaid":
+        """Delete embeddings from an existing FastPlaid index.
 
-        fast_plaid_rust.delete(
-            index=self.index,
-            torch_path=self.torch_path,
-            device=primary_device,
-            subset=subset,
-        )
+        Args:
+        ----
+        subset:
+            A list of document IDs (0-based) to delete.
 
-        metadata_db_path = os.path.join(self.index, "metadata.db")
-        if os.path.exists(metadata_db_path):
-            delete(index=self.index, subset=subset)
+        """
+        # Exclusive Lock for Modification
+        with self.lock:
+            primary_device = self.devices[0]
 
-        self.indices = _reload_index(
-            index_path=self.index,
-            devices=self.devices,
-            indices=self.indices,
-        )
+            fast_plaid_rust.delete(
+                index=self.index,
+                torch_path=self.torch_path,
+                device=primary_device,
+                subset=subset,
+            )
+
+            metadata_db_path = os.path.join(self.index, "metadata.db")
+            if os.path.exists(metadata_db_path) and _delete_metadata:
+                delete(index=self.index, subset=subset)
+
+            new_indices = _reload_index(
+                index_path=self.index,
+                devices=self.devices,
+                indices={},
+                low_memory=self.low_memory,
+            )
+
+            # Atomic swap of indices dictionary
+            with self._index_swap_lock:
+                self.indices = new_indices
+                self._update_mtime()
 
         return self
+
+    @torch.inference_mode()
+    def get_embeddings(self, subset: list[int]) -> list[torch.Tensor]:
+        """Reconstruct original embeddings for the specified document IDs.
+
+        This method leverages the Rust backend to efficiently decompress
+        and reconstruct embeddings, utilizing parallelism where possible.
+
+        Args:
+        ----
+        subset:
+            A list of document IDs (0-based) to reconstruct.
+
+        """
+        # Non-blocking reload: if an update is in progress, continue with current index
+        self._check_and_reload_index(blocking=False)
+
+        if not subset:
+            return []
+
+        # Get a snapshot of current indices (atomic read)
+        with self._index_swap_lock:
+            current_index = self.indices[self.devices[0]]
+
+        return fast_plaid_rust.reconstruct_embeddings(
+            index=current_index,
+            subset=subset,
+            device=self.devices[0],
+        )

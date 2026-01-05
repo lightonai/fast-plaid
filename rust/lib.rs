@@ -25,6 +25,7 @@ use crate::index::delete::delete_from_index;
 use crate::index::update::update_index;
 use search::load::{construct_index, get_device, PyLoadedIndex};
 use search::search::{search_many, QueryResult, SearchParameters};
+use utils::embeddings::reconstruct_embeddings;
 use utils::errors::anyhow_to_pyerr;
 
 /// Dynamically loads the native Torch shared library (libtorch).
@@ -194,9 +195,6 @@ fn pysearch(
     subset: Option<Vec<Vec<i64>>>,
 ) -> PyResult<Vec<QueryResult>> {
     let device_tch = get_device(&device)?;
-
-    // Prepare data for the search to ensure it is Send/Sync before releasing GIL.
-    let queries = queries_embeddings.to_kind(Kind::Half);
     let params = search_parameters.clone();
     let index_inner = &index.inner;
 
@@ -204,7 +202,7 @@ fn pysearch(
     let results = py
         .allow_threads(move || {
             search_many(
-                &queries,
+                &queries_embeddings,
                 index_inner,
                 &params,
                 device_tch,
@@ -236,6 +234,8 @@ fn pysearch(
 ///     embeddings (list[torch.Tensor]): A list of 2D tensors
 ///         (num_tokens, embedding_dim), one for each new document.
 ///     batch_size (int): Batch size for processing new embeddings.
+///     update_threshold_centroids (bool | None): Whether to update the quantization
+///         residual threshold based on the new data. Defaults to False.
 ///
 /// Raises:
 ///     RuntimeError: If updating the index fails or `libtorch` fails to load.
@@ -248,26 +248,20 @@ fn update(
     device: String,
     embeddings: Vec<PyTensor>,
     batch_size: i64,
+    update_threshold_centroids: Option<bool>,
 ) -> PyResult<()> {
     call_torch(torch_path)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
 
     let device_tch = get_device(&device)?;
 
-    let embeddings: Vec<_> = embeddings
-        .into_iter()
-        .map(|tensor| tensor.to_kind(Kind::Half))
-        .collect();
-
-    // We pass the full `index.inner` (LoadedIndex) to utilize the existing Codec
-    // and the existing IVF structure for incremental updates.
-    // The Python side handles reloading the data from disk after this returns.
     update_index(
         &embeddings,
         &index_path,
         device_tch,
         batch_size,
         &index.inner,
+        update_threshold_centroids.unwrap_or(false),
     )
     .map_err(|e| PyRuntimeError::new_err(format!("Failed to update index: {}", e)))?;
 
@@ -323,5 +317,6 @@ fn python_module(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pysearch, m)?)?;
     m.add_function(wrap_pyfunction!(update, m)?)?;
     m.add_function(wrap_pyfunction!(delete, m)?)?;
+    m.add_function(wrap_pyfunction!(reconstruct_embeddings, m)?)?;
     Ok(())
 }

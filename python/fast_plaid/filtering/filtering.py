@@ -98,7 +98,6 @@ def create(
     ...     metadata=new_metadata,
     ... )
     Added new column 'first_name' with type TEXT to the table.
-    1 new rows successfully added to 'test_index/metadata.db'.
 
     >>> filtering.where(
     ...     index="test_index",
@@ -281,8 +280,6 @@ def update(
     conn.commit()
     conn.close()
 
-    print(f"{len(metadata)} new rows successfully added to '{path}'.")
-
 
 def delete(index: str, subset: list[int] | int) -> None:
     """Delete rows from the database and re-index the `_subset_` column.
@@ -375,7 +372,13 @@ def get(
     """Retrieve rows as a list of dictionaries, filtered by condition or subset.
 
     This function allows filtering by either a SQL `condition` or a list of
-    `_subset_` IDs, but not both. If neither is provided, all rows are returned.
+    `_subset_` IDs.
+
+    **Ordering behavior:**
+    - If `subset` is provided: Returns rows ordered exactly as they appear in the
+      `subset` list (including duplicates).
+    - If `condition` is provided or `subset` is None: Returns rows ordered by
+      `_subset_` (ascending ID).
 
     Args:
     ----
@@ -405,23 +408,36 @@ def get(
     query = "SELECT * FROM METADATA"
     params = parameters
 
+    should_sort_by_subset = False
+
     if condition is not None:
         query += f" WHERE {condition}"
+        query += " ORDER BY _subset_"
     elif subset is not None:
         if not subset:
             return []
         placeholders = ", ".join(["?"] * len(subset))
         query += f" WHERE _subset_ IN ({placeholders})"
         params = subset
-
-    query += " ORDER BY _subset_"
+        should_sort_by_subset = True
+    else:
+        query += " ORDER BY _subset_"
 
     cursor.execute(query, params)
     rows = cursor.fetchall()
     conn.close()
 
     # Convert sqlite3.Row objects to standard Python dictionaries
-    return [dict(row) for row in rows]
+    results = [dict(row) for row in rows]
+
+    # If subset was provided, re-order (and potentially duplicate) results
+    # to match the input subset list
+    if should_sort_by_subset and subset is not None:
+        results_map = {row["_subset_"]: row for row in results}
+        # Retrieve items in the order of 'subset', skipping any that weren't found
+        results = [results_map[i] for i in subset if i in results_map]
+
+    return results
 
 
 def where(

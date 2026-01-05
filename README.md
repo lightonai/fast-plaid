@@ -44,10 +44,10 @@ FastPlaid is available in multiple versions to support different PyTorch version
 
 | FastPlaid Version | PyTorch Version | Installation Command                |
 | ----------------- | --------------- | ----------------------------------- |
-| 1.3.1.290         | 2.9.0           | `pip install fast-plaid==1.3.1.290` |
-| 1.3.1.280         | 2.8.0           | `pip install fast-plaid==1.3.1.280` |
-| 1.3.1.271         | 2.7.1           | `pip install fast-plaid==1.3.1.271` |
-| 1.3.1.270         | 2.7.0           | `pip install fast-plaid==1.3.1.270` |
+| 1.4.0.290         | 2.9.0           | `pip install fast-plaid==1.4.0.290` |
+| 1.4.0.280         | 2.8.0           | `pip install fast-plaid==1.4.0.280` |
+| 1.4.0.271         | 2.7.1           | `pip install fast-plaid==1.4.0.271` |
+| 1.4.0.270         | 2.7.0           | `pip install fast-plaid==1.4.0.270` |
 
 ### Adding FastPlaid as a Dependency
 
@@ -56,7 +56,7 @@ You can add FastPlaid to your project dependencies with version ranges to ensure
 **For requirements.txt:**
 
 ```
-fast-plaid>=1.3.1.270,<=1.3.1.290
+fast-plaid>=1.4.0.270,<=1.4.0.290
 ```
 
 **For pyproject.toml:**
@@ -64,7 +64,7 @@ fast-plaid>=1.3.1.270,<=1.3.1.290
 ```toml
 [project]
 dependencies = [
-    "fast-plaid>=1.3.1.270,<=1.3.1.290"
+    "fast-plaid>=1.4.0.270,<=1.4.0.290"
 ]
 ```
 
@@ -72,7 +72,7 @@ dependencies = [
 
 ```python
 install_requires=[
-    "fast-plaid>=1.3.1.270,<=1.3.1.290"
+    "fast-plaid>=1.4.0.270,<=1.4.0.290"
 ]
 ```
 
@@ -80,7 +80,7 @@ Choose the appropriate version range based on your PyTorch requirements.
 
 **Building from Source:**
 
-```python
+```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 pip install git+https://github.com/lightonai/fast-plaid.git
 ```
@@ -97,6 +97,7 @@ import torch
 from fast_plaid import search
 
 fast_plaid = search.FastPlaid(index="index", device="cpu") # or "cuda" for GPU.
+# Leave blank for auto-detect, including multi-GPU.
 # On CPU, specifying device speeds up initialization.
 
 embedding_dim = 128
@@ -167,9 +168,15 @@ scores = fast_plaid.search(
 print(scores)
 ```
 
-It is highly recommended to create your initial index with a large and representative sample of your data for optimal performance and accuracy. The **`.create()` method** establishes the fundamental structure of the index by calculating centroids that are specifically tailored to the distribution of this initial dataset.
+The **`.update()` method** efficiently adds new documents to an existing index while automatically maintaining centroid quality through a buffered expansion mechanism:
 
-The **`.update()` method**, designed for efficiency, **does not re-compute these centroids**. Instead, it places new documents into the existing structure. If you frequently update the index with large volumes of data that have a different statistical distribution than the original set, you may experience "drift." This means the fixed centroids become less representative of the total collection, potentially leading to sub-optimal data partitioning and a gradual decline in retrieval accuracy over time. Therefore, building a robust initial index is key to its long-term health. If you find that your data distribution changes significantly, consider periodically re-creating the index with a new, representative sample to maintain optimal performance or avoid using the `.update()` method and rely on the **`.create()` method** which will delete the existing index and re-create it from scratch. To update an existing embedding, you should delete it first and then add the new version with the `.update()` method.
+1. **Buffered Updates**: New documents are first accumulated in a buffer. When the buffer reaches the `buffer_size` threshold (default: 100 documents), the system triggers a centroid expansion check.
+
+2. **Automatic Centroid Expansion**: During expansion, embeddings that are far from all existing centroids (outliers) are identified using a distance threshold computed during index creation. These outliers are then clustered using K-means to create new centroids, which are appended to the existing set.
+
+3. **Efficient Small Updates**: For small batches of documents (below `buffer_size`), the update is performed immediately without centroid expansion, ensuring fast incremental updates.
+
+This approach balances efficiency with accuracy: small updates are fast, while larger batches automatically adapt the index structure to accommodate new data distributions. To update an existing embedding, you should delete it first and then add the new version with the `.update()` method.
 
 &nbsp;
 
@@ -217,6 +224,45 @@ Providing a `subset` filter can significantly speed up the search process, espec
 
 &nbsp;
 
+## ⚖️ Settings Trade-offs
+
+### Initialization
+
+```python
+Parameter         Default     Memory                        Speed                     Description
+low_memory       True        lower = less VRAM usage     True = slower   No effect when device is "cpu", only used when device is GPU. Load index tensors on CPU and move to device only when needed. Accelerate search at the cost of higher VRAM usage when False.
+```
+
+
+### Indexing
+
+```python
+Parameter         Default     Speed                        Accuracy                     Description
+n_samples_kmeans  None        lower = faster               lower = less precise         Number of samples to compute centroids
+nbits             4           lower  = faster              lower  = less precise        product quantization bits
+kmeans_niters     4           higher = slower indexing     higher = better clusters     K-means iterations
+```
+
+### Search
+
+```python
+Parameter         Default     Speed               Accuracy                    Description
+n_ivf_probe       8           higher = slower     higher = better recall      cluster probes per query
+n_full_scores     4096        higher = slower     higher = better ranking     candidates for full scoring
+```
+
+### Update
+
+```python
+Parameter              Default     Description
+buffer_size            100         Number of documents to accumulate before triggering centroid expansion
+start_from_scratch     999         Rebuild index from scratch if fewer documents exist
+kmeans_niters          4           K-means iterations for centroid expansion
+max_points_per_centroid 256        Maximum points per centroid during expansion
+```
+
+&nbsp;
+
 ## 📊 Benchmarks
 
 FastPlaid significantly outperforms the original PLAID engine across various datasets, delivering comparable accuracy with faster indexing and query speeds.
@@ -250,27 +296,6 @@ webis-touche2020 382545 PLAID         0.25             128.11                   
 ```
 
 _All benchmarks were performed on an H100 GPU. It's important to note that PLAID relies on Just-In-Time (JIT) compilation. This means the very first execution can exhibit longer runtimes. To ensure our performance analysis is representative, we've excluded these initial JIT-affected runs from the reported results. In contrast, FastPlaid does not employ JIT compilation, so its performance on the first run is directly indicative of its typical execution speed._
-
-&nbsp;
-
-## ⚖️ Settings Trade-offs
-
-### Indexing
-
-```python
-Parameter         Default     Speed                        Accuracy                     Description
-n_samples_kmeans  None        lower = faster               lower = less precise         Number of samples to compute centroids
-nbits             4           lower  = faster              lower  = less precise        product quantization bits
-kmeans_niters     4           higher = slower indexing     higher = better clusters     K-means iterations
-```
-
-### Search
-
-```python
-Parameter         Default     Speed               Accuracy                    Description
-n_ivf_probe       8           higher = slower     higher = better recall      cluster probes per query
-n_full_scores     4096        higher = slower     higher = better ranking     candidates for full scoring
-```
 
 &nbsp;
 
@@ -317,6 +342,7 @@ class FastPlaid:
         self,
         index: str,
         device: str | list[str] | None = None,
+        low_memory: bool = True,
     ) -> None:
 ```
 
@@ -333,6 +359,9 @@ device: str | list[str] | None = None
     - Can be a list of device strings (e.g., ["cuda:0", "cuda:1"]).
     - If multiple GPUs are specified and available, multiprocessing is automatically set up for parallel execution.
       Remember to include your code within an `if __name__ == "__main__":` block for proper multiprocessing behavior.
+    
+low_memory: bool = True
+    If True, the index is loaded in a memory-efficient manner, keeping tensors on CPU and moving them to the target device only when needed. This reduces VRAM usage at the cost of some performance. No effect when device is "cpu".
 
 ```
 
@@ -348,7 +377,7 @@ The **`create` method** builds the multi-vector index from your document embeddi
         max_points_per_centroid: int = 256,
         nbits: int = 4,
         n_samples_kmeans: int | None = None,
-        batch_size: int = 25_000,
+        batch_size: int = 50_000,
         seed: int = 42,
         use_triton_kmeans: bool | None = None,
         metadata: list[dict[str, Any]] | None = None,
@@ -380,7 +409,7 @@ n_samples_kmeans: int | None = None (optional)
     clustering quality. If you have a large dataset, you might want to set this to a
     smaller value to speed up the indexing process and save some memory.
 
-batch_size: int = 25_000 (optional)
+batch_size: int = 50_000 (optional)
     Batch size for processing embeddings during index creation.
 
 seed: int = 42 (optional)
@@ -402,14 +431,21 @@ metadata: list[dict[str, Any]] | None = None (optional)
 
 ### Updating the Index
 
-The **`update` method** provides an efficient way to add new documents to an existing index without rebuilding it from scratch. This is significantly faster than calling .create() again, as it reuses the existing quantization configuration and only processes the new documents. The centroids and quantization parameters remain unchanged, **this might lead to a slight decrease in accuracy compared to a full re-indexing**. To update an existing embedding, you should delete it first and then add the new version with the `.update()` method. Warning, when using the `delete` method, the remaining documents are re-indexed to maintain a sequential order. If you delete document k, all documents with id > k will have their id decreased by 1.
+The **`update` method** provides an efficient way to add new documents to an existing index while automatically maintaining centroid quality. It uses a buffered expansion mechanism: documents are accumulated until reaching `buffer_size`, at which point embeddings far from existing centroids are identified and used to create new centroids that are appended to the index structure. This ensures the index adapts to new data distributions over time. To update an existing embedding, you should delete it first and then add the new version with the `.update()` method. Warning, when using the `delete` method, the remaining documents are re-indexed to maintain a sequential order. If you delete document k, all documents with id > k will have their id decreased by 1.
 
 ```python
     def update(
         self,
         documents_embeddings: list[torch.Tensor] | torch.Tensor,
         metadata: list[dict[str, Any]] | None = None,
-        batch_size: int = 25_000,
+        batch_size: int = 50_000,
+        kmeans_niters: int = 4,
+        max_points_per_centroid: int = 256,
+        n_samples_kmeans: int | None = None,
+        seed: int = 42,
+        start_from_scratch: int = 999,
+        buffer_size: int = 100,
+        use_triton_kmeans: bool | None = False,
     ) -> "FastPlaid":
 ```
 
@@ -425,8 +461,33 @@ metadata: list[dict[str, Any]] | None = None
     If provided, the length of this list must match the number of new documents being added.
     The metadata will be stored in a SQLite database within the index directory for filtering during searches.
 
-batch_size: int = 25_000 (optional)
+batch_size: int = 50_000 (optional)
     Batch size for processing embeddings during the update.
+
+kmeans_niters: int = 4 (optional)
+    The number of iterations for the K-means algorithm when creating new centroids during expansion.
+
+max_points_per_centroid: int = 256 (optional)
+    The maximum number of points per centroid when creating new centroids.
+
+n_samples_kmeans: int | None = None (optional)
+    The number of samples to use for K-means clustering during centroid expansion.
+    If None, it defaults to a value based on the number of documents.
+
+seed: int = 42 (optional)
+    Seed for the random number generator used during centroid expansion.
+
+start_from_scratch: int = 999 (optional)
+    If the existing index has fewer documents than this threshold, the index will be
+    completely rebuilt from scratch instead of being updated incrementally.
+
+buffer_size: int = 100 (optional)
+    Number of documents to accumulate before triggering centroid expansion.
+    When the buffer reaches this size, outlier embeddings (far from existing centroids)
+    are identified and clustered to create new centroids that are appended to the index.
+
+use_triton_kmeans: bool | None = False (optional)
+    Whether to use the Triton-based K-means implementation during centroid expansion.
 ```
 
 ### Searching the Index
@@ -501,9 +562,9 @@ subset: list[int]
 
 Any contributions to FastPlaid are welcome! If you have ideas for improvements, bug fixes, or new features, please open an issue or submit a pull request. We are particularly interested in:
 
-- Re-computing centroids when using the `.update()` method to maintain optimal performance.
 - Additional algorithms for multi-vector search.
 - New search outputs formats for better integration with existing systems.
+- Performance optimizations for CPU and GPU operations.
 
 &nbsp;
 

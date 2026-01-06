@@ -1,8 +1,4 @@
-"""Custom FastKMeans implementation with torch tensor support.
-
-Extends the fastkmeans library to accept torch tensors as input and return
-centroids as torch tensors, reducing memory overhead from numpy conversions.
-"""
+"""Wrapper around FastKmeans to avoid copy."""
 
 from __future__ import annotations
 

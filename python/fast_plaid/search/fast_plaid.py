@@ -873,6 +873,23 @@ class FastPlaid:
             if os.path.exists(buffer_path):
                 os.remove(buffer_path)
 
+            # Clear merged files to force regeneration after deletion
+            # The Rust delete operation doesn't update these files, causing
+            # loading failures on Windows and incorrect state on all platforms
+            merged_files = [
+                "merged_codes.npy",
+                "merged_codes.manifest.json",
+                "merged_residuals.npy",
+                "merged_residuals.manifest.json",
+            ]
+            for merged_file in merged_files:
+                merged_path = os.path.join(self.index, merged_file)
+                if os.path.exists(merged_path):
+                    try:
+                        os.remove(merged_path)
+                    except OSError:
+                        pass
+
             # Update num_documents in metadata.json to reflect the deletion
             # This ensures subsequent updates use the correct document count
             metadata_json_path = os.path.join(self.index, "metadata.json")

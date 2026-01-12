@@ -173,6 +173,78 @@ class TestUpdate:
             # Ensure index is closed to release file handles on Windows
             index.close()
 
+    def test_update_delete_update_with_metadata(self, test_index_path):
+        """Test the update-delete-update sequence with metadata to ensure buffer is properly managed."""
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+
+        try:
+            embedding_dim = 128
+
+            # Create initial documents with metadata
+            initial_embeddings = [torch.randn(10, embedding_dim) for _ in range(3)]
+            initial_metadata = [
+                {"name": "Alice", "category": "A", "join_date": date(2023, 5, 17)},
+                {"name": "Bob", "category": "B", "join_date": date(2021, 6, 21)},
+                {"name": "Alex", "category": "A", "join_date": date(2023, 8, 1)},
+            ]
+            index.create(
+                documents_embeddings=initial_embeddings, metadata=initial_metadata
+            )
+            random_query = torch.randn(1, 10, embedding_dim)
+
+            # Verify initial state
+            assert len(filtering.get(index=index.index)) == 3, (
+                "Expected 3 documents after initial creation"
+            )
+            assert len(index.search(random_query, top_k=10)[0]) == 3, (
+                "Expected 3 documents after initial creation"
+            )
+
+            # First update
+            new_embeddings = [torch.randn(10, embedding_dim) for _ in range(1)]
+            new_metadata = [
+                {"name": "Charlie", "category": "B", "join_date": date(2020, 3, 15)},
+            ]
+            index.update(documents_embeddings=new_embeddings, metadata=new_metadata)
+
+            assert len(filtering.get(index=index.index)) == 4, (
+                "Expected 4 documents after update"
+            )
+            search_results = index.search(random_query, top_k=10)[0]
+            assert len(search_results) == 4, (
+                f"Expected 4 documents after update, got {len(search_results)}"
+            )
+
+            # Delete the last document
+            index.delete(subset=[3])
+            assert len(filtering.get(index=index.index)) == 3, (
+                "Expected 3 documents after deletion"
+            )
+            search_results = index.search(random_query, top_k=10)[0]
+            assert len(search_results) == 3, (
+                f"Expected 3 documents after deletion, got {len(search_results)}"
+            )
+
+            # Second update - this is where the bug occurred
+            index.update(documents_embeddings=new_embeddings, metadata=new_metadata)
+
+            assert len(filtering.get(index=index.index)) == 4, (
+                "Expected 4 documents after second update"
+            )
+            search_results = index.search(random_query, top_k=10)[0]
+            
+            # Verify that only valid document IDs are returned (0, 1, 2, 3)
+            doc_ids = {doc_id for doc_id, _ in search_results}
+            assert doc_ids.issubset({0, 1, 2, 3}), (
+                f"Found invalid document IDs: {doc_ids - {0, 1, 2, 3}}"
+            )
+            
+            assert len(search_results) == 4, (
+                f"Expected 4 documents after second update, got {len(search_results)}"
+            )
+        finally:
+            index.close()
+
 
 class TestDelete:
     """Tests for index delete functionality."""

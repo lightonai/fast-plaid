@@ -422,9 +422,11 @@ def process_update(  # noqa: PLR0912
         )
 
     # Buffer not reached - append to buffer and update without centroid expansion
+    # Combine existing buffer embeddings with new embeddings
+    all_buffer_embeddings = existing_buffer_embeddings + documents_embeddings
     save_list_tensors_on_disk(
         path=os.path.join(index_path, "buffer.npy"),
-        tensors=documents_embeddings,
+        tensors=all_buffer_embeddings,
     )
 
     fast_plaid_rust.update(

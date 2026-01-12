@@ -864,6 +864,11 @@ class FastPlaid:
             if os.path.exists(metadata_db_path) and _delete_metadata:
                 delete(index=self.index, subset=subset)
 
+            # Clear buffer if it exists, as deleted documents may have been buffered
+            buffer_path = os.path.join(self.index, "buffer.npy")
+            if os.path.exists(buffer_path):
+                os.remove(buffer_path)
+
             new_indices = _reload_index(
                 index_path=self.index,
                 devices=self.devices,

@@ -864,7 +864,9 @@ class FastPlaid:
             if os.path.exists(metadata_db_path) and _delete_metadata:
                 delete(index=self.index, subset=subset)
 
-            # Clear buffer if it exists, as deleted documents may have been buffered
+            # Clear buffer to prevent stale embeddings from causing phantom documents
+            # in search results. If deleted documents were buffered, keeping the buffer
+            # would cause inconsistencies between the index and buffer state.
             buffer_path = os.path.join(self.index, "buffer.npy")
             if os.path.exists(buffer_path):
                 os.remove(buffer_path)

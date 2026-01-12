@@ -422,7 +422,9 @@ def process_update(  # noqa: PLR0912
         )
 
     # Buffer not reached - append to buffer and update without centroid expansion
-    # Combine existing buffer embeddings with new embeddings
+    # Combine existing buffer embeddings with new embeddings to maintain buffer state.
+    # Note: The delete() function clears the buffer, so this primarily handles cases
+    # where multiple updates occur without deletions or buffer threshold being reached.
     all_buffer_embeddings = existing_buffer_embeddings + documents_embeddings
     save_list_tensors_on_disk(
         path=os.path.join(index_path, "buffer.npy"),

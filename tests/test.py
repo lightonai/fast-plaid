@@ -174,7 +174,10 @@ class TestUpdate:
             index.close()
 
     def test_update_delete_update_with_metadata(self, test_index_path):
-        """Test the update-delete-update sequence with metadata to ensure buffer is properly managed."""
+        """Test update-delete-update sequence with metadata.
+
+        Ensures buffer is properly managed to prevent phantom documents.
+        """
         index = search.FastPlaid(index=test_index_path, device="cpu")
 
         try:
@@ -232,13 +235,13 @@ class TestUpdate:
                 "Expected 4 documents after second update"
             )
             search_results = index.search(random_query, top_k=10)[0]
-            
+
             # Verify that only valid document IDs are returned (0, 1, 2, 3)
             doc_ids = {doc_id for doc_id, _ in search_results}
             assert doc_ids.issubset({0, 1, 2, 3}), (
                 f"Found invalid document IDs: {doc_ids - {0, 1, 2, 3}}"
             )
-            
+
             assert len(search_results) == 4, (
                 f"Expected 4 documents after second update, got {len(search_results)}"
             )

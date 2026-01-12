@@ -866,36 +866,41 @@ class FastPlaid:
             if os.path.exists(metadata_db_path) and _delete_metadata:
                 delete(index=self.index, subset=subset)
 
-            # Clear buffer to prevent stale embeddings from causing phantom documents
-            # in search results. If deleted documents were buffered, keeping the buffer
-            # would cause inconsistencies between the index and buffer state.
-            buffer_path = os.path.join(self.index, "buffer.npy")
-            if os.path.exists(buffer_path):
-                os.remove(buffer_path)
+            # Only update buffer and metadata when this is a user-initiated delete
+            # Internal deletes during buffer processing (_delete_metadata=False)
+            # should not modify these files as the buffer contents will be immediately
+            # reprocessed with the new embeddings
+            if _delete_metadata:
+                # Clear buffer to prevent stale embeddings from causing phantom documents
+                # in search results. If deleted documents were buffered, keeping the buffer
+                # would cause inconsistencies between the index and buffer state.
+                buffer_path = os.path.join(self.index, "buffer.npy")
+                if os.path.exists(buffer_path):
+                    os.remove(buffer_path)
 
-            # Update num_documents in metadata.json to reflect the deletion
-            # This ensures subsequent updates use the correct document count
-            metadata_json_path = os.path.join(self.index, "metadata.json")
-            if os.path.exists(metadata_json_path):
-                with open(metadata_json_path) as f:
-                    meta = json.load(f)
+                # Update num_documents in metadata.json to reflect the deletion
+                # This ensures subsequent updates use the correct document count
+                metadata_json_path = os.path.join(self.index, "metadata.json")
+                if os.path.exists(metadata_json_path):
+                    with open(metadata_json_path) as f:
+                        meta = json.load(f)
 
-                # Get the actual document count from the metadata DB if it exists
-                if os.path.exists(metadata_db_path):
-                    conn = sqlite3.connect(metadata_db_path)
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT COUNT(*) FROM METADATA")
-                    actual_count = cursor.fetchone()[0]
-                    conn.close()
-                    meta["num_documents"] = actual_count
-                else:
-                    # Fall back to decrementing by the number of deleted items
-                    meta["num_documents"] = max(
-                        0, meta.get("num_documents", 0) - len(subset)
-                    )
+                    # Get the actual document count from the metadata DB if it exists
+                    if os.path.exists(metadata_db_path):
+                        conn = sqlite3.connect(metadata_db_path)
+                        cursor = conn.cursor()
+                        cursor.execute("SELECT COUNT(*) FROM METADATA")
+                        actual_count = cursor.fetchone()[0]
+                        conn.close()
+                        meta["num_documents"] = actual_count
+                    else:
+                        # Fall back to decrementing by the number of deleted items
+                        meta["num_documents"] = max(
+                            0, meta.get("num_documents", 0) - len(subset)
+                        )
 
-                with open(metadata_json_path, "w") as f:
-                    json.dump(meta, f, indent=4)
+                    with open(metadata_json_path, "w") as f:
+                        json.dump(meta, f, indent=4)
 
             new_indices = _reload_index(
                 index_path=self.index,

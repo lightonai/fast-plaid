@@ -173,6 +173,81 @@ class TestUpdate:
             # Ensure index is closed to release file handles on Windows
             index.close()
 
+    def test_update_delete_update_with_metadata(self, test_index_path):
+        """Test update-delete-update sequence with metadata.
+
+        Ensures buffer is properly managed to prevent phantom documents.
+        """
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+
+        try:
+            embedding_dim = 128
+
+            # Create initial documents with metadata
+            initial_embeddings = [torch.randn(10, embedding_dim) for _ in range(3)]
+            initial_metadata = [
+                {"name": "Alice", "category": "A", "join_date": date(2023, 5, 17)},
+                {"name": "Bob", "category": "B", "join_date": date(2021, 6, 21)},
+                {"name": "Alex", "category": "A", "join_date": date(2023, 8, 1)},
+            ]
+            index.create(
+                documents_embeddings=initial_embeddings, metadata=initial_metadata
+            )
+            random_query = torch.randn(1, 10, embedding_dim)
+
+            # Verify initial state
+            assert len(filtering.get(index=index.index)) == 3, (
+                "Expected 3 documents after initial creation"
+            )
+            assert len(index.search(random_query, top_k=10)[0]) == 3, (
+                "Expected 3 documents after initial creation"
+            )
+
+            # First update
+            new_embeddings = [torch.randn(10, embedding_dim) for _ in range(1)]
+            new_metadata = [
+                {"name": "Charlie", "category": "B", "join_date": date(2020, 3, 15)},
+            ]
+            index.update(documents_embeddings=new_embeddings, metadata=new_metadata)
+
+            assert len(filtering.get(index=index.index)) == 4, (
+                "Expected 4 documents after update"
+            )
+            search_results = index.search(random_query, top_k=10)[0]
+            assert len(search_results) == 4, (
+                f"Expected 4 documents after update, got {len(search_results)}"
+            )
+
+            # Delete the last document
+            index.delete(subset=[3])
+            assert len(filtering.get(index=index.index)) == 3, (
+                "Expected 3 documents after deletion"
+            )
+            search_results = index.search(random_query, top_k=10)[0]
+            assert len(search_results) == 3, (
+                f"Expected 3 documents after deletion, got {len(search_results)}"
+            )
+
+            # Second update - this is where the bug occurred
+            index.update(documents_embeddings=new_embeddings, metadata=new_metadata)
+
+            assert len(filtering.get(index=index.index)) == 4, (
+                "Expected 4 documents after second update"
+            )
+            search_results = index.search(random_query, top_k=10)[0]
+
+            # Verify that only valid document IDs are returned (0, 1, 2, 3)
+            doc_ids = {doc_id for doc_id, _ in search_results}
+            assert doc_ids.issubset({0, 1, 2, 3}), (
+                f"Found invalid document IDs: {doc_ids - {0, 1, 2, 3}}"
+            )
+
+            assert len(search_results) == 4, (
+                f"Expected 4 documents after second update, got {len(search_results)}"
+            )
+        finally:
+            index.close()
+
 
 class TestDelete:
     """Tests for index delete functionality."""
@@ -697,6 +772,335 @@ class TestScoreConsistency:
         assert doc_ids_1 == doc_ids_2, (
             f"Inconsistent results: {doc_ids_1} != {doc_ids_2}"
         )
+
+
+class TestMetadataDocumentCount:
+    """Tests for exact document count in metadata.json."""
+
+    def _get_num_documents(self, index_path):
+        """Helper to read num_documents from metadata.json."""
+        import json
+
+        metadata_path = os.path.join(index_path, "metadata.json")
+        with open(metadata_path) as f:
+            metadata = json.load(f)
+        return metadata.get("num_documents", 0)
+
+    def test_create_sets_exact_document_count(self, test_index_path):
+        """Test that creating an index sets the exact document count in metadata.json."""
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+
+        num_docs = 25
+        documents_embeddings = [
+            torch.randn(50, 128, device="cpu") for _ in range(num_docs)
+        ]
+        index.create(documents_embeddings=documents_embeddings, kmeans_niters=2)
+
+        assert self._get_num_documents(test_index_path) == num_docs, (
+            f"Expected {num_docs} documents in metadata.json"
+        )
+
+    def test_update_increments_document_count_exactly(self, test_index_path):
+        """Test that updating an index sets the exact document count in metadata.json."""
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+
+        try:
+            # Create initial index with 20 documents
+            initial_docs = 20
+            initial_embeddings = [
+                torch.randn(50, 128, device="cpu") for _ in range(initial_docs)
+            ]
+            index.create(documents_embeddings=initial_embeddings, kmeans_niters=2)
+
+            assert self._get_num_documents(test_index_path) == initial_docs, (
+                f"Expected {initial_docs} documents after creation"
+            )
+
+            # First update with 10 documents
+            update_1_docs = 10
+            update_1_embeddings = [
+                torch.randn(50, 128, device="cpu") for _ in range(update_1_docs)
+            ]
+            index.update(documents_embeddings=update_1_embeddings)
+
+            expected_after_update_1 = initial_docs + update_1_docs
+            assert self._get_num_documents(test_index_path) == expected_after_update_1, (
+                f"Expected {expected_after_update_1} documents after first update, "
+                f"got {self._get_num_documents(test_index_path)}"
+            )
+
+            # Second update with 15 documents
+            update_2_docs = 15
+            update_2_embeddings = [
+                torch.randn(50, 128, device="cpu") for _ in range(update_2_docs)
+            ]
+            index.update(documents_embeddings=update_2_embeddings)
+
+            expected_after_update_2 = expected_after_update_1 + update_2_docs
+            assert self._get_num_documents(test_index_path) == expected_after_update_2, (
+                f"Expected {expected_after_update_2} documents after second update, "
+                f"got {self._get_num_documents(test_index_path)}"
+            )
+        finally:
+            index.close()
+
+    def test_delete_decrements_document_count_exactly(self, test_index_path):
+        """Test that deleting documents sets the exact document count in metadata.json."""
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+
+        try:
+            # Create initial index with 30 documents
+            initial_docs = 30
+            initial_embeddings = [
+                torch.randn(50, 128, device="cpu") for _ in range(initial_docs)
+            ]
+            index.create(documents_embeddings=initial_embeddings, kmeans_niters=2)
+
+            assert self._get_num_documents(test_index_path) == initial_docs, (
+                f"Expected {initial_docs} documents after creation"
+            )
+
+            # Delete 1 document
+            index.delete(subset=[5])
+            expected_after_delete_1 = initial_docs - 1
+            assert self._get_num_documents(test_index_path) == expected_after_delete_1, (
+                f"Expected {expected_after_delete_1} documents after deleting 1 document, "
+                f"got {self._get_num_documents(test_index_path)}"
+            )
+
+            # Delete 4 more documents
+            index.delete(subset=[0, 3, 10, 15])
+            expected_after_delete_2 = expected_after_delete_1 - 4
+            assert self._get_num_documents(test_index_path) == expected_after_delete_2, (
+                f"Expected {expected_after_delete_2} documents after deleting 4 documents, "
+                f"got {self._get_num_documents(test_index_path)}"
+            )
+        finally:
+            index.close()
+
+    def test_update_then_delete_maintains_exact_count(self, test_index_path):
+        """Test that update followed by delete maintains exact document count."""
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+
+        try:
+            # Create initial index with 15 documents
+            initial_docs = 15
+            initial_embeddings = [
+                torch.randn(50, 128, device="cpu") for _ in range(initial_docs)
+            ]
+            index.create(documents_embeddings=initial_embeddings, kmeans_niters=2)
+
+            assert self._get_num_documents(test_index_path) == initial_docs
+
+            # Update with 5 documents
+            update_docs = 5
+            update_embeddings = [
+                torch.randn(50, 128, device="cpu") for _ in range(update_docs)
+            ]
+            index.update(documents_embeddings=update_embeddings)
+
+            expected_after_update = initial_docs + update_docs
+            assert self._get_num_documents(test_index_path) == expected_after_update, (
+                f"Expected {expected_after_update} documents after update"
+            )
+
+            # Delete 3 documents (including one from the update)
+            index.delete(subset=[2, 10, 17])
+            expected_after_delete = expected_after_update - 3
+            assert self._get_num_documents(test_index_path) == expected_after_delete, (
+                f"Expected {expected_after_delete} documents after delete, "
+                f"got {self._get_num_documents(test_index_path)}"
+            )
+        finally:
+            index.close()
+
+    def test_delete_then_update_maintains_exact_count(self, test_index_path):
+        """Test that delete followed by update maintains exact document count."""
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+
+        try:
+            # Create initial index with 20 documents
+            initial_docs = 20
+            initial_embeddings = [
+                torch.randn(50, 128, device="cpu") for _ in range(initial_docs)
+            ]
+            index.create(documents_embeddings=initial_embeddings, kmeans_niters=2)
+
+            assert self._get_num_documents(test_index_path) == initial_docs
+
+            # Delete 5 documents
+            index.delete(subset=[0, 5, 10, 15, 19])
+            expected_after_delete = initial_docs - 5
+            assert self._get_num_documents(test_index_path) == expected_after_delete, (
+                f"Expected {expected_after_delete} documents after delete"
+            )
+
+            # Update with 8 documents
+            update_docs = 8
+            update_embeddings = [
+                torch.randn(50, 128, device="cpu") for _ in range(update_docs)
+            ]
+            index.update(documents_embeddings=update_embeddings)
+
+            expected_after_update = expected_after_delete + update_docs
+            assert self._get_num_documents(test_index_path) == expected_after_update, (
+                f"Expected {expected_after_update} documents after update, "
+                f"got {self._get_num_documents(test_index_path)}"
+            )
+        finally:
+            index.close()
+
+    def test_multiple_updates_and_deletes_exact_count(self, test_index_path):
+        """Test exact document count after multiple interleaved updates and deletes."""
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+
+        try:
+            # Create initial index
+            current_count = 10
+            initial_embeddings = [
+                torch.randn(50, 128, device="cpu") for _ in range(current_count)
+            ]
+            index.create(documents_embeddings=initial_embeddings, kmeans_niters=2)
+            assert self._get_num_documents(test_index_path) == current_count
+
+            # Update +5
+            index.update(
+                documents_embeddings=[
+                    torch.randn(50, 128, device="cpu") for _ in range(5)
+                ]
+            )
+            current_count += 5
+            assert self._get_num_documents(test_index_path) == current_count
+
+            # Delete 2
+            index.delete(subset=[0, 7])
+            current_count -= 2
+            assert self._get_num_documents(test_index_path) == current_count
+
+            # Update +3
+            index.update(
+                documents_embeddings=[
+                    torch.randn(50, 128, device="cpu") for _ in range(3)
+                ]
+            )
+            current_count += 3
+            assert self._get_num_documents(test_index_path) == current_count
+
+            # Delete 1
+            index.delete(subset=[5])
+            current_count -= 1
+            assert self._get_num_documents(test_index_path) == current_count
+
+            # Final verification
+            assert self._get_num_documents(test_index_path) == 15, (
+                f"Expected 15 documents after all operations, "
+                f"got {self._get_num_documents(test_index_path)}"
+            )
+        finally:
+            index.close()
+
+    def test_document_count_matches_search_results(self, test_index_path):
+        """Test that metadata.json count matches actual searchable documents."""
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+
+        try:
+            # Create index with 25 documents
+            num_docs = 25
+            documents_embeddings = [
+                torch.randn(50, 128, device="cpu") for _ in range(num_docs)
+            ]
+            index.create(documents_embeddings=documents_embeddings, kmeans_niters=2)
+
+            # Verify count in metadata.json
+            metadata_count = self._get_num_documents(test_index_path)
+            assert metadata_count == num_docs
+
+            # Verify search returns all documents when requesting more than exist
+            query = torch.randn(1, 30, 128, device="cpu")
+            results = index.search(queries_embeddings=query, top_k=100)
+
+            # Should get exactly num_docs results
+            assert len(results[0]) == num_docs, (
+                f"Search returned {len(results[0])} docs but metadata says {metadata_count}"
+            )
+
+            # After update
+            index.update(
+                documents_embeddings=[
+                    torch.randn(50, 128, device="cpu") for _ in range(5)
+                ]
+            )
+            metadata_count = self._get_num_documents(test_index_path)
+            results = index.search(queries_embeddings=query, top_k=100)
+            assert len(results[0]) == metadata_count, (
+                f"After update: search returned {len(results[0])} docs but "
+                f"metadata says {metadata_count}"
+            )
+
+            # After delete
+            index.delete(subset=[0, 10, 20])
+            metadata_count = self._get_num_documents(test_index_path)
+            results = index.search(queries_embeddings=query, top_k=100)
+            assert len(results[0]) == metadata_count, (
+                f"After delete: search returned {len(results[0])} docs but "
+                f"metadata says {metadata_count}"
+            )
+        finally:
+            index.close()
+
+    def test_document_count_with_metadata_db(self, test_index_path):
+        """Test that metadata.json count matches metadata.db count after operations."""
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+
+        try:
+            # Create with metadata
+            num_docs = 10
+            documents_embeddings = [
+                torch.randn(50, 128, device="cpu") for _ in range(num_docs)
+            ]
+            metadata = [{"name": f"doc{i}"} for i in range(num_docs)]
+            index.create(
+                documents_embeddings=documents_embeddings,
+                metadata=metadata,
+                kmeans_niters=2,
+            )
+
+            # Verify both counts match
+            json_count = self._get_num_documents(test_index_path)
+            db_count = len(filtering.get(index=test_index_path))
+            assert json_count == db_count == num_docs, (
+                f"Mismatch: json={json_count}, db={db_count}, expected={num_docs}"
+            )
+
+            # Update with metadata
+            update_docs = 5
+            update_embeddings = [
+                torch.randn(50, 128, device="cpu") for _ in range(update_docs)
+            ]
+            update_metadata = [{"name": f"new_doc{i}"} for i in range(update_docs)]
+            index.update(
+                documents_embeddings=update_embeddings, metadata=update_metadata
+            )
+
+            expected_count = num_docs + update_docs
+            json_count = self._get_num_documents(test_index_path)
+            db_count = len(filtering.get(index=test_index_path))
+            assert json_count == db_count == expected_count, (
+                f"After update: json={json_count}, db={db_count}, "
+                f"expected={expected_count}"
+            )
+
+            # Delete some documents
+            index.delete(subset=[2, 7, 12])
+            expected_count -= 3
+            json_count = self._get_num_documents(test_index_path)
+            db_count = len(filtering.get(index=test_index_path))
+            assert json_count == db_count == expected_count, (
+                f"After delete: json={json_count}, db={db_count}, "
+                f"expected={expected_count}"
+            )
+        finally:
+            index.close()
 
 
 class TestFilteringModule:

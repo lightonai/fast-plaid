@@ -203,7 +203,7 @@ def update_centroids(  # noqa: PLR0912
         torch.cuda.empty_cache()
 
 
-def process_update(  # noqa: PLR0912
+def process_update(
     index_path: str,
     devices: list[str],
     torch_path: str,
@@ -310,16 +310,17 @@ def process_update(  # noqa: PLR0912
         update_metadata_db(index=index_path, metadata=metadata)
 
     # Rebuild index from scratch if below threshold
-    if num_documents_in_index <= start_from_scratch:
-        if os.path.exists(os.path.join(index_path, "embeddings.npy")):
-            existing_embeddings_np = np.load(
-                os.path.join(index_path, "embeddings.npy"),
-                allow_pickle=True,
-            )
-            existing_embeddings = [
-                torch.from_numpy(tensor) for tensor in existing_embeddings_np
-            ]
-            documents_embeddings = existing_embeddings + documents_embeddings
+    if num_documents_in_index <= start_from_scratch and os.path.exists(
+        os.path.join(index_path, "embeddings.npy")
+    ):
+        existing_embeddings_np = np.load(
+            os.path.join(index_path, "embeddings.npy"),
+            allow_pickle=True,
+        )
+        existing_embeddings = [
+            torch.from_numpy(tensor) for tensor in existing_embeddings_np
+        ]
+        documents_embeddings = existing_embeddings + documents_embeddings
 
         create_fn(
             documents_embeddings=documents_embeddings,

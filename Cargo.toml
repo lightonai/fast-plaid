@@ -1,6 +1,6 @@
 [package]
 name = "fast_plaid_rust"
-version = "1.4.1"
+version = "1.4.2"
 edition = "2021"
 build = "build.rs"
 

@@ -842,7 +842,12 @@ class FastPlaid:
         return all_results
 
     @torch.inference_mode()
-    def delete(self, subset: list[int], _delete_metadata: bool = True) -> "FastPlaid":
+    def delete(
+        self,
+        subset: list[int],
+        _delete_metadata: bool = True,
+        _delete_buffer: bool = True,
+    ) -> "FastPlaid":
         """Delete embeddings from an existing FastPlaid index.
 
         Args:
@@ -882,7 +887,6 @@ class FastPlaid:
                 num_buffer_docs = len(buffer_np)
 
             # Buffer documents are the most recent ones (at the end)
-            # Buffer indices range from (num_documents - num_buffer_docs) to (num_documents - 1)
             buffer_start_idx = num_documents - num_buffer_docs
 
             # Update embeddings.npy if it exists

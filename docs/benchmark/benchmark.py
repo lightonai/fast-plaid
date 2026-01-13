@@ -88,6 +88,9 @@ for i in range(0, len(documents_embeddings), batch_size):
         documents_embeddings=documents_embeddings[i : i + batch_size],
         metadata=[{"id": document["id"]} for document in documents[i : i + batch_size]],
     )
+
+    total += len(documents_embeddings[i : i + batch_size])
+
 end_index = time.time()
 indexing_time = end_index - start_index
 print(f"\t✅ {dataset_name} indexing: {indexing_time:.2f} seconds")
@@ -104,10 +107,10 @@ large_queries_embeddings = torch.cat(
 
 print(f"🔍 50_000 queries on {dataset_name}...")
 start_search = time.time()
-_ = index.search(
-    queries_embeddings=large_queries_embeddings,
-    top_k=10,
-)
+# _ = index.search(
+#    queries_embeddings=large_queries_embeddings,
+#    top_k=10,
+# )
 end_search = time.time()
 heavy_search_time = end_search - start_search
 queries_per_second = large_queries_embeddings.shape[0] / heavy_search_time
@@ -130,7 +133,6 @@ for (query_id, _), query_scores in zip(queries.items(), scores, strict=True):
         subset=[document_id for document_id, _ in query_scores],
     )
 
-    # Why other results is broken ?
     other_results.append(
         [
             {"id": document["id"], "score": score}

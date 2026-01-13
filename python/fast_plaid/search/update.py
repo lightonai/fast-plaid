@@ -380,7 +380,11 @@ def process_update(
             start_del_idx = num_documents_in_index - len(existing_buffer_embeddings)
             documents_to_delete = list(range(start_del_idx, num_documents_in_index))
             documents_embeddings = existing_buffer_embeddings + documents_embeddings
-            delete_fn(subset=documents_to_delete, _delete_metadata=False)
+            delete_fn(
+                subset=documents_to_delete,
+                _delete_metadata=False,
+                _delete_buffer=False,
+            )
 
         update_centroids(
             index_path=index_path,
@@ -425,7 +429,7 @@ def process_update(
     # Buffer not reached - append to buffer and update without centroid expansion
     save_list_tensors_on_disk(
         path=os.path.join(index_path, "buffer.npy"),
-        tensors=documents_embeddings,
+        tensors=existing_buffer_embeddings + documents_embeddings,
     )
 
     fast_plaid_rust.update(

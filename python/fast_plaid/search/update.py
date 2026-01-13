@@ -203,7 +203,7 @@ def update_centroids(  # noqa: PLR0912
         torch.cuda.empty_cache()
 
 
-def process_update(  # noqa: PLR0912
+def process_update(
     index_path: str,
     devices: list[str],
     torch_path: str,
@@ -310,16 +310,17 @@ def process_update(  # noqa: PLR0912
         update_metadata_db(index=index_path, metadata=metadata)
 
     # Rebuild index from scratch if below threshold
-    if num_documents_in_index <= start_from_scratch:
-        if os.path.exists(os.path.join(index_path, "embeddings.npy")):
-            existing_embeddings_np = np.load(
-                os.path.join(index_path, "embeddings.npy"),
-                allow_pickle=True,
-            )
-            existing_embeddings = [
-                torch.from_numpy(tensor) for tensor in existing_embeddings_np
-            ]
-            documents_embeddings = existing_embeddings + documents_embeddings
+    if num_documents_in_index <= start_from_scratch and os.path.exists(
+        os.path.join(index_path, "embeddings.npy")
+    ):
+        existing_embeddings_np = np.load(
+            os.path.join(index_path, "embeddings.npy"),
+            allow_pickle=True,
+        )
+        existing_embeddings = [
+            torch.from_numpy(tensor) for tensor in existing_embeddings_np
+        ]
+        documents_embeddings = existing_embeddings + documents_embeddings
 
         create_fn(
             documents_embeddings=documents_embeddings,
@@ -379,7 +380,11 @@ def process_update(  # noqa: PLR0912
             start_del_idx = num_documents_in_index - len(existing_buffer_embeddings)
             documents_to_delete = list(range(start_del_idx, num_documents_in_index))
             documents_embeddings = existing_buffer_embeddings + documents_embeddings
-            delete_fn(subset=documents_to_delete, _delete_metadata=False)
+            delete_fn(
+                subset=documents_to_delete,
+                _delete_metadata=False,
+                _delete_buffer=False,
+            )
 
         update_centroids(
             index_path=index_path,
@@ -424,7 +429,7 @@ def process_update(  # noqa: PLR0912
     # Buffer not reached - append to buffer and update without centroid expansion
     save_list_tensors_on_disk(
         path=os.path.join(index_path, "buffer.npy"),
-        tensors=documents_embeddings,
+        tensors=existing_buffer_embeddings + documents_embeddings,
     )
 
     fast_plaid_rust.update(

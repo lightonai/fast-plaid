@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import glob
+import json
 import math
 import os
 import threading
@@ -12,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     import types
 
+import numpy as np
 import torch
 from fast_plaid import fast_plaid_rust
 from filelock import FileLock
@@ -689,7 +691,7 @@ class FastPlaid:
         n_full_scores:
             The number of full scores to compute per query.
         n_ivf_probe:
-            The number of IVF clusters to probe during search.
+            The number of IVF clusters to probe.
         show_progress:
             Whether to display a progress bar during search.
         subset:
@@ -840,7 +842,12 @@ class FastPlaid:
         return all_results
 
     @torch.inference_mode()
-    def delete(self, subset: list[int], _delete_metadata: bool = True) -> "FastPlaid":
+    def delete(
+        self,
+        subset: list[int],
+        _delete_metadata: bool = True,
+        _delete_buffer: bool = True,
+    ) -> "FastPlaid":
         """Delete embeddings from an existing FastPlaid index.
 
         Args:
@@ -863,6 +870,76 @@ class FastPlaid:
             metadata_db_path = os.path.join(self.index, "metadata.db")
             if os.path.exists(metadata_db_path) and _delete_metadata:
                 delete(index=self.index, subset=subset)
+
+            # Get metadata to determine document counts
+            meta_path = os.path.join(self.index, "metadata.json")
+            num_documents = 0
+            if os.path.exists(meta_path):
+                with open(meta_path) as f:
+                    meta = json.load(f)
+                    num_documents = meta.get("num_documents", 0)
+
+            # Determine buffer size if buffer exists
+            buffer_path = os.path.join(self.index, "buffer.npy")
+            num_buffer_docs = 0
+            if os.path.exists(buffer_path):
+                buffer_np = np.load(buffer_path, allow_pickle=True)
+                num_buffer_docs = len(buffer_np)
+
+            # Buffer documents are the most recent ones (at the end)
+            buffer_start_idx = num_documents - num_buffer_docs
+
+            # Update embeddings.npy if it exists
+            embeddings_path = os.path.join(self.index, "embeddings.npy")
+            if os.path.exists(embeddings_path):
+                embeddings_np = np.load(embeddings_path, allow_pickle=True)
+                num_embeddings = len(embeddings_np)
+
+                # Filter subset to only include indices within embeddings range
+                embeddings_to_delete = {idx for idx in subset if idx < num_embeddings}
+
+                if embeddings_to_delete:
+                    # Keep embeddings that are NOT in the delete set
+                    remaining_embeddings = [
+                        torch.from_numpy(embeddings_np[i])
+                        for i in range(num_embeddings)
+                        if i not in embeddings_to_delete
+                    ]
+
+                    if remaining_embeddings:
+                        save_list_tensors_on_disk(
+                            path=embeddings_path,
+                            tensors=remaining_embeddings,
+                        )
+                    else:
+                        os.remove(embeddings_path)
+
+            # Update buffer.npy if it exists and contains documents to delete
+            if os.path.exists(buffer_path) and num_buffer_docs > 0:
+                # Calculate which subset indices fall within the buffer range
+                buffer_indices_to_delete = {
+                    idx - buffer_start_idx
+                    for idx in subset
+                    if buffer_start_idx <= idx < num_documents
+                }
+
+                if buffer_indices_to_delete:
+                    buffer_np = np.load(buffer_path, allow_pickle=True)
+
+                    # Keep buffer entries that are NOT in the delete set
+                    remaining_buffer = [
+                        torch.from_numpy(buffer_np[i])
+                        for i in range(num_buffer_docs)
+                        if i not in buffer_indices_to_delete
+                    ]
+
+                    if remaining_buffer:
+                        save_list_tensors_on_disk(
+                            path=buffer_path,
+                            tensors=remaining_buffer,
+                        )
+                    else:
+                        os.remove(buffer_path)
 
             new_indices = _reload_index(
                 index_path=self.index,

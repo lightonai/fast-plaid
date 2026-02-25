@@ -17,6 +17,7 @@ authors = [
 keywords = []
 classifiers = [
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.14",
   "Programming Language :: Rust",
   "Operating System :: OS Independent",
 ]

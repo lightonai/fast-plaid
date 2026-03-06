@@ -61,9 +61,7 @@ jobs:
           LIBTORCH_BYPASS_VERSION_CHECK: 1
           CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
           CIBW_MANYLINUX_ARM64_IMAGE: manylinux_2_28
-          CIBW_ENVIRONMENT: |
-            PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cpu/torch_stable.html"
-            PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
+          CIBW_ENVIRONMENT: 'PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cpu/torch_stable.html" PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1'
           CIBW_PIP_ARGS: "--no-cache-dir --no-build-isolation"
           CIBW_BEFORE_BUILD: "pip install torch==2.9.0 numpy maturin delvewheel"
           CIBW_REPAIR_WHEEL_COMMAND_LINUX: >

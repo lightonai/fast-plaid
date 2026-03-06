@@ -52,17 +52,16 @@ jobs:
           echo "PYTHON_VERSION_NO_DOT=$PYTHON_VERSION_NO_DOT" >> $GITHUB_OUTPUT
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@v2.23.3
+        uses: pypa/cibuildwheel@v3.3.1
         env:
+          CIBW_ENABLE: cpython-prerelease
           CIBW_BUILD: "cp${{ steps.prepare_python_version.outputs.PYTHON_VERSION_NO_DOT }}-*"
-          CIBW_SKIP: "*-manylinux_i686 *-musllinux_* *-win32"
+          CIBW_SKIP: "*-manylinux_i686 *-musllinux_* *-win32 cp314t-*"
           CIBW_BUILD_VERBOSITY: 1
           LIBTORCH_BYPASS_VERSION_CHECK: 1
           CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
           CIBW_MANYLINUX_ARM64_IMAGE: manylinux_2_28
-          CIBW_ENVIRONMENT: |
-            PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cpu/torch_stable.html"
-            PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
+          CIBW_ENVIRONMENT: 'PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cpu/torch_stable.html" PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1'
           CIBW_PIP_ARGS: --no-cache-dir
           CIBW_BEFORE_BUILD: "pip install torch==2.8.0 numpy maturin delvewheel"
           CIBW_REPAIR_WHEEL_COMMAND_LINUX: >

@@ -824,7 +824,9 @@ class TestMetadataDocumentCount:
             index.update(documents_embeddings=update_1_embeddings)
 
             expected_after_update_1 = initial_docs + update_1_docs
-            assert self._get_num_documents(test_index_path) == expected_after_update_1, (
+            assert (
+                self._get_num_documents(test_index_path) == expected_after_update_1
+            ), (
                 f"Expected {expected_after_update_1} documents after first update, "
                 f"got {self._get_num_documents(test_index_path)}"
             )
@@ -837,7 +839,9 @@ class TestMetadataDocumentCount:
             index.update(documents_embeddings=update_2_embeddings)
 
             expected_after_update_2 = expected_after_update_1 + update_2_docs
-            assert self._get_num_documents(test_index_path) == expected_after_update_2, (
+            assert (
+                self._get_num_documents(test_index_path) == expected_after_update_2
+            ), (
                 f"Expected {expected_after_update_2} documents after second update, "
                 f"got {self._get_num_documents(test_index_path)}"
             )
@@ -863,7 +867,9 @@ class TestMetadataDocumentCount:
             # Delete 1 document
             index.delete(subset=[5])
             expected_after_delete_1 = initial_docs - 1
-            assert self._get_num_documents(test_index_path) == expected_after_delete_1, (
+            assert (
+                self._get_num_documents(test_index_path) == expected_after_delete_1
+            ), (
                 f"Expected {expected_after_delete_1} documents after deleting 1 document, "
                 f"got {self._get_num_documents(test_index_path)}"
             )
@@ -871,7 +877,9 @@ class TestMetadataDocumentCount:
             # Delete 4 more documents
             index.delete(subset=[0, 3, 10, 15])
             expected_after_delete_2 = expected_after_delete_1 - 4
-            assert self._get_num_documents(test_index_path) == expected_after_delete_2, (
+            assert (
+                self._get_num_documents(test_index_path) == expected_after_delete_2
+            ), (
                 f"Expected {expected_after_delete_2} documents after deleting 4 documents, "
                 f"got {self._get_num_documents(test_index_path)}"
             )
@@ -1150,6 +1158,137 @@ class TestFilteringModule:
         # The new column should exist for all rows (None for old rows)
         assert "extra_field" in all_metadata[2], "extra_field not found in metadata"
         assert all_metadata[2]["extra_field"] == "value", "extra_field has wrong value"
+
+
+class TestInvertedIndex:
+    """Tests for inverted index on list-valued metadata fields."""
+
+    def test_create_and_where_any(self, test_index_path):
+        """List fields are auto-detected and queryable with where_any."""
+        metadata = [
+            {"name": "A", "foreign_ids": [2, 3, 4], "more_ids": [5, 6]},
+            {"name": "B", "foreign_ids": [1, 2], "more_ids": [5, 8]},
+            {"name": "C", "foreign_ids": [3, 5]},
+        ]
+        filtering.create(index=test_index_path, metadata=metadata)
+
+        assert filtering.where_any(
+            index=test_index_path, field="foreign_ids", values=[2, 5]
+        ) == [0, 1, 2]
+        assert (
+            filtering.where_any(index=test_index_path, field="foreign_ids", values=[99])
+            == []
+        )
+        assert filtering.where_any(
+            index=test_index_path, field="more_ids", values=[5]
+        ) == [0, 1]
+        assert filtering.where_any(
+            index=test_index_path, field="more_ids", values=[8]
+        ) == [1]
+
+    def test_where_all(self, test_index_path):
+        """where_all returns only docs containing ALL queried values."""
+        metadata = [
+            {"name": "A", "foreign_ids": [2, 3, 4], "more_ids": [5, 6]},
+            {"name": "B", "foreign_ids": [1, 2], "more_ids": [5, 7]},
+            {"name": "C", "foreign_ids": [2, 3, 5]},
+        ]
+        filtering.create(index=test_index_path, metadata=metadata)
+
+        assert filtering.where_all(
+            index=test_index_path, field="foreign_ids", values=[2, 3]
+        ) == [0, 2]
+        assert (
+            filtering.where_all(
+                index=test_index_path, field="foreign_ids", values=[2, 99]
+            )
+            == []
+        )
+        assert filtering.where_all(
+            index=test_index_path, field="more_ids", values=[5, 7]
+        ) == [1]
+
+    def test_get_deserializes_list_fields(self, test_index_path):
+        """get() returns list fields as Python lists, not JSON strings."""
+        metadata = [
+            {"name": "A", "ids": [10, 20], "more_ids": [5, 7]},
+            {"name": "B", "ids": None},
+        ]
+        filtering.create(index=test_index_path, metadata=metadata)
+
+        results = filtering.get(index=test_index_path)
+        assert results[0]["ids"] == [10, 20]
+        assert results[1]["ids"] is None
+        assert results[1]["more_ids"] is None
+
+    def test_update_extends_inverted_index(self, test_index_path):
+        """update() appends new entries to the inverted index."""
+        filtering.create(
+            index=test_index_path,
+            metadata=[{"name": "A", "ids": [1, 2]}],
+        )
+        filtering.update(
+            index=test_index_path,
+            metadata=[{"name": "B", "ids": [2, 3], "more_ids": [5, 7]}],
+        )
+
+        assert filtering.where_any(index=test_index_path, field="ids", values=[2]) == [
+            0,
+            1,
+        ]
+        assert filtering.where_any(index=test_index_path, field="ids", values=[3]) == [
+            1
+        ]
+        assert filtering.where_any(
+            index=test_index_path, field="more_ids", values=[5]
+        ) == [1]
+
+    def test_delete_rebuilds_inverted_index(self, test_index_path):
+        """delete() re-indexes the inverted index with new sequential IDs."""
+        metadata = [
+            {"name": "A", "ids": [1]},
+            {"name": "B", "ids": [2], "more_ids": [5, 7]},
+            {"name": "C", "ids": [1, 3]},
+        ]
+        filtering.create(index=test_index_path, metadata=metadata)
+
+        filtering.delete(index=test_index_path, subset=[1])
+        # After re-index: A→0, C→1
+
+        assert filtering.where_any(index=test_index_path, field="ids", values=[2]) == []
+        assert filtering.where_any(index=test_index_path, field="ids", values=[1]) == [
+            0,
+            1,
+        ]
+        assert filtering.where_any(index=test_index_path, field="ids", values=[3]) == [
+            1
+        ]
+        assert (
+            filtering.where_any(index=test_index_path, field="more_ids", values=[5])
+            == []
+        )
+
+    def test_combine_where_and_where_any(self, test_index_path):
+        """SQL where() and inverted where_any() can be combined via set ops."""
+        metadata = [
+            {"name": "A", "age": 30, "foreign_ids": [1, 2], "more_ids": [4, 5]},
+            {"name": "B", "age": 25, "foreign_ids": [2, 3], "more_ids": [5, 6]},
+            {"name": "C", "age": 35, "foreign_ids": [1, 3]},
+            {"name": "D", "age": 50, "foreign_ids": [1, 4], "more_ids": [4, 9]},
+        ]
+        filtering.create(index=test_index_path, metadata=metadata)
+
+        age_filter = filtering.where(
+            index=test_index_path, condition="age > ?", parameters=(28,)
+        )
+        foreign_filter = filtering.where_any(
+            index=test_index_path, field="foreign_ids", values=[1]
+        )
+        more_ids_filter = filtering.where_any(
+            index=test_index_path, field="more_ids", values=[4]
+        )
+        combined = sorted(set(age_filter) & set(foreign_filter) & set(more_ids_filter))
+        assert combined == [0, 3]
 
 
 # Legacy test function for backwards compatibility

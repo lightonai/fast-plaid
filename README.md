@@ -630,3 +630,41 @@ for match in scores:
 
 You can also rely on the existing subset parameter of the .search() method to filter candidates based
 on the order of insertion or rely on an external filtering system as providing the metadata parameter is optional.
+
+### List Fields (`where_any` / `where_all`)
+
+If your metadata contains list or tuple values (e.g. a list of foreign IDs per document), FastPlaid automatically detects them and builds an in-memory inverted index for fast lookups. No API changes are needed at creation time — just pass lists as values:
+
+```python
+metadata = [
+    {"name": "Alice", "foreign_ids": [2, 3, 4], "more_ids": [6, 7]},
+    {"name": "Bob", "foreign_ids": [1, 2], "more_ids": [6, 9]},
+    {"name": "Charlie", "foreign_ids": [3, 5]},
+    {"name": "David", "foreign_ids": [3, 5], "more_ids": [9, 8]},
+]
+
+fast_plaid.create(documents_embeddings=embeddings, metadata=metadata)
+```
+
+Then query with `where_any` (OR — documents matching **any** of the values) or `where_all` (AND — documents matching **all** of the values):
+
+```python
+# Documents with foreign_id 2 OR 5
+subset = filtering.where_any(index="my_index", field="foreign_ids", values=[2, 5])
+# → [0, 1, 2]
+
+# Documents with foreign_id 2 AND 3
+subset = filtering.where_all(index="my_index", field="foreign_ids", values=[2, 3, 4])
+# → [0]
+```
+
+These can be combined with standard SQL filters via set operations:
+
+```python
+recent = filtering.where(index="my_index", condition="join_date > ?", parameters=("2024-01-01",))
+by_foreign = filtering.where_any(index="my_index", field="foreign_ids", values=[3])
+by_more = filtering.where_any(index="my_index", field="more_ids", values=[9])
+subset = sorted(set(recent) & set(by_foreign) & set(by_more))
+
+scores = fast_plaid.search(queries_embeddings=query, top_k=5, subset=subset)
+```

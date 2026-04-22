@@ -35,4 +35,4 @@ jobs:
         run: |
           python -c "import torch; print('torch:', torch.__version__)"
           python -c "from fast_plaid import search; print('fast_plaid.search imported OK')"
-          python -c "from fast_plaid import fast_plaid_rust; print('fast_plaid_rust imported OK')"
+          python -c "import torch; from fast_plaid import fast_plaid_rust; print('fast_plaid_rust imported OK')"

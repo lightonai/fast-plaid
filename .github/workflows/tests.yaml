@@ -38,6 +38,9 @@ jobs:
       - name: Install dependencies and run common tests
         run: |
           uv pip install pytest pytest-cov
+          uv sync
+          uv pip list
+          uv run python -c "import torch; print('torch version:', torch.__version__)"
           uv run pytest tests/test.py
 
       - name: Run Ubuntu-specific tests

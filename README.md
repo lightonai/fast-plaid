@@ -98,9 +98,11 @@ import torch
 
 from fast_plaid import search
 
-fast_plaid = search.FastPlaid(index="index", device="cpu") # or "cuda" for GPU.
+fast_plaid = search.FastPlaid(index="index", device="cpu", low_memory=True) # or "cuda" for GPU.
 # Leave blank for auto-detect, including multi-GPU.
 # On CPU, specifying device speeds up initialization.
+# On GPU with spare VRAM, pass low_memory=False for significantly faster search but higher VRAM usage. 
+# The low_memory flag has no effect when device="cpu" and is set to True by default.
 
 embedding_dim = 128
 
@@ -243,14 +245,34 @@ for doc_id, score, token_scores in results[0]:
 
 &nbsp;
 
+## 🚀 Search Speed Tip: `low_memory=False`
+
+`low_memory` is a constructor flag on `FastPlaid` that controls **where the index lives at query time** on GPU devices. It defaults to `True` (VRAM-friendly), but for most production search workloads the real win is flipping it off. This parameter has no effect when `device="cpu"`.
+
+| Setting                      | VRAM                                               | Search Speed                                |
+| ---------------------------- | -------------------------------------------------- | ------------------------------------------- |
+| `low_memory=True` (default)  | Minimal — index tensors stream from CPU per query  | Slower                                      |
+| `low_memory=False`           | Higher — index tensors live on GPU                 | **Significantly faster queries-per-second** |
+
+```python
+# Default — low VRAM, slightly slower search
+fast_plaid = search.FastPlaid(index="index")
+
+# GPU-resident — higher VRAM, faster queries
+fast_plaid = search.FastPlaid(index="index", low_memory=False)
+```
+
+**If your index fits in VRAM, don't hesitate to try `low_memory=False`.** The speedup on high-QPS workloads is often substantial because you skip a host→device copy on every single query. Switch back if you hit OOM. The flag has no effect when `device="cpu"`.
+
+&nbsp;
+
 ## ⚖️ Settings Trade-offs
 
 ### Initialization
 
-```python
-Parameter         Default     Memory                        Speed                     Description
-low_memory       True        lower = less VRAM usage     True = slower   No effect when device is "cpu", only used when device is GPU. Load index tensors on CPU and move to device only when needed. Accelerate search at the cost of higher VRAM usage when False.
-```
+| Parameter    | Default | Memory            | Speed           | Notes                                                                                                                                                          |
+| ------------ | ------- | ----------------- | --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `low_memory` | `True`  | Lower = less VRAM | `True` = slower | 👉 See [Search Speed Tip](#-search-speed-tip-low_memoryfalse). If your index fits in GPU memory, set to `False` for faster search. No effect on CPU. |
 
 ### Indexing
 
@@ -379,7 +401,16 @@ device: str | list[str] | None = None
       Remember to include your code within an `if __name__ == "__main__":` block for proper multiprocessing behavior.
 
 low_memory: bool = True
-    If True, the index is loaded in a memory-efficient manner, keeping tensors on CPU and moving them to the target device only when needed. This reduces VRAM usage at the cost of some performance. No effect when device is "cpu".
+    Controls where the index lives at query time on GPU devices.
+
+    - True (default): index tensors stay on CPU and are moved to the GPU per
+      query. Lowest VRAM usage; slightly slower search.
+    - False: index tensors are loaded onto the GPU once and stay there.
+      Significantly faster queries-per-second when VRAM allows.
+
+    If your index fits in GPU memory, consider setting low_memory=False — the
+    speedup on high-QPS search workloads is often substantial. No effect when
+    device="cpu".
 
 ```
 
@@ -395,7 +426,7 @@ The **`create` method** builds the multi-vector index from your document embeddi
         max_points_per_centroid: int = 256,
         nbits: int = 4,
         n_samples_kmeans: int | None = None,
-        batch_size: int = 50_000,
+        batch_size: int = 25_000,
         seed: int = 42,
         use_triton_kmeans: bool | None = None,
         metadata: list[dict[str, Any]] | None = None,
@@ -427,7 +458,7 @@ n_samples_kmeans: int | None = None (optional)
     clustering quality. If you have a large dataset, you might want to set this to a
     smaller value to speed up the indexing process and save some memory.
 
-batch_size: int = 50_000 (optional)
+batch_size: int = 25_000 (optional)
     Batch size for processing embeddings during index creation.
 
 seed: int = 42 (optional)
@@ -456,7 +487,7 @@ The **`update` method** provides an efficient way to add new documents to an exi
         self,
         documents_embeddings: list[torch.Tensor] | torch.Tensor,
         metadata: list[dict[str, Any]] | None = None,
-        batch_size: int = 50_000,
+        batch_size: int = 25_000,
         kmeans_niters: int = 4,
         max_points_per_centroid: int = 256,
         n_samples_kmeans: int | None = None,
@@ -479,7 +510,7 @@ metadata: list[dict[str, Any]] | None = None
     If provided, the length of this list must match the number of new documents being added.
     The metadata will be stored in a SQLite database within the index directory for filtering during searches.
 
-batch_size: int = 50_000 (optional)
+batch_size: int = 25_000 (optional)
     Batch size for processing embeddings during the update.
 
 kmeans_niters: int = 4 (optional)

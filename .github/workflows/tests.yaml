@@ -37,6 +37,7 @@ jobs:
 
       - name: Install dependencies and run common tests
         run: |
+          uv sync
           uv pip install pytest pytest-cov
           uv run --no-sync python -c "import torch; print('torch version:', torch.__version__)"
           uv run --no-sync pytest tests/test.py

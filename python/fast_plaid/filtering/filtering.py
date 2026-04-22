@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import sqlite3
@@ -25,6 +26,177 @@ def _get_sql_type(value: Any) -> str:
     return "BLOB"
 
 
+def _is_list_value(value: Any) -> bool:
+    """Check if a value is a list or tuple (i.e. a multi-value field)."""
+    return isinstance(value, (list, tuple))
+
+
+def _detect_list_fields(metadata: list[dict[str, Any]]) -> set[str]:
+    """Scan metadata and return the set of field names that contain list values.
+
+    A field is considered a list field if ANY row has a list or tuple value for it.
+    """
+    list_fields: set[str] = set()
+    for item in metadata:
+        for key, value in item.items():
+            if value is not None and _is_list_value(value):
+                list_fields.add(key)
+    return list_fields
+
+
+def _inverted_index_path(index: str) -> str:
+    """Return the file path for the inverted index JSON file."""
+    return os.path.join(index, "metadata_inverted.json")
+
+
+def _load_inverted_index(index: str) -> dict[str, dict[str, list[int]]]:
+    """Load the inverted index from disk.
+
+    Returns an empty dict if the file does not exist.
+    """
+    path = _inverted_index_path(index)
+    if not os.path.exists(path):
+        return {}
+    with open(path) as f:
+        return json.load(f)
+
+
+def _save_inverted_index(index: str, inverted: dict[str, dict[str, list[int]]]) -> None:
+    """Save the inverted index to disk as a JSON file."""
+    path = _inverted_index_path(index)
+    with open(path, "w") as f:
+        json.dump(inverted, f, separators=(",", ":"))
+
+
+def _build_inverted_index(
+    metadata: list[dict[str, Any]],
+    list_fields: set[str],
+    start_id: int = 0,
+) -> dict[str, dict[str, list[int]]]:
+    """Build an inverted index from metadata for the given list fields.
+
+    Args:
+        metadata: The list of metadata dicts (one per document).
+        list_fields: The set of field names that are list-valued.
+        start_id: The _subset_ ID to assign to the first row.
+
+    Returns:
+        A dict mapping field_name -> {str(value): [subset_id, ...]}.
+
+    """
+    inverted: dict[str, dict[str, list[int]]] = {field: {} for field in list_fields}
+    for i, item in enumerate(metadata):
+        subset_id = start_id + i
+        for field in list_fields:
+            values = item.get(field)
+            if values is None or not _is_list_value(values):
+                continue
+            for v in values:
+                key = str(v)
+                if key not in inverted[field]:
+                    inverted[field][key] = []
+                inverted[field][key].append(subset_id)
+    return inverted
+
+
+def _merge_inverted_indices(
+    base: dict[str, dict[str, list[int]]],
+    new: dict[str, dict[str, list[int]]],
+) -> dict[str, dict[str, list[int]]]:
+    """Merge a new inverted index into a base inverted index (mutates base).
+
+    For each field and value, the new subset ID lists are appended to the base.
+    """
+    for field, mapping in new.items():
+        if field not in base:
+            base[field] = {}
+        for value_key, subset_ids in mapping.items():
+            if value_key not in base[field]:
+                base[field][value_key] = []
+            base[field][value_key].extend(subset_ids)
+    return base
+
+
+def _serialize_metadata_row(
+    item: dict[str, Any],
+    list_fields: set[str],
+) -> dict[str, Any]:
+    """Return a copy of the metadata item with list values serialized as JSON."""
+    row = {}
+    for key, value in item.items():
+        if key in list_fields and value is not None and _is_list_value(value):
+            row[key] = json.dumps(value)
+        else:
+            row[key] = value
+    return row
+
+
+def _get_list_field_names(index: str) -> set[str]:
+    """Return the set of list field names from the inverted index on disk.
+
+    Returns an empty set if no inverted index exists.
+    """
+    inverted = _load_inverted_index(index)
+    return set(inverted.keys())
+
+
+def _deserialize_list_fields_in_row(
+    row: dict[str, Any],
+    list_fields: set[str],
+) -> dict[str, Any]:
+    """Deserialize JSON-encoded list fields back to Python lists in a row dict."""
+    for field in list_fields:
+        if field in row and row[field] is not None and isinstance(row[field], str):
+            try:
+                row[field] = json.loads(row[field])
+            except (json.JSONDecodeError, ValueError):
+                pass
+    return row
+
+
+def _rebuild_inverted_index_from_db(
+    index: str,
+    list_fields: set[str],
+) -> dict[str, dict[str, list[int]]]:
+    """Rebuild the inverted index by reading list field columns from SQLite.
+
+    This is used after delete + re-index operations where _subset_ IDs have
+    changed and the inverted index must be reconstructed from scratch.
+    """
+    if not list_fields:
+        return {}
+
+    path = os.path.join(index, "metadata.db")
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    columns_to_select = ", ".join(['"_subset_"'] + [f'"{f}"' for f in list_fields])
+    cursor.execute(f"SELECT {columns_to_select} FROM METADATA ORDER BY _subset_")  # noqa: S608
+    rows = cursor.fetchall()
+    conn.close()
+
+    inverted: dict[str, dict[str, list[int]]] = {field: {} for field in list_fields}
+    for row in rows:
+        subset_id = row["_subset_"]
+        for field in list_fields:
+            raw_value = row[field]
+            if raw_value is None:
+                continue
+            try:
+                values = json.loads(raw_value)
+            except (json.JSONDecodeError, ValueError, TypeError):
+                continue
+            if not isinstance(values, list):
+                continue
+            for v in values:
+                key = str(v)
+                if key not in inverted[field]:
+                    inverted[field][key] = []
+                inverted[field][key].append(subset_id)
+    return inverted
+
+
 def create(
     index: str,
     metadata: list[dict[str, Any]],
@@ -32,6 +204,9 @@ def create(
     """Create a new SQLite database and table, erasing any existing one.
 
     It can handle standard Python types, including `date` and `datetime` objects.
+    List and tuple values are automatically detected and stored as JSON strings
+    in SQLite, with a companion inverted index file for fast lookups via
+    `where_any` and `where_all`.
 
     Args:
     ----
@@ -143,9 +318,17 @@ def create(
     if os.path.exists(path):
         os.remove(path)
 
+    # Also remove any existing inverted index
+    inv_path = _inverted_index_path(index)
+    if os.path.exists(inv_path):
+        os.remove(inv_path)
+
     if not metadata:
         print("Warning: No metadata provided. An empty database will be created.")
         return
+
+    # Detect list fields before anything else
+    list_fields = _detect_list_fields(metadata)
 
     # Collect all unique column names from the metadata, preserving insertion order
     all_keys: dict[str, None] = {}
@@ -164,12 +347,20 @@ def create(
             """.strip()
             raise ValueError(error)
 
-        # Find the first non-null value for the column to infer its type
-        value = next(
-            (item[col] for item in metadata if col in item and item[col] is not None),
-            None,
-        )
-        sql_type = _get_sql_type(value)
+        # List fields are always stored as TEXT (JSON-encoded strings)
+        if col in list_fields:
+            sql_type = "TEXT"
+        else:
+            # Find the first non-null value for the column to infer its type
+            value = next(
+                (
+                    item[col]
+                    for item in metadata
+                    if col in item and item[col] is not None
+                ),
+                None,
+            )
+            sql_type = _get_sql_type(value)
         col_defs.append(f'"{col}" {sql_type}')
 
     # Add the special _subset_ column as the primary key
@@ -190,14 +381,20 @@ def create(
 
     rows_to_insert = []
     for i, item in enumerate(metadata):
-        # The first value is the _subset_ id
-        row = [i] + [item.get(col) for col in columns]
+        serialized = _serialize_metadata_row(item, list_fields)
+        row = [i] + [serialized.get(col) for col in columns]
         rows_to_insert.append(tuple(row))
 
     cursor.executemany(insert_sql, rows_to_insert)
 
     conn.commit()
     conn.close()
+
+    # Build and save the inverted index for list fields
+    if list_fields:
+        inverted = _build_inverted_index(metadata, list_fields, start_id=0)
+        _save_inverted_index(index, inverted)
+
     message = f"""
     Database created at '{path}' with {len(metadata)} rows.
     """.strip()
@@ -215,6 +412,9 @@ def update(
     to add them. It then appends the new metadata records, automatically
     assigning incremented '_subset_' IDs.
 
+    List fields in the new metadata are auto-detected and merged into the
+    existing inverted index.
+
     Args:
     ----
         index: The path to the index directory containing the database.
@@ -224,6 +424,12 @@ def update(
     if not metadata:
         print("No metadata provided to update.")
         return
+
+    # Detect list fields in the new metadata and merge with existing ones
+    new_list_fields = _detect_list_fields(metadata)
+    existing_inverted = _load_inverted_index(index)
+    existing_list_fields = set(existing_inverted.keys())
+    all_list_fields = existing_list_fields | new_list_fields
 
     path = os.path.join(index, "metadata.db")
     conn = sqlite3.connect(path, detect_types=sqlite3.PARSE_DECLTYPES)
@@ -246,8 +452,14 @@ def update(
             """.strip()
             raise ValueError(error)
 
-        first_value = next((item[column] for item in metadata if column in item), None)
-        sql_type = _get_sql_type(first_value)
+        # List fields are always TEXT
+        if column in all_list_fields:
+            sql_type = "TEXT"
+        else:
+            first_value = next(
+                (item[column] for item in metadata if column in item), None
+            )
+            sql_type = _get_sql_type(first_value)
 
         alter_sql = f'ALTER TABLE METADATA ADD COLUMN "{column}" {sql_type}'
         cursor.execute(alter_sql)
@@ -272,13 +484,21 @@ def update(
     rows_to_insert = []
     for i, item in enumerate(metadata):
         new_id = start_id + i
-        # Use item.get(col) to handle missing keys gracefully (inserts NULL)
-        row = [new_id] + [item.get(col) for col in db_columns]
+        serialized = _serialize_metadata_row(item, all_list_fields)
+        row = [new_id] + [serialized.get(col) for col in db_columns]
         rows_to_insert.append(tuple(row))
 
     cursor.executemany(insert_sql, rows_to_insert)
     conn.commit()
     conn.close()
+
+    # Update the inverted index with the new rows
+    if all_list_fields:
+        new_inverted = _build_inverted_index(
+            metadata, all_list_fields, start_id=start_id
+        )
+        merged = _merge_inverted_indices(existing_inverted, new_inverted)
+        _save_inverted_index(index, merged)
 
 
 def delete(index: str, subset: list[int] | int) -> None:
@@ -286,7 +506,8 @@ def delete(index: str, subset: list[int] | int) -> None:
 
     After deleting the specified rows, this function recomputes the entire
     `_subset_` column for the remaining rows, ensuring it is sequential
-    and starts from 0.
+    and starts from 0. The inverted index (if any) is rebuilt from scratch
+    to reflect the new IDs.
 
     Args:
     ----
@@ -310,6 +531,9 @@ def delete(index: str, subset: list[int] | int) -> None:
     if not subset:
         print("0 rows deleted (empty subset provided).")
         return
+
+    # Load inverted index to know which fields are list fields
+    list_fields = _get_list_field_names(index)
 
     path = os.path.join(index, "metadata.db")
     conn = sqlite3.connect(path)
@@ -362,6 +586,12 @@ def delete(index: str, subset: list[int] | int) -> None:
         # Always close the connection.
         conn.close()
 
+    # Rebuild the inverted index from the re-indexed SQLite table.
+    # This is necessary because all _subset_ IDs have been reassigned.
+    if list_fields:
+        inverted = _rebuild_inverted_index_from_db(index, list_fields)
+        _save_inverted_index(index, inverted)
+
 
 def get(
     index: str,
@@ -372,7 +602,8 @@ def get(
     """Retrieve rows as a list of dictionaries, filtered by condition or subset.
 
     This function allows filtering by either a SQL `condition` or a list of
-    `_subset_` IDs.
+    `_subset_` IDs. List fields that were stored as JSON strings are
+    automatically deserialized back to Python lists.
 
     **Ordering behavior:**
     - If `subset` is provided: Returns rows ordered exactly as they appear in the
@@ -437,6 +668,11 @@ def get(
         # Retrieve items in the order of 'subset', skipping any that weren't found
         results = [results_map[i] for i in subset if i in results_map]
 
+    # Deserialize list fields back to Python lists
+    list_fields = _get_list_field_names(index)
+    if list_fields:
+        results = [_deserialize_list_fields_in_row(row, list_fields) for row in results]
+
     return results
 
 
@@ -476,3 +712,117 @@ def where(
     results = [row[0] for row in cursor.fetchall()]
     conn.close()
     return results
+
+
+def where_any(
+    index: str,
+    field: str,
+    values: list[Any],
+) -> list[int]:
+    """Retrieve _subset_ IDs where the list field contains ANY of the given values.
+
+    This uses the pre-built inverted index for O(1)-per-value lookups.
+    The result is the union of all document sets (OR semantics).
+
+    Args:
+    ----
+        index: The path to the index directory.
+        field: The name of the list field to query (e.g. ``"foreign_ids"``).
+        values: A list of values to search for. A document is included if its
+            list contains **at least one** of these values.
+
+    Returns:
+    -------
+        A sorted list of `_subset_` IDs matching the condition.
+
+    """
+    inv_path = _inverted_index_path(index)
+    if not os.path.exists(inv_path):
+        error = (
+            "No inverted index found. This index has no list fields, "
+            "or was created before inverted index support was added."
+        )
+        raise FileNotFoundError(error)
+
+    inverted = _load_inverted_index(index)
+
+    if field not in inverted:
+        available = list(inverted.keys()) if inverted else []
+        error = (
+            f"Field '{field}' is not a known list field. "
+            f"Available list fields: {available}"
+        )
+        raise KeyError(error)
+
+    field_index = inverted[field]
+
+    result_set: set[int] = set()
+    for v in values:
+        key = str(v)
+        if key in field_index:
+            result_set.update(field_index[key])
+
+    return sorted(result_set)
+
+
+def where_all(
+    index: str,
+    field: str,
+    values: list[Any],
+) -> list[int]:
+    """Retrieve _subset_ IDs where the list field contains ALL of the given values.
+
+    This uses the pre-built inverted index for O(1)-per-value lookups.
+    The result is the intersection of all document sets (AND semantics).
+
+    Args:
+    ----
+        index: The path to the index directory.
+        field: The name of the list field to query (e.g. ``"foreign_ids"``).
+        values: A list of values to search for. A document is included only if
+            its list contains **every one** of these values.
+
+    Returns:
+    -------
+        A sorted list of `_subset_` IDs matching the condition.
+
+    """
+    inv_path = _inverted_index_path(index)
+    if not os.path.exists(inv_path):
+        error = (
+            "No inverted index found. This index has no list fields, "
+            "or was created before inverted index support was added."
+        )
+        raise FileNotFoundError(error)
+
+    inverted = _load_inverted_index(index)
+
+    if field not in inverted:
+        available = list(inverted.keys()) if inverted else []
+        error = (
+            f"Field '{field}' is not a known list field. "
+            f"Available list fields: {available}"
+        )
+        raise KeyError(error)
+
+    if not values:
+        return []
+
+    field_index = inverted[field]
+
+    result_set: set[int] | None = None
+    for v in values:
+        key = str(v)
+        if key in field_index:
+            ids = set(field_index[key])
+        else:
+            # If any value has no matches, intersection is empty
+            return []
+        if result_set is None:
+            result_set = ids
+        else:
+            result_set &= ids
+        if not result_set:
+            return []
+
+    return sorted(result_set) if result_set else []

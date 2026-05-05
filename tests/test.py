@@ -973,6 +973,32 @@ class TestScoreConsistency:
             f"Inconsistent results: {doc_ids_1} != {doc_ids_2}"
         )
 
+    def test_same_seed_gives_same_index(self, test_index_path):
+        """Two independently-built indices with the same seed must return identical results."""
+        rng = torch.Generator()
+        rng.manual_seed(0)
+        documents_embeddings = [torch.randn(30 + (i % 20), 128, generator=rng) for i in range(200)]
+        queries = torch.randn(10, 25, 128, generator=rng)
+
+        path_b = test_index_path + "_b"
+        os.makedirs(path_b)
+
+        index_a = search.FastPlaid(index=test_index_path, device="cpu")
+        index_a.create(documents_embeddings=documents_embeddings, kmeans_niters=4, seed=42, n_samples_kmeans=50)
+        results_a = index_a.search(queries_embeddings=queries, top_k=10)
+        index_a.close()
+
+        index_b = search.FastPlaid(index=path_b, device="cpu")
+        index_b.create(documents_embeddings=documents_embeddings, kmeans_niters=4, seed=42, n_samples_kmeans=50)
+        results_b = index_b.search(queries_embeddings=queries, top_k=10)
+        index_b.close()
+        shutil.rmtree(path_b)
+
+        for q, (ra, rb) in enumerate(zip(results_a, results_b)):
+            ids_a = [doc_id for doc_id, _ in ra]
+            ids_b = [doc_id for doc_id, _ in rb]
+            assert ids_a == ids_b, f"query {q}: non-deterministic results {ids_a} != {ids_b}"
+
 
 class TestMetadataDocumentCount:
     """Tests for exact document count in metadata.json."""

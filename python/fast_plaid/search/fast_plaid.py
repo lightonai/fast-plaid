@@ -114,8 +114,11 @@ def compute_kmeans(
 
     n_samples_kmeans = min(num_documents, n_samples_kmeans)
 
+    # Use a local Generator to avoid clobbering the global torch RNG state in library code.
+    generator = torch.Generator()
+    generator.manual_seed(seed)
     # Memory optimization: Use torch.randperm for efficient sampling
-    sampled_indices = torch.randperm(num_documents)[:n_samples_kmeans]
+    sampled_indices = torch.randperm(num_documents, generator=generator)[:n_samples_kmeans]
 
     if isinstance(documents_embeddings, torch.Tensor):
         # Indexing a tensor directly is a view-operation or efficient gather

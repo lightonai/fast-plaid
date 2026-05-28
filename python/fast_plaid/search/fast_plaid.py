@@ -708,7 +708,9 @@ class FastPlaid:
                             pass
 
             meta["frozen"] = True
-            with open(meta_path, "w") as f:
+            # newline="\n" prevents Windows text-mode translation; Rust's
+            # serde_json::to_writer_pretty always uses \n regardless of platform.
+            with open(meta_path, "w", newline="\n") as f:
                 json.dump(meta, f, indent=2)
 
             self._update_mtime()
@@ -828,7 +830,7 @@ class FastPlaid:
 
             # Drop the frozen marker entirely to restore byte-identical metadata.
             meta.pop("frozen", None)
-            with open(meta_path, "w") as f:
+            with open(meta_path, "w", newline="\n") as f:
                 json.dump(meta, f, indent=2)
 
             self._update_mtime()

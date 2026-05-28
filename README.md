@@ -184,6 +184,12 @@ This approach balances efficiency with accuracy: small updates are fast, while l
 
 &nbsp;
 
+## 🧊 Freezing a Read-Only Index
+
+Once you no longer plan to mutate an index, call `fast_plaid.freeze()` to drop the per-shard `{i}.codes.npy` / `{i}.residuals.npy` files and keep only the merged storage, roughly halving on-disk size with no impact on search. The change is reversible via `fast_plaid.unfreeze()`, which rebuilds the shards byte-for-byte from the merged file.
+
+&nbsp;
+
 ## 🔎 Filtering
 
 You can restrict your search to a specific subset of documents by using the `subset` parameter in the `.search()` method. This is useful for implementing metadata filtering or searching within a pre-defined collection.

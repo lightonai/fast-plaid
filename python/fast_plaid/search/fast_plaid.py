@@ -709,9 +709,131 @@ class FastPlaid:
 
             meta["frozen"] = True
             with open(meta_path, "w") as f:
-                json.dump(meta, f)
+                json.dump(meta, f, indent=2)
 
             self._update_mtime()
+
+        return self
+
+    @staticmethod
+    def _write_tch_compatible_npy(path: str, arr: np.ndarray) -> None:
+        """Write a .npy file byte-identical to ``tch::Tensor::write_npy``.
+
+        Differs from ``np.save`` in two places:
+
+        - Multi-dim shapes are formatted ``(R,C,)`` (Rust style: trailing
+          comma, no spaces), not ``(R, C)``.
+        - Byte order is always ``<`` even for 1-byte types (numpy uses ``|``).
+        - The header is padded so the prologue (10 + header) is a multiple
+          of 16, matching tch's alignment.
+        """
+        arr = np.ascontiguousarray(arr)
+        kind_size = arr.dtype.kind + str(arr.dtype.itemsize)
+        descr = f"<{kind_size}"
+
+        if arr.ndim == 1:
+            shape_str = f"({arr.shape[0]},)"
+        else:
+            shape_str = "(" + ",".join(str(s) for s in arr.shape) + ",)"
+
+        header_body = (
+            f"{{'descr': '{descr}', 'fortran_order': False, "
+            f"'shape': {shape_str}, }}"
+        )
+
+        prologue_fixed = 10  # magic(6) + version(2) + header_len_field(2)
+        body_with_newline = len(header_body) + 1
+        target = ((prologue_fixed + body_with_newline + 15) // 16) * 16
+        pad = target - prologue_fixed - body_with_newline
+
+        header = header_body + (" " * pad) + "\n"
+        header_bytes = header.encode("ascii")
+
+        with open(path, "wb") as f:
+            f.write(b"\x93NUMPY\x01\x00")
+            f.write(len(header_bytes).to_bytes(2, "little"))
+            f.write(header_bytes)
+            f.write(arr.tobytes())
+
+    def unfreeze(self) -> "FastPlaid":
+        """Rebuild per-shard codes/residuals from the merged file.
+
+        Inverse of ``freeze()``. Slices ``merged_codes.npy`` / ``merged_residuals.npy``
+        back into ``{i}.codes.npy`` / ``{i}.residuals.npy`` according to each
+        shard's ``doclens.{i}.json``, then clears the ``frozen`` flag.
+
+        Restores the ability to call ``update()`` / ``delete()``.
+        """
+        with self.lock:
+            meta_path = os.path.join(self.index, "metadata.json")
+            if not os.path.exists(meta_path):
+                error = f"No index found at {self.index} to unfreeze."
+                raise FileNotFoundError(error)
+
+            with open(meta_path) as f:
+                meta = json.load(f)
+
+            if not meta.get("frozen", False):
+                return self
+
+            num_chunks = meta.get("num_chunks", 0)
+
+            merged_codes_path = os.path.join(self.index, "merged_codes.npy")
+            merged_residuals_path = os.path.join(self.index, "merged_residuals.npy")
+            for merged_path in (merged_codes_path, merged_residuals_path):
+                if not os.path.exists(merged_path):
+                    error = (
+                        f"Cannot unfreeze: {merged_path} missing — index data is gone."
+                    )
+                    raise FileNotFoundError(error)
+
+            # Release any open mmaps on the merged files before we read them.
+            with self._index_swap_lock:
+                self.indices.clear()
+            gc.collect()
+
+            codes_mmap = np.load(merged_codes_path, mmap_mode="r")
+            residuals_mmap = np.load(merged_residuals_path, mmap_mode="r")
+
+            offset = 0
+            for i in range(num_chunks):
+                doclens_path = os.path.join(self.index, f"doclens.{i}.json")
+                if not os.path.exists(doclens_path):
+                    error = f"Cannot unfreeze: {doclens_path} missing."
+                    raise FileNotFoundError(error)
+                with open(doclens_path) as f:
+                    chunk_doclens = json.load(f)
+                chunk_rows = sum(chunk_doclens)
+
+                chunk_codes = np.ascontiguousarray(
+                    codes_mmap[offset : offset + chunk_rows]
+                )
+                chunk_residuals = np.ascontiguousarray(
+                    residuals_mmap[offset : offset + chunk_rows]
+                )
+
+                self._write_tch_compatible_npy(
+                    os.path.join(self.index, f"{i}.codes.npy"),
+                    chunk_codes,
+                )
+                self._write_tch_compatible_npy(
+                    os.path.join(self.index, f"{i}.residuals.npy"),
+                    chunk_residuals,
+                )
+
+                offset += chunk_rows
+
+            del codes_mmap, residuals_mmap
+            gc.collect()
+
+            # Drop the frozen marker entirely to restore byte-identical metadata.
+            meta.pop("frozen", None)
+            with open(meta_path, "w") as f:
+                json.dump(meta, f, indent=2)
+
+            self._update_mtime()
+            # Reload so the in-memory indices reflect the restored shard layout.
+            self._reload_under_lock(Path(meta_path).stat().st_mtime)
 
         return self
 

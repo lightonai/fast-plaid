@@ -1477,6 +1477,110 @@ class TestFreeze:
         finally:
             index.close()
 
+    def test_freeze_unfreeze_roundtrip_byte_identical(self, tmp_path):
+        """freeze() then unfreeze() must restore every file byte-for-byte.
+
+        Build an index with several shards, snapshot its directory, then
+        freeze and unfreeze the original. Every file in the unfrozen index
+        must match the snapshot exactly (modulo merged_*.manifest.json,
+        which is a cache of mtimes regenerated on load).
+        """
+        import filecmp
+        import gc
+        import shutil
+
+        original_path = str(tmp_path / "original")
+        snapshot_path = str(tmp_path / "snapshot")
+        os.makedirs(original_path, exist_ok=True)
+
+        try:
+            index = search.FastPlaid(index=original_path, device="cpu")
+            # Force several shards so the roundtrip exercises real chunking.
+            documents_embeddings = [
+                torch.randn(80, 128, device="cpu") for _ in range(120)
+            ]
+            index.create(
+                documents_embeddings=documents_embeddings,
+                kmeans_niters=4,
+                batch_size=40,
+            )
+            index.close()
+            gc.collect()
+
+            # Snapshot the pristine on-disk index.
+            shutil.copytree(original_path, snapshot_path)
+
+            # Round-trip: freeze then unfreeze the original.
+            index = search.FastPlaid(index=original_path, device="cpu")
+            index.freeze()
+            index.unfreeze()
+            index.close()
+            gc.collect()
+
+            # Manifests are mtime caches, not source data; ignored intentionally.
+            ignored = {"merged_codes.manifest.json", "merged_residuals.manifest.json"}
+
+            original_files = {
+                f for f in os.listdir(original_path) if f not in ignored
+            }
+            snapshot_files = {
+                f for f in os.listdir(snapshot_path) if f not in ignored
+            }
+            assert original_files == snapshot_files, (
+                f"file set diverged: only-in-original={original_files - snapshot_files}, "
+                f"only-in-snapshot={snapshot_files - original_files}"
+            )
+
+            mismatches = []
+            for name in sorted(original_files):
+                a = os.path.join(original_path, name)
+                b = os.path.join(snapshot_path, name)
+                if not filecmp.cmp(a, b, shallow=False):
+                    mismatches.append(name)
+
+            assert mismatches == [], (
+                f"freeze/unfreeze roundtrip changed file bytes: {mismatches}"
+            )
+        finally:
+            shutil.rmtree(original_path, ignore_errors=True)
+            shutil.rmtree(snapshot_path, ignore_errors=True)
+
+    def test_unfreeze_restores_update_capability(self, test_index_path):
+        """After unfreeze() the index must accept update() again."""
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+
+        try:
+            documents_embeddings = [
+                torch.randn(60, 128, device="cpu") for _ in range(40)
+            ]
+            index.create(documents_embeddings=documents_embeddings, kmeans_niters=4)
+            index.freeze()
+            index.unfreeze()
+
+            new_embeddings = [torch.randn(60, 128, device="cpu") for _ in range(10)]
+            index.update(documents_embeddings=new_embeddings)
+
+            queries = torch.randn(2, 30, 128, device="cpu")
+            results = index.search(queries_embeddings=queries, top_k=10)
+            for query_results in results:
+                for doc_id, _ in query_results:
+                    assert 0 <= doc_id < 50
+        finally:
+            index.close()
+
+    def test_unfreeze_idempotent(self, test_index_path):
+        """Calling unfreeze() on a non-frozen index is a no-op."""
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+
+        try:
+            documents_embeddings = [
+                torch.randn(60, 128, device="cpu") for _ in range(40)
+            ]
+            index.create(documents_embeddings=documents_embeddings, kmeans_niters=4)
+            index.unfreeze()  # never frozen → no-op, must not raise
+        finally:
+            index.close()
+
 
 # Legacy test function for backwards compatibility
 def test():

@@ -637,6 +637,84 @@ class FastPlaid:
         return self
 
     @torch.inference_mode()
+    def _assert_not_frozen(self, operation: str) -> None:
+        """Refuse mutating operations on a frozen index.
+
+        A frozen index has had its per-shard ``{i}.codes.npy`` /
+        ``{i}.residuals.npy`` files deleted, so ``update`` and ``delete``
+        (which operate per shard) can't run without re-sharding first.
+        """
+        meta_path = os.path.join(self.index, "metadata.json")
+        if not os.path.exists(meta_path):
+            return
+        with open(meta_path) as f:
+            meta = json.load(f)
+        if meta.get("frozen", False):
+            error = (
+                f"Cannot {operation} a frozen index. "
+                f"Re-create the index from source embeddings if mutation is needed."
+            )
+            raise RuntimeError(error)
+
+    def freeze(self) -> "FastPlaid":
+        """Drop per-shard codes/residuals to halve on-disk storage.
+
+        After indexing, FastPlaid keeps both the per-shard files
+        (``{i}.codes.npy``, ``{i}.residuals.npy``) used by ``update``/``delete``
+        and a merged file (``merged_codes.npy``, ``merged_residuals.npy``) used
+        at search time. For a read-only index the shards are redundant.
+
+        ``freeze()`` ensures the merged file is up to date, then deletes every
+        per-shard ``codes``/``residuals`` file and writes ``"frozen": true``
+        into ``metadata.json``. Subsequent ``update``/``delete`` calls raise.
+        Search is unaffected and reloads become slightly faster (the chunk scan
+        is skipped).
+
+        This is irreversible without re-indexing from the source embeddings.
+        """
+        with self.lock:
+            meta_path = os.path.join(self.index, "metadata.json")
+            if not os.path.exists(meta_path):
+                error = f"No index found at {self.index} to freeze."
+                raise FileNotFoundError(error)
+
+            # Force a reload so the merged file reflects the current shards.
+            self._reload_under_lock(Path(meta_path).stat().st_mtime)
+
+            with open(meta_path) as f:
+                meta = json.load(f)
+
+            if meta.get("frozen", False):
+                return self
+
+            num_chunks = meta.get("num_chunks", 0)
+
+            for suffix in ("codes", "residuals"):
+                merged_path = os.path.join(self.index, f"merged_{suffix}.npy")
+                if not os.path.exists(merged_path):
+                    error = (
+                        f"Cannot freeze: {merged_path} does not exist. "
+                        f"Load the index at least once before freezing."
+                    )
+                    raise FileNotFoundError(error)
+
+            for i in range(num_chunks):
+                for suffix in ("codes", "residuals"):
+                    shard_path = os.path.join(self.index, f"{i}.{suffix}.npy")
+                    if os.path.exists(shard_path):
+                        try:
+                            os.remove(shard_path)
+                        except OSError:
+                            pass
+
+            meta["frozen"] = True
+            with open(meta_path, "w") as f:
+                json.dump(meta, f)
+
+            self._update_mtime()
+
+        return self
+
     def update(
         self,
         documents_embeddings: list[torch.Tensor] | torch.Tensor,
@@ -679,6 +757,7 @@ class FastPlaid:
         """
         # Exclusive Lock for Modification
         with self.lock:
+            self._assert_not_frozen("update")
             # Get current indices snapshot for the update operation
             with self._index_swap_lock:
                 current_indices = dict(self.indices)
@@ -1059,6 +1138,7 @@ class FastPlaid:
         """
         # Exclusive Lock for Modification
         with self.lock:
+            self._assert_not_frozen("delete from")
             primary_device = self.devices[0]
 
             fast_plaid_rust.delete(

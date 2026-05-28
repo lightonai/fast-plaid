@@ -1352,6 +1352,132 @@ class TestFilteringModule:
         assert all_metadata[2]["extra_field"] == "value", "extra_field has wrong value"
 
 
+class TestFreeze:
+    """Tests for the freeze() API that drops per-shard codes/residuals."""
+
+    def test_freeze_removes_shards_and_search_still_works(self, test_index_path):
+        """freeze() deletes per-shard files but search results stay identical."""
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+
+        try:
+            documents_embeddings = [
+                torch.randn(100, 128, device="cpu") for _ in range(80)
+            ]
+            queries_embeddings = torch.randn(5, 30, 128, device="cpu")
+
+            index.create(documents_embeddings=documents_embeddings, kmeans_niters=4)
+            results_before = index.search(
+                queries_embeddings=queries_embeddings, top_k=10
+            )
+
+            # Shards must exist before freeze.
+            shard_files_before = [
+                f
+                for f in os.listdir(test_index_path)
+                if f.endswith(".codes.npy") and not f.startswith("merged_")
+            ]
+            assert len(shard_files_before) > 0, "expected per-shard codes files"
+
+            index.freeze()
+
+            # Shards gone, merged files retained.
+            shard_files_after = [
+                f
+                for f in os.listdir(test_index_path)
+                if f.endswith(".codes.npy") and not f.startswith("merged_")
+            ]
+            assert shard_files_after == [], (
+                f"expected all shard codes files deleted, got {shard_files_after}"
+            )
+            assert os.path.exists(os.path.join(test_index_path, "merged_codes.npy"))
+            assert os.path.exists(
+                os.path.join(test_index_path, "merged_residuals.npy")
+            )
+
+            results_after = index.search(
+                queries_embeddings=queries_embeddings, top_k=10
+            )
+            assert results_before == results_after, (
+                "freeze() must not change search results"
+            )
+        finally:
+            index.close()
+
+    def test_freeze_persists_across_reload(self, test_index_path):
+        """A frozen index reloads correctly from disk in a fresh instance."""
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+
+        try:
+            documents_embeddings = [
+                torch.randn(80, 128, device="cpu") for _ in range(60)
+            ]
+            queries_embeddings = torch.randn(3, 30, 128, device="cpu")
+
+            index.create(documents_embeddings=documents_embeddings, kmeans_niters=4)
+            index.freeze()
+            results_before = index.search(
+                queries_embeddings=queries_embeddings, top_k=10
+            )
+        finally:
+            index.close()
+
+        reloaded = search.FastPlaid(index=test_index_path, device="cpu")
+        try:
+            results_after = reloaded.search(
+                queries_embeddings=queries_embeddings, top_k=10
+            )
+            assert results_before == results_after
+        finally:
+            reloaded.close()
+
+    def test_freeze_update_raises(self, test_index_path):
+        """update() on a frozen index must fail loudly rather than corrupt it."""
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+
+        try:
+            documents_embeddings = [
+                torch.randn(60, 128, device="cpu") for _ in range(40)
+            ]
+            index.create(documents_embeddings=documents_embeddings, kmeans_niters=4)
+            index.freeze()
+
+            new_embeddings = [torch.randn(60, 128, device="cpu") for _ in range(10)]
+            with pytest.raises(RuntimeError, match="frozen"):
+                index.update(documents_embeddings=new_embeddings)
+        finally:
+            index.close()
+
+    def test_freeze_delete_raises(self, test_index_path):
+        """delete() on a frozen index must fail loudly."""
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+
+        try:
+            documents_embeddings = [
+                torch.randn(60, 128, device="cpu") for _ in range(40)
+            ]
+            index.create(documents_embeddings=documents_embeddings, kmeans_niters=4)
+            index.freeze()
+
+            with pytest.raises(RuntimeError, match="frozen"):
+                index.delete(subset=[0, 1, 2])
+        finally:
+            index.close()
+
+    def test_freeze_idempotent(self, test_index_path):
+        """Calling freeze() twice should be a no-op the second time."""
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+
+        try:
+            documents_embeddings = [
+                torch.randn(60, 128, device="cpu") for _ in range(40)
+            ]
+            index.create(documents_embeddings=documents_embeddings, kmeans_niters=4)
+            index.freeze()
+            index.freeze()  # second call: must not raise
+        finally:
+            index.close()
+
+
 # Legacy test function for backwards compatibility
 def test():
     """Ensure that the Fast-PLAiD search index can be created and queried correctly."""

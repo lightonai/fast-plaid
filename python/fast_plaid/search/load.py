@@ -217,6 +217,28 @@ def _get_merged_mmap(  # noqa: PLR0912
     return torch.from_numpy(arr).to(device=device, dtype=dtype)
 
 
+def _mmap_frozen_tensor(
+    name_suffix: str,
+    dtype: torch.dtype,
+    device: str,
+    index_path: str,
+) -> torch.Tensor:
+    """Load a pre-existing merged_*.npy directly via mmap, with no chunk scan.
+
+    Used when the index is marked ``frozen``: the per-shard files have been
+    dropped, so the merged file is the sole source of truth.
+    """
+    merged_path = os.path.join(index_path, f"merged_{name_suffix}.npy")
+    if not os.path.exists(merged_path):
+        error = (
+            f"Frozen index is missing {merged_path}. "
+            f"The merged file is required when per-shard files have been dropped."
+        )
+        raise FileNotFoundError(error)
+    arr = np.load(merged_path, mmap_mode="c")
+    return torch.from_numpy(arr).to(device=device, dtype=dtype)
+
+
 def _load_index_tensors_cpu(index_path: str) -> dict[str, Any] | None:
     """Load index data into CPU tensors.
 
@@ -236,6 +258,7 @@ def _load_index_tensors_cpu(index_path: str) -> dict[str, Any] | None:
         metadata = json.load(f)
 
     num_chunks = metadata["num_chunks"]
+    frozen = metadata.get("frozen", False)
     device = "cpu"
 
     data = {
@@ -299,25 +322,39 @@ def _load_index_tensors_cpu(index_path: str) -> dict[str, Any] | None:
     last_len = all_doc_lens[-1] if all_doc_lens else 0
     padding_needed = max(0, max_len - last_len)
 
-    data["doc_codes"] = _get_merged_mmap(
-        name_suffix="codes",
-        dtype=torch.int64,
-        numpy_dtype=np.int64,
-        padding_needed=padding_needed,
-        device=device,
-        index_path=index_path,
-        num_chunks=num_chunks,
-    )
+    if frozen:
+        data["doc_codes"] = _mmap_frozen_tensor(
+            name_suffix="codes",
+            dtype=torch.int64,
+            device=device,
+            index_path=index_path,
+        )
+        data["doc_residuals"] = _mmap_frozen_tensor(
+            name_suffix="residuals",
+            dtype=torch.uint8,
+            device=device,
+            index_path=index_path,
+        )
+    else:
+        data["doc_codes"] = _get_merged_mmap(
+            name_suffix="codes",
+            dtype=torch.int64,
+            numpy_dtype=np.int64,
+            padding_needed=padding_needed,
+            device=device,
+            index_path=index_path,
+            num_chunks=num_chunks,
+        )
 
-    data["doc_residuals"] = _get_merged_mmap(
-        name_suffix="residuals",
-        dtype=torch.uint8,
-        numpy_dtype=np.uint8,
-        padding_needed=padding_needed,
-        device=device,
-        index_path=index_path,
-        num_chunks=num_chunks,
-    )
+        data["doc_residuals"] = _get_merged_mmap(
+            name_suffix="residuals",
+            dtype=torch.uint8,
+            numpy_dtype=np.uint8,
+            padding_needed=padding_needed,
+            device=device,
+            index_path=index_path,
+            num_chunks=num_chunks,
+        )
 
     return data
 

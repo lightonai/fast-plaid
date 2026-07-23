@@ -726,7 +726,7 @@ class FastPlaid:
             # per-device GPU loads to the first search (all-None entries reload lazily).
             _load_index_tensors_cpu(index_path=self.index)
             with self._index_swap_lock:
-                self.indices = {device: None for device in self.devices}
+                self.indices = dict.fromkeys(self.devices)
                 self._update_mtime()
 
         return self
@@ -834,8 +834,7 @@ class FastPlaid:
             shape_str = "(" + ",".join(str(s) for s in arr.shape) + ",)"
 
         header_body = (
-            f"{{'descr': '{descr}', 'fortran_order': False, "
-            f"'shape': {shape_str}, }}"
+            f"{{'descr': '{descr}', 'fortran_order': False, 'shape': {shape_str}, }}"
         )
 
         prologue_fixed = 10  # magic(6) + version(2) + header_len_field(2)

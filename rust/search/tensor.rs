@@ -190,6 +190,22 @@ impl StridedTensor {
         strides
     }
 
+    /// Creates a `StridedTensor` whose (tiny) length tensors live on `lengths_device`, so
+    /// per-query sorting and chunk planning stay on the search device when data is CPU-resident.
+    pub fn new_with_lengths_device(
+        data: Tensor,
+        lengths: Tensor,
+        storage_device: Device,
+        lengths_device: Device,
+    ) -> Self {
+        let mut built = Self::new(data, lengths, storage_device);
+        if lengths_device != storage_device {
+            built.element_lengths = built.element_lengths.to_device(lengths_device);
+            built.cumulative_lengths = built.cumulative_lengths.to_device(lengths_device);
+        }
+        built
+    }
+
     /// Creates a new `StridedTensor`.
     ///
     /// This constructor initializes the structure by preparing the data for efficient
@@ -298,8 +314,10 @@ impl StridedTensor {
     /// A tuple containing the `(data, lengths)` on the `target_device`.
     pub fn lookup(&self, indices: &Tensor, target_device: Device) -> (Tensor, Tensor) {
         let storage_device = self.underlying_data.device();
+        // Length/offset math runs where the lengths live; only the small offsets move for the gather.
+        let lengths_device = self.element_lengths.device();
 
-        let indices_local = indices.to_device(storage_device).to_kind(Kind::Int64);
+        let indices_local = indices.to_device(lengths_device).to_kind(Kind::Int64);
 
         if indices_local.numel() == 0 {
             let mut empty_shape = vec![0];
@@ -342,9 +360,11 @@ impl StridedTensor {
             )
         });
 
-        // Select data and apply mask
-        let strided_data = view.index_select(0, &selected_offsets);
-        let mask = crate::search::tensor::create_mask(&selected_lengths, chosen_stride, None)
+        // Select data and apply mask (on the storage device)
+        let offsets_for_gather = selected_offsets.to_device(storage_device);
+        let lengths_for_mask = selected_lengths.to_device(storage_device);
+        let strided_data = view.index_select(0, &offsets_for_gather);
+        let mask = crate::search::tensor::create_mask(&lengths_for_mask, chosen_stride, None)
             .to_kind(Kind::Bool);
         let final_data = strided_data.index(&[Some(mask)]);
 

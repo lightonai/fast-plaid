@@ -176,11 +176,13 @@ fn create(
 ///     index (PyLoadedIndex): A reference to the loaded index object containing
 ///         IVF structures and codebooks.
 ///     device (str): Device to perform the search on (e.g., "cpu", "cuda:0").
-///     queries_embeddings (torch.Tensor): A 3D tensor of query embeddings
-///         with shape (num_queries, num_query_tokens, embedding_dim).
+///     queries_embeddings (torch.Tensor): A 2D packed tensor of shape
+///         (total_query_tokens, embedding_dim) holding all queries
+///         concatenated without padding.
 ///     search_parameters (SearchParameters): A SearchParameters object
 ///         containing `top_k`, `n_ivf_probe`, etc.
 ///     show_progress (bool): Whether to display a progress bar during search.
+///     query_lengths (list[int]): True token count per query in the packed tensor.
 ///     subset (list[list[int]] | None): An optional filter to restrict the
 ///         search. Must be a list of lists, where each inner list contains
 ///         the document IDs to search for that specific query.
@@ -192,6 +194,7 @@ fn create(
 ///     RuntimeError: If searching fails.
 ///     ValueError: If search parameters are invalid.
 #[pyfunction]
+#[pyo3(signature = (index, device, queries_embeddings, search_parameters, show_progress, query_lengths, subset=None))]
 fn pysearch(
     py: Python<'_>,
     index: &PyLoadedIndex,
@@ -199,6 +202,7 @@ fn pysearch(
     queries_embeddings: PyTensor,
     search_parameters: &SearchParameters,
     show_progress: bool,
+    query_lengths: Vec<i64>,
     subset: Option<Vec<Vec<i64>>>,
 ) -> PyResult<Vec<QueryResult>> {
     let device_tch = get_device(&device)?;
@@ -215,6 +219,7 @@ fn pysearch(
                 device_tch,
                 show_progress,
                 subset,
+                query_lengths,
             )
         })
         .map_err(anyhow_to_pyerr)?;
@@ -230,11 +235,13 @@ fn pysearch(
 /// Args:
 ///     index (PyLoadedIndex): A reference to the loaded index object.
 ///     device (str): Device to perform the search on (e.g., "cpu", "cuda:0").
-///     queries_embeddings (torch.Tensor): A 3D tensor of query embeddings
-///         with shape (num_queries, num_query_tokens, embedding_dim).
+///     queries_embeddings (torch.Tensor): A 2D packed tensor of shape
+///         (total_query_tokens, embedding_dim) holding all queries
+///         concatenated without padding.
 ///     search_parameters (SearchParameters): A SearchParameters object
 ///         containing `top_k`, `n_ivf_probe`, etc.
 ///     show_progress (bool): Whether to display a progress bar during search.
+///     query_lengths (list[int]): True token count per query in the packed tensor.
 ///     subset (list[list[int]] | None): An optional filter to restrict the
 ///         search per query.
 ///
@@ -245,6 +252,7 @@ fn pysearch(
 /// Raises:
 ///     RuntimeError: If searching fails.
 #[pyfunction]
+#[pyo3(signature = (index, device, queries_embeddings, search_parameters, show_progress, query_lengths, subset=None))]
 fn pysearch_with_token_scores(
     py: Python<'_>,
     index: &PyLoadedIndex,
@@ -252,6 +260,7 @@ fn pysearch_with_token_scores(
     queries_embeddings: PyTensor,
     search_parameters: &SearchParameters,
     show_progress: bool,
+    query_lengths: Vec<i64>,
     subset: Option<Vec<Vec<i64>>>,
 ) -> PyResult<Vec<QueryResultWithTokenScores>> {
     let device_tch = get_device(&device)?;
@@ -267,6 +276,7 @@ fn pysearch_with_token_scores(
                 device_tch,
                 show_progress,
                 subset,
+                query_lengths,
             )
         })
         .map_err(anyhow_to_pyerr)?;

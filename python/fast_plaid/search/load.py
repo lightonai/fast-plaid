@@ -359,8 +359,35 @@ def _load_index_tensors_cpu(index_path: str) -> dict[str, Any] | None:
     return data
 
 
+def _resolve_index_gpu_memory(
+    data: dict[str, Any],
+    device: str,
+    index_gpu_memory: str,
+    index_memory_fraction: float,
+) -> str:
+    """Resolve 'auto' to the highest tier within `index_memory_fraction` of VRAM."""
+    if index_gpu_memory != "auto":
+        return index_gpu_memory
+    if not device.startswith("cuda") or not torch.cuda.is_available():
+        return "low"
+
+    free, total = torch.cuda.mem_get_info(torch.device(device))
+    codes_bytes = data["doc_codes"].numel() * 8  # stored as int64
+    residuals_bytes = data["doc_residuals"].numel()  # uint8
+    headroom = int((1.0 - index_memory_fraction) * total)
+
+    if free - (codes_bytes + residuals_bytes) >= headroom:
+        return "high"
+    if free - codes_bytes >= headroom:
+        return "medium"
+    return "low"
+
+
 def _construct_index_from_tensors(
-    data: dict[str, Any], device: str, low_memory: bool
+    data: dict[str, Any],
+    device: str,
+    index_gpu_memory: str,
+    index_memory_fraction: float,
 ) -> Any:
     """Build Rust index from CPU tensors.
 
@@ -370,16 +397,23 @@ def _construct_index_from_tensors(
         Dictionary of tensors loaded on CPU.
     device:
         The target device for the index.
-    low_memory:
-        If True, keeps large document tensors on CPU to save VRAM.
+    index_gpu_memory:
+        GPU placement tier for the large document tensors; 'auto' adapts per device.
+    index_memory_fraction:
+        Fraction of device memory 'auto' placement may fill.
 
     """
+    index_gpu_memory = _resolve_index_gpu_memory(
+        data, device, index_gpu_memory, index_memory_fraction
+    )
+
     gpu_data: dict[str, Any] = {}
     for key, val in data.items():
         if val is None:
             gpu_data[key] = None
         elif isinstance(val, torch.Tensor):
-            if low_memory and key in ["doc_codes", "doc_residuals", "doc_lengths"]:
+            if key in ["doc_codes", "doc_residuals", "doc_lengths"]:
+                # Tier placement happens on the Rust side; hand these over on CPU.
                 gpu_data[key] = val
             else:
                 gpu_data[key] = val.to(device, non_blocking=True)
@@ -398,7 +432,7 @@ def _construct_index_from_tensors(
         doc_residuals=gpu_data["doc_residuals"],
         doc_lengths=gpu_data["doc_lengths"],
         device=device,
-        low_memory=low_memory,
+        index_gpu_memory=index_gpu_memory,
     )
 
 
@@ -406,7 +440,8 @@ def _reload_index(
     index_path: str,
     devices: list[str],
     indices: dict[str, Any],
-    low_memory: bool = False,
+    index_gpu_memory: str = "auto",
+    index_memory_fraction: float = 0.7,
 ) -> dict[str, Any]:
     """Load or reload the index for all configured devices.
 
@@ -418,8 +453,10 @@ def _reload_index(
         List of devices to load the index on.
     indices:
         Dictionary mapping devices to index objects.
-    low_memory:
-        If True, keeps large document tensors on CPU.
+    index_gpu_memory:
+        GPU placement tier for the large document tensors; 'auto' adapts per device.
+    index_memory_fraction:
+        Fraction of device memory 'auto' placement may fill.
 
     """
     if not os.path.exists(os.path.join(index_path, "metadata.json")):
@@ -445,7 +482,8 @@ def _reload_index(
             idx = _construct_index_from_tensors(
                 data=cpu_tensors,  # noqa: F821
                 device=device,
-                low_memory=low_memory,
+                index_gpu_memory=index_gpu_memory,
+                index_memory_fraction=index_memory_fraction,
             )
             return device, idx  # noqa: TRY300
         except Exception as e:

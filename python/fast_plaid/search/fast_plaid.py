@@ -8,7 +8,7 @@ import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     import types
@@ -23,7 +23,7 @@ from joblib import Parallel, delayed
 
 from ..filtering import create, delete
 from .kmeans import FastKMeans
-from .load import _reload_index, save_list_tensors_on_disk
+from .load import _load_index_tensors_cpu, _reload_index, save_list_tensors_on_disk
 from .update import process_update
 
 
@@ -185,15 +185,81 @@ def compute_kmeans(
     ).half()
 
 
+def device_memory_budget(device: str, search_memory_fraction: float) -> int:
+    """Scoring budget in bytes: `search_memory_fraction` of free VRAM; 0 on CPU."""
+    if device.startswith("cuda") and torch.cuda.is_available():
+        free, _ = torch.cuda.mem_get_info(torch.device(device))
+        return int(free * search_memory_fraction)
+    return 0
+
+
+def _resolve_batch_size(batch_size: int | Literal["auto"]) -> int:
+    """Map 'auto' to 0 (memory-planned chunks); validate manual chunk sizes."""
+    if batch_size == "auto":
+        return 0
+    if not isinstance(batch_size, int) or batch_size <= 0:
+        raise ValueError("batch_size must be 'auto' or a positive int.")
+    return batch_size
+
+
+def _true_query_lengths(queries: list[torch.Tensor]) -> list[int]:
+    """Last non-zero row + 1 per query (min 1), vectorized over same-shape chunks."""
+    lengths: list[int] = []
+    start = 0
+    n = len(queries)
+    chunk = 256
+    while start < n:
+        # Group contiguous equal-shaped queries (PyLate pads all to query_length).
+        shape = queries[start].shape
+        end = start + 1
+        limit = min(start + chunk, n)
+        while end < limit and queries[end].shape == shape:
+            end += 1
+        stacked = torch.stack(queries[start:end])
+        row_is_nonzero = (stacked != 0).any(dim=-1)
+        positions = torch.arange(
+            1, row_is_nonzero.shape[1] + 1, device=row_is_nonzero.device
+        )
+        chunk_lengths = (row_is_nonzero * positions).amax(dim=1).clamp_min(1)
+        lengths.extend(int(v) for v in chunk_lengths.tolist())
+        start = end
+    return lengths
+
+
+def pack_queries(
+    queries_embeddings: torch.Tensor | list[torch.Tensor],
+) -> tuple[torch.Tensor, list[int]]:
+    """Trim per-query zero-row padding and pack into a [total_tokens, dim] fp16 tensor.
+
+    Returns the packed tensor and the true token count per query.
+    """
+    if isinstance(queries_embeddings, torch.Tensor):
+        if queries_embeddings.dim() == 2:
+            queries_embeddings = [queries_embeddings]
+        else:
+            queries_embeddings = list(queries_embeddings.unbind(0))
+
+    queries = [q.squeeze(0) if q.dim() == 3 else q for q in queries_embeddings]
+    if not queries:
+        return torch.empty(0, 0, dtype=torch.float16), []
+
+    lengths = _true_query_lengths(queries)
+    pieces = [q[:length] for q, length in zip(queries, lengths)]
+    packed = torch.cat(pieces, dim=0)
+    return packed.to(torch.float16), lengths
+
+
 def search_on_device(
     device: str,
     queries_embeddings: torch.Tensor,
-    batch_size: int,
+    batch_size: int | Literal["auto"],
     n_full_scores: int,
     top_k: int,
     n_ivf_probe: int,
+    search_memory_fraction: float,
     index_object: Any,
     show_progress: bool,
+    query_lengths: list[int],
     subset: list[list[int]] | None = None,
 ) -> list[list[tuple[int, float]]]:
     """Perform a search on a single specified device using the passed object.
@@ -203,19 +269,24 @@ def search_on_device(
     device:
         The device identifier to perform the search on.
     queries_embeddings:
-        The query embeddings to search for.
+        A packed 2D tensor (total_query_tokens, embedding_dim) holding all
+        queries concatenated without padding.
     batch_size:
-        The batch size for processing queries.
+        Documents per scoring chunk; 'auto' plans chunks from the memory budget.
     n_full_scores:
         The number of full scores to compute per query.
     top_k:
         The number of top results to return.
     n_ivf_probe:
         The number of IVF clusters to probe.
+    search_memory_fraction:
+        Fraction of free VRAM the scoring stages may use.
     index_object:
         The loaded index object for the specific device.
     show_progress:
         Whether to show a progress bar.
+    query_lengths:
+        True token count per query in the packed tensor.
     subset:
         Optional subset of document IDs to search within.
 
@@ -229,10 +300,11 @@ def search_on_device(
         raise ValueError(error)
 
     search_parameters = fast_plaid_rust.SearchParameters(
-        batch_size=batch_size,
+        batch_size=_resolve_batch_size(batch_size),
         n_full_scores=n_full_scores,
         top_k=top_k,
         n_ivf_probe=n_ivf_probe,
+        memory_budget_bytes=device_memory_budget(device, search_memory_fraction),
     )
 
     scores = fast_plaid_rust.pysearch(
@@ -242,6 +314,7 @@ def search_on_device(
         search_parameters=search_parameters,
         show_progress=show_progress,
         subset=subset,
+        query_lengths=query_lengths,
     )
 
     return [
@@ -256,12 +329,14 @@ def search_on_device(
 def search_on_device_with_token_scores(
     device: str,
     queries_embeddings: torch.Tensor,
-    batch_size: int,
+    batch_size: int | Literal["auto"],
     n_full_scores: int,
     top_k: int,
     n_ivf_probe: int,
+    search_memory_fraction: float,
     index_object: Any,
     show_progress: bool,
+    query_lengths: list[int],
     subset: list[list[int]] | None = None,
 ) -> list[list[tuple[int, float, torch.Tensor]]]:
     """Perform a search on a single device, returning token-level similarity matrices.
@@ -273,17 +348,21 @@ def search_on_device_with_token_scores(
     queries_embeddings:
         The query embeddings to search for.
     batch_size:
-        The batch size for processing queries.
+        Documents per scoring chunk; 'auto' plans chunks from the memory budget.
     n_full_scores:
         The number of full scores to compute per query.
     top_k:
         The number of top results to return.
     n_ivf_probe:
         The number of IVF clusters to probe.
+    search_memory_fraction:
+        Fraction of free VRAM the scoring stages may use.
     index_object:
         The loaded index object for the specific device.
     show_progress:
         Whether to show a progress bar.
+    query_lengths:
+        True token count per query in the packed tensor.
     subset:
         Optional subset of document IDs to search within.
 
@@ -296,10 +375,11 @@ def search_on_device_with_token_scores(
         raise ValueError(error)
 
     search_parameters = fast_plaid_rust.SearchParameters(
-        batch_size=batch_size,
+        batch_size=_resolve_batch_size(batch_size),
         n_full_scores=n_full_scores,
         top_k=top_k,
         n_ivf_probe=n_ivf_probe,
+        memory_budget_bytes=device_memory_budget(device, search_memory_fraction),
     )
 
     results = fast_plaid_rust.pysearch_with_token_scores(
@@ -309,6 +389,7 @@ def search_on_device_with_token_scores(
         search_parameters=search_parameters,
         show_progress=show_progress,
         subset=subset,
+        query_lengths=query_lengths,
     )
 
     return [
@@ -329,7 +410,9 @@ class FastPlaid:
         self,
         index: str,
         device: str | list[str] | None = None,
-        low_memory: bool = True,
+        index_gpu_memory: Literal["auto", "low", "medium", "high"] = "auto",
+        index_memory_fraction: float = 0.7,
+        search_memory_fraction: float = 0.5,
         **kwargs: Any,  # noqa: ARG002
     ) -> None:
         """Initialize the FastPlaid instance.
@@ -340,12 +423,27 @@ class FastPlaid:
             Path to the directory where the index is stored.
         device:
             The device(s) to use for index operations (e.g., 'cuda:0', 'cpu').
-        low_memory:
-            Whether to use low memory mode when loading the index.
+        index_gpu_memory:
+            GPU placement of the large document tensors: 'low' keeps codes and
+            residuals on CPU, 'medium' moves codes to GPU, 'high' moves both;
+            'auto' picks the highest tier that fits within index_memory_fraction
+            of the device. Placement affects speed only.
+        index_memory_fraction:
+            Fraction of device memory 'auto' index placement may fill.
+        search_memory_fraction:
+            Fraction of free VRAM the scoring stages may use when batch_size
+            is 'auto'.
         kwargs:
             Additional keyword arguments.
 
         """
+        if index_gpu_memory not in {"auto", "low", "medium", "high"}:
+            error = "index_gpu_memory must be 'auto', 'low', 'medium' or 'high'."
+            raise ValueError(error)
+        if not 0.0 < index_memory_fraction <= 1.0:
+            raise ValueError("index_memory_fraction must be in (0, 1].")
+        if not 0.0 < search_memory_fraction <= 1.0:
+            raise ValueError("search_memory_fraction must be in (0, 1].")
         if device is not None and isinstance(device, str):
             self.devices = [device]
         elif isinstance(device, list):
@@ -363,7 +461,9 @@ class FastPlaid:
 
         self.torch_path = _load_torch_path(device=self.devices[0])
         self.index = index
-        self.low_memory = low_memory
+        self.index_gpu_memory = index_gpu_memory
+        self.index_memory_fraction = index_memory_fraction
+        self.search_memory_fraction = search_memory_fraction
 
         # Concurrency Control
         if not os.path.exists(self.index):
@@ -503,7 +603,8 @@ class FastPlaid:
             index_path=self.index,
             devices=self.devices,
             indices=self.indices,
-            low_memory=self.low_memory,
+            index_gpu_memory=self.index_gpu_memory,
+            index_memory_fraction=self.index_memory_fraction,
         )
 
         # Atomic swap of indices dictionary
@@ -621,17 +722,11 @@ class FastPlaid:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-            # Reload indices on all devices now that creation is complete
-            new_indices = _reload_index(
-                index_path=self.index,
-                devices=self.devices,
-                indices={},
-                low_memory=self.low_memory,
-            )
-
-            # Atomic swap of indices dictionary
+            # Materialize the merged on-disk files once (CPU-side); defer the
+            # per-device GPU loads to the first search (all-None entries reload lazily).
+            _load_index_tensors_cpu(index_path=self.index)
             with self._index_swap_lock:
-                self.indices = new_indices
+                self.indices = {device: None for device in self.devices}
                 self._update_mtime()
 
         return self
@@ -890,7 +985,8 @@ class FastPlaid:
                 index_path=self.index,
                 devices=self.devices,
                 torch_path=self.torch_path,
-                low_memory=self.low_memory,
+                index_gpu_memory=self.index_gpu_memory,
+                index_memory_fraction=self.index_memory_fraction,
                 indices_dict=current_indices,
                 documents_embeddings=documents_embeddings,
                 metadata=metadata,
@@ -947,8 +1043,8 @@ class FastPlaid:
         self,
         queries_embeddings: torch.Tensor | list[torch.Tensor],
         subset: list[list[int]] | list[int] | None,
-    ) -> tuple[dict[str, Any], torch.Tensor, list[list[int]] | None]:
-        """Shared setup for search methods: reload index, validate, normalize inputs."""
+    ) -> tuple[dict[str, Any], torch.Tensor, list[int], list[list[int]] | None]:
+        """Shared setup for search methods: reload index, validate, pack queries."""
         self._check_and_reload_index(blocking=False)
 
         with self._index_swap_lock:
@@ -972,17 +1068,8 @@ class FastPlaid:
                 Check CUDA memory or device availability."""
                 raise RuntimeError(error)
 
-        if isinstance(queries_embeddings, list):
-            queries_embeddings = torch.nn.utils.rnn.pad_sequence(
-                sequences=[
-                    embedding[0] if embedding.dim() == 3 else embedding
-                    for embedding in queries_embeddings
-                ],
-                batch_first=True,
-                padding_value=0.0,
-            )
-
-        num_queries = queries_embeddings.shape[0]
+        packed_queries, query_lengths = pack_queries(queries_embeddings)
+        num_queries = len(query_lengths)
 
         if subset is not None:
             if isinstance(subset, int):
@@ -995,16 +1082,17 @@ class FastPlaid:
             if subset is not None and len(subset) != num_queries:
                 raise ValueError("Subset length must match number of queries.")
 
-        return search_indices, queries_embeddings, subset  # type: ignore
+        return search_indices, packed_queries, query_lengths, subset  # type: ignore
 
     def _dispatch_search(
         self,
         device_fn: Any,
         search_indices: dict[str, Any],
-        queries_embeddings: torch.Tensor,
+        packed_queries: torch.Tensor,
+        query_lengths: list[int],
         subset: list[list[int]] | None,
         *,
-        batch_size: int,
+        batch_size: int | Literal["auto"],
         n_full_scores: int,
         top_k: int,
         n_ivf_probe: int,
@@ -1020,12 +1108,14 @@ class FastPlaid:
             search_on_device_with_token_scores).
         search_indices:
             Mapping of device name to loaded index object.
-        queries_embeddings:
-            A 3D tensor of query embeddings (num_queries, n_tokens, embedding_dim).
+        packed_queries:
+            A 2D packed tensor (total_query_tokens, embedding_dim), no padding.
+        query_lengths:
+            True token count per query.
         subset:
             Optional per-query document ID filters.
         batch_size:
-            The number of queries to process in each batch.
+            Documents per scoring chunk; 'auto' plans chunks from the memory budget.
         n_full_scores:
             The number of full scores to compute per query.
         top_k:
@@ -1039,7 +1129,20 @@ class FastPlaid:
             Ignored on GPU. Defaults to 1.
 
         """
-        num_queries = queries_embeddings.shape[0]
+        num_queries = len(query_lengths)
+        if num_queries == 0:
+            return []
+
+        token_offsets = [0]
+        for length in query_lengths:
+            token_offsets.append(token_offsets[-1] + length)
+
+        def query_slice(q_start: int, q_end: int) -> tuple[torch.Tensor, list[int]]:
+            t_start, t_end = token_offsets[q_start], token_offsets[q_end]
+            return (
+                packed_queries.narrow(0, t_start, t_end - t_start),
+                query_lengths[q_start:q_end],
+            )
 
         # Joblib parallelism for CPU-only bulk search
         is_cpu_only = self.devices[0] == "cpu"
@@ -1056,71 +1159,84 @@ class FastPlaid:
         if use_joblib:
             num_workers = n_processes
             chunk_size = math.ceil(num_queries / num_workers)
-            query_chunks = list(torch.split(queries_embeddings, chunk_size))
+            bounds = [
+                (start, min(start + chunk_size, num_queries))
+                for start in range(0, num_queries, chunk_size)
+            ]
             subset_chunks: list = []
             if subset is not None:
-                for i in range(0, num_queries, chunk_size):
-                    subset_chunks.append(subset[i : i + chunk_size])
+                subset_chunks = [subset[start:end] for start, end in bounds]
             else:
-                subset_chunks = [None] * len(query_chunks)  # type: ignore
+                subset_chunks = [None] * len(bounds)  # type: ignore
 
             results = Parallel(n_jobs=num_workers, prefer="threads")(
                 delayed(device_fn)(
                     device="cpu",
-                    queries_embeddings=chunk,
+                    queries_embeddings=query_slice(start, end)[0],
                     batch_size=batch_size,
                     n_full_scores=n_full_scores,
                     top_k=top_k,
                     n_ivf_probe=n_ivf_probe,
+                    search_memory_fraction=self.search_memory_fraction,
                     index_object=search_indices["cpu"],
                     show_progress=(show_progress and i == 0),
                     subset=sub_chunk,
+                    query_lengths=query_slice(start, end)[1],
                 )
-                for i, (chunk, sub_chunk) in enumerate(zip(query_chunks, subset_chunks))
+                for i, ((start, end), sub_chunk) in enumerate(
+                    zip(bounds, subset_chunks)
+                )
             )
             return [item for sublist in results for item in sublist]
 
         if len(self.devices) == 1:
             return device_fn(
                 device=self.devices[0],
-                queries_embeddings=queries_embeddings,
+                queries_embeddings=packed_queries,
                 batch_size=batch_size,
                 n_full_scores=n_full_scores,
                 top_k=top_k,
                 n_ivf_probe=n_ivf_probe,
+                search_memory_fraction=self.search_memory_fraction,
                 index_object=search_indices[self.devices[0]],
                 show_progress=show_progress,
                 subset=subset,
+                query_lengths=query_lengths,
             )
 
         # Multi-GPU split
         num_devices = len(self.devices)
         chunk_size = math.ceil(num_queries / num_devices)
-        query_chunks = list(torch.split(queries_embeddings, chunk_size))
+        bounds = [
+            (start, min(start + chunk_size, num_queries))
+            for start in range(0, num_queries, chunk_size)
+        ]
         subset_chunks_gpu: list = []
         if subset is not None:
-            for i in range(0, num_queries, chunk_size):
-                subset_chunks_gpu.append(subset[i : i + chunk_size])
+            subset_chunks_gpu = [subset[start:end] for start, end in bounds]
         else:
-            subset_chunks_gpu = [None] * len(query_chunks)  # type: ignore
+            subset_chunks_gpu = [None] * len(bounds)  # type: ignore
 
         futures = []
         with ThreadPoolExecutor(max_workers=num_devices) as executor:
             for i, device in enumerate(self.devices):
-                if i >= len(query_chunks):
+                if i >= len(bounds):
                     break
+                chunk_queries, chunk_lengths = query_slice(*bounds[i])
                 futures.append(
                     executor.submit(
                         device_fn,
                         device=device,
-                        queries_embeddings=query_chunks[i],
+                        queries_embeddings=chunk_queries,
                         batch_size=batch_size,
                         n_full_scores=n_full_scores,
                         top_k=top_k,
                         n_ivf_probe=n_ivf_probe,
+                        search_memory_fraction=self.search_memory_fraction,
                         index_object=search_indices[device],
                         show_progress=show_progress and (i == 0),
                         subset=subset_chunks_gpu[i],
+                        query_lengths=chunk_lengths,
                     )
                 )
 
@@ -1135,7 +1251,7 @@ class FastPlaid:
         self,
         queries_embeddings: torch.Tensor | list[torch.Tensor],
         top_k: int = 10,
-        batch_size: int = 2000,
+        batch_size: int | Literal["auto"] = "auto",
         n_full_scores: int = 4096,
         n_ivf_probe: int = 8,
         show_progress: bool = True,
@@ -1152,7 +1268,8 @@ class FastPlaid:
         top_k:
             The number of top results to return for each query.
         batch_size:
-            The number of queries to process in each batch.
+            Documents per scoring chunk; 'auto' plans chunks from the device
+            memory budget.
         n_full_scores:
             The number of full scores to compute per query.
         n_ivf_probe:
@@ -1168,14 +1285,15 @@ class FastPlaid:
             Ignored if running on GPU(s). Defaults to 1.
 
         """
-        search_indices, queries_embeddings, subset = self._prepare_search(
+        search_indices, packed_queries, query_lengths, subset = self._prepare_search(
             queries_embeddings, subset
         )
 
         return self._dispatch_search(
             search_on_device,
             search_indices,
-            queries_embeddings,
+            packed_queries,
+            query_lengths,
             subset,  # type: ignore
             batch_size=batch_size,
             n_full_scores=n_full_scores,
@@ -1190,7 +1308,7 @@ class FastPlaid:
         self,
         queries_embeddings: torch.Tensor | list[torch.Tensor],
         top_k: int = 10,
-        batch_size: int = 2000,
+        batch_size: int | Literal["auto"] = "auto",
         n_full_scores: int = 4096,
         n_ivf_probe: int = 8,
         show_progress: bool = True,
@@ -1212,7 +1330,8 @@ class FastPlaid:
         top_k:
             The number of top results to return for each query.
         batch_size:
-            The number of queries to process in each batch.
+            Documents per scoring chunk; 'auto' plans chunks from the device
+            memory budget.
         n_full_scores:
             The number of full scores to compute per query.
         n_ivf_probe:
@@ -1228,14 +1347,15 @@ class FastPlaid:
             Ignored if running on GPU(s). Defaults to 1.
 
         """
-        search_indices, queries_embeddings, subset = self._prepare_search(
+        search_indices, packed_queries, query_lengths, subset = self._prepare_search(
             queries_embeddings, subset
         )
 
         return self._dispatch_search(
             search_on_device_with_token_scores,
             search_indices,
-            queries_embeddings,
+            packed_queries,
+            query_lengths,
             subset,  # type: ignore
             batch_size=batch_size,
             n_full_scores=n_full_scores,
@@ -1350,7 +1470,8 @@ class FastPlaid:
                 index_path=self.index,
                 devices=self.devices,
                 indices={},
-                low_memory=self.low_memory,
+                index_gpu_memory=self.index_gpu_memory,
+                index_memory_fraction=self.index_memory_fraction,
             )
 
             # Atomic swap of indices dictionary

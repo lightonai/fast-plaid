@@ -11,6 +11,221 @@ use crate::search::padding::direct_pad_sequences;
 use crate::search::tensor::StridedTensor;
 use crate::utils::residual_codec::ResidualCodec;
 
+/// Fallback per-device workspace budget when the caller does not provide one.
+const DEFAULT_MEMORY_BUDGET_BYTES: i64 = 4 * (1 << 30);
+
+/// Never shrink a stage budget below this during OOM retries.
+const MIN_STAGE_BUDGET_BYTES: i64 = 64 * (1 << 20);
+
+/// Approximate-scoring bytes per padded (doc, token) cell: fp16 score gather + padded copy, plus code gathers.
+fn approx_bytes_per_cell(q_tokens: i64) -> i64 {
+    4 * q_tokens + 32
+}
+
+/// Exact-scoring bytes per padded (doc, token) cell: fp16 token scores plus decompression intermediates and embedding copies.
+fn exact_bytes_per_cell(q_tokens: i64) -> i64 {
+    4 * q_tokens + 1792
+}
+
+fn is_oom_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_lowercase();
+    message.contains("out of memory") || message.contains("cuda oom")
+}
+
+/// Converts panics into errors: tch ops panic on CUDA OOM, and the retry logic needs an `Err` to inspect.
+fn catch_stage_panic(run: impl FnOnce() -> Result<Tensor>) -> Result<Tensor> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+        Ok(result) => result,
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "panic during scoring stage".to_string());
+            Err(anyhow!("{}", message))
+        },
+    }
+}
+
+fn sort_passage_ids_by_doc_length_with_restore(
+    passage_ids: &Tensor,
+    doc_codes_strided: &StridedTensor,
+    device: Device,
+) -> (Tensor, Tensor) {
+    if passage_ids.numel() <= 1 {
+        return (
+            passage_ids.shallow_clone(),
+            Tensor::arange(passage_ids.numel() as i64, (Kind::Int64, device)),
+        );
+    }
+
+    let lengths_device = doc_codes_strided.element_lengths.device();
+    let ids_for_lengths = passage_ids.to_device(lengths_device).to_kind(Kind::Int64);
+    let passage_lengths = doc_codes_strided
+        .element_lengths
+        .index_select(0, &ids_for_lengths);
+    let (_, length_order) = passage_lengths.sort(0, false);
+    let length_order = length_order.to_device(device);
+    let sorted_passage_ids = passage_ids.index_select(0, &length_order);
+    let (_, restore_order) = length_order.sort(0, false);
+
+    (sorted_passage_ids, restore_order)
+}
+
+/// Greedy chunk boundaries over doc lengths keeping each chunk's padded workspace within `budget_bytes`.
+/// Ascending lengths pack short docs densely; otherwise uniform ranges use the global max. Chunks hold >= 1 doc.
+fn plan_chunk_ranges(
+    lengths: &[i64],
+    bytes_per_cell: i64,
+    budget_bytes: i64,
+    lengths_ascending: bool,
+) -> Vec<(i64, i64)> {
+    let n = lengths.len() as i64;
+    if n == 0 {
+        return Vec::new();
+    }
+
+    if !lengths_ascending {
+        let max_len = lengths.iter().copied().max().unwrap_or(1).max(1);
+        let docs_per_chunk = (budget_bytes / (max_len * bytes_per_cell)).max(1);
+        return (0..n)
+            .step_by(docs_per_chunk as usize)
+            .map(|start| (start, docs_per_chunk.min(n - start)))
+            .collect();
+    }
+
+    let mut ranges = Vec::new();
+    let mut start: i64 = 0;
+    while start < n {
+        let mut len: i64 = 1;
+        let mut token_sum: i128 = lengths[start as usize].max(1) as i128;
+        while start + len < n {
+            let chunk_max = lengths[(start + len) as usize].max(1);
+            let padded = (len + 1) as i128 * chunk_max as i128;
+            // Break on budget, or when padding would exceed 2x the true tokens (skewed lengths).
+            if padded * bytes_per_cell as i128 > budget_bytes as i128
+                || padded > 2 * (token_sum + chunk_max as i128)
+            {
+                break;
+            }
+            token_sum += chunk_max as i128;
+            len += 1;
+        }
+        ranges.push((start, len));
+        start += len;
+    }
+    ranges
+}
+
+/// Scores candidates chunk-by-chunk within a memory budget, or in fixed `manual_docs`-sized
+/// chunks when positive. Returned scores are always aligned with the input `ids` order.
+#[allow(clippy::too_many_arguments)]
+fn run_scoring_stage(
+    ids: &Tensor,
+    lengths_cpu: &[i64],
+    bytes_per_cell: i64,
+    budget_bytes: i64,
+    manual_docs: i64,
+    doc_codes_strided: &StridedTensor,
+    device: Device,
+    sort_enabled: bool,
+    score_chunk: &mut dyn FnMut(&Tensor) -> Result<Tensor>,
+) -> Result<Tensor> {
+    let n = ids.size()[0];
+    if n == 0 {
+        return Ok(Tensor::empty(&[0], (Kind::Float, device)));
+    }
+
+    let max_len = lengths_cpu.iter().copied().max().unwrap_or(1).max(1);
+    let padded_cells = n as i128 * max_len as i128;
+    let token_sum: i128 = lengths_cpu.iter().map(|&l| l.max(1) as i128).sum();
+    // Single unsorted chunk only when it fits the budget and padding stays tight.
+    if manual_docs <= 0
+        && padded_cells * bytes_per_cell as i128 <= budget_bytes as i128
+        && padded_cells <= 2 * token_sum
+    {
+        return score_chunk(ids);
+    }
+
+    let (ids_exec, restore_order) = if sort_enabled {
+        let (sorted_ids, restore) =
+            sort_passage_ids_by_doc_length_with_restore(ids, doc_codes_strided, device);
+        (sorted_ids, Some(restore))
+    } else {
+        (ids.shallow_clone(), None)
+    };
+
+    let ranges: Vec<(i64, i64)> = if manual_docs > 0 {
+        (0..n)
+            .step_by(manual_docs as usize)
+            .map(|start| (start, manual_docs.min(n - start)))
+            .collect()
+    } else {
+        let mut planned_lengths = lengths_cpu.to_vec();
+        if sort_enabled {
+            planned_lengths.sort_unstable();
+        }
+        plan_chunk_ranges(&planned_lengths, bytes_per_cell, budget_bytes, sort_enabled)
+    };
+
+    let mut score_chunks = Vec::with_capacity(ranges.len());
+    for (start, len) in ranges {
+        let batch_ids = ids_exec.narrow(0, start, len);
+        score_chunks.push(score_chunk(&batch_ids)?);
+    }
+
+    let mut scores = Tensor::cat(&score_chunks, 0);
+    if let Some(restore) = restore_order {
+        scores = scores.index_select(0, &restore);
+    }
+    Ok(scores)
+}
+
+/// Runs a scoring stage, halving the budget and retrying on CUDA OOM; manual chunk sizes
+/// are respected verbatim, so their OOM errors propagate.
+#[allow(clippy::too_many_arguments)]
+fn run_scoring_stage_with_oom_retry(
+    ids: &Tensor,
+    lengths_cpu: &[i64],
+    bytes_per_cell: i64,
+    budget_bytes: i64,
+    manual_docs: i64,
+    doc_codes_strided: &StridedTensor,
+    device: Device,
+    sort_enabled: bool,
+    score_chunk: &mut dyn FnMut(&Tensor) -> Result<Tensor>,
+) -> Result<Tensor> {
+    let mut budget = budget_bytes.max(MIN_STAGE_BUDGET_BYTES);
+    loop {
+        let attempt = catch_stage_panic(|| {
+            run_scoring_stage(
+                ids,
+                lengths_cpu,
+                bytes_per_cell,
+                budget,
+                manual_docs,
+                doc_codes_strided,
+                device,
+                sort_enabled,
+                score_chunk,
+            )
+        });
+        match attempt {
+            Ok(scores) => return Ok(scores),
+            Err(error)
+                if manual_docs <= 0 && is_oom_error(&error) && budget > MIN_STAGE_BUDGET_BYTES =>
+            {
+                budget = (budget / 2).max(MIN_STAGE_BUDGET_BYTES);
+                eprintln!(
+                    "fast-plaid: scoring stage hit CUDA OOM; retrying with chunk budget {} MiB",
+                    budget / (1 << 20)
+                );
+            },
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// Decompresses residual vectors from a packed, quantized format.
 ///
 /// This function reconstructs full embedding vectors by combining coarse centroids with
@@ -171,7 +386,7 @@ impl QueryResultWithTokenScores {
 #[pyclass]
 #[derive(Clone, Debug)]
 pub struct SearchParameters {
-    /// Number of queries per batch.
+    /// Manual docs per scoring chunk; 0 plans chunks from the memory budget.
     #[pyo3(get, set)]
     pub batch_size: usize,
     /// Number of documents to re-rank with exact scores.
@@ -183,20 +398,51 @@ pub struct SearchParameters {
     /// Number of IVF cells to probe during the initial search.
     #[pyo3(get, set)]
     pub n_ivf_probe: usize,
+    /// Per-device scoring workspace budget in bytes. 0 = a conservative default.
+    #[pyo3(get, set)]
+    pub memory_budget_bytes: usize,
 }
 
 #[pymethods]
 impl SearchParameters {
     /// Creates a new `SearchParameters` instance from Python.
     #[new]
-    fn new(batch_size: usize, n_full_scores: usize, top_k: usize, n_ivf_probe: usize) -> Self {
+    #[pyo3(signature = (batch_size, n_full_scores, top_k, n_ivf_probe, memory_budget_bytes=0))]
+    fn new(
+        batch_size: usize,
+        n_full_scores: usize,
+        top_k: usize,
+        n_ivf_probe: usize,
+        memory_budget_bytes: usize,
+    ) -> Self {
         Self {
             batch_size,
             n_full_scores,
             top_k,
             n_ivf_probe,
+            memory_budget_bytes,
         }
     }
+}
+
+fn resolve_memory_budget(params: &SearchParameters) -> i64 {
+    if params.memory_budget_bytes > 0 {
+        params.memory_budget_bytes as i64
+    } else {
+        DEFAULT_MEMORY_BUDGET_BYTES
+    }
+}
+
+/// Computes per-query offsets from packed query lengths.
+fn packed_query_offsets(query_lengths: &[i64]) -> Vec<i64> {
+    let mut offsets = Vec::with_capacity(query_lengths.len() + 1);
+    let mut acc: i64 = 0;
+    offsets.push(0);
+    for len in query_lengths {
+        acc += len;
+        offsets.push(acc);
+    }
+    offsets
 }
 
 /// Processes a batch of queries against the loaded index.
@@ -206,16 +452,18 @@ impl SearchParameters {
 ///
 /// # Arguments
 ///
-/// * `queries` - A 3D tensor of query embeddings with shape `[num_queries, tokens_per_query, dim]`.
+/// * `queries` - A packed 2D tensor of query embeddings with shape `[total_tokens, dim]`,
+///   moved to the device once and viewed per query.
 /// * `index` - The `LoadedIndex` containing all necessary index components.
 /// * `params` - `SearchParameters` for search configuration.
 /// * `device` - The `tch::Device` for computation.
+/// * `show_progress` - Whether to display a progress bar.
 /// * `subset` - An optional list of document ID lists to restrict the search for each query.
+/// * `query_lengths` - True token count per query in the packed tensor.
 ///
 /// # Returns
 ///
-/// A `Result` with a `Vec<QueryResult>`. Individual search failures result in an empty
-/// `QueryResult` for that specific query, ensuring the operation doesn't halt.
+/// A `Result` with a `Vec<QueryResult>`, one per query.
 pub fn search_many(
     queries: &Tensor,
     index: &LoadedIndex,
@@ -223,6 +471,7 @@ pub fn search_many(
     device: Device,
     show_progress: bool,
     subset: Option<Vec<Vec<i64>>>,
+    query_lengths: Vec<i64>,
 ) -> Result<Vec<QueryResult>> {
     let ivf_index = index.ivf_index_strided.as_ref().ok_or_else(|| {
         anyhow!(
@@ -231,15 +480,11 @@ pub fn search_many(
         )
     })?;
 
-    let [num_queries, _, query_dim] = queries.size()[..] else {
-        bail!(
-            "Expected a 3D tensor for queries, but got shape {:?}",
-            queries.size()
-        );
-    };
+    let (num_queries, query_dim, packed_queries, offsets) =
+        prepare_query_layout(queries, &query_lengths, device)?;
 
-    let search_closure = |query_index| {
-        let query_embedding = queries.i(query_index).to(device);
+    let search_closure = |query_index: i64| -> Result<QueryResult> {
+        let query_embedding = get_query_embedding(&packed_queries, &offsets, query_index);
 
         // Handle the per-query subset list
         let query_subset = subset.as_ref().and_then(|s| s.get(query_index as usize));
@@ -257,24 +502,24 @@ pub fn search_many(
             &index.doc_codes_strided,
             &index.doc_residuals_strided,
             params.n_ivf_probe as i64,
-            params.batch_size as i64,
             params.n_full_scores as i64,
             index.nbits,
             params.top_k,
             device,
             subset_tensor.as_ref(),
             false,
-        )
-        .unwrap_or_default();
+            params.batch_size as i64,
+            resolve_memory_budget(params),
+        )?;
 
-        QueryResult {
+        Ok(QueryResult {
             query_id: query_index as usize,
             passage_ids,
             scores,
-        }
+        })
     };
 
-    let results = if show_progress {
+    let results: Result<Vec<QueryResult>> = if show_progress {
         let bar = ProgressBar::new(num_queries.try_into().unwrap());
         (0..num_queries)
             .progress_with(bar)
@@ -284,7 +529,40 @@ pub fn search_many(
         (0..num_queries).map(search_closure).collect()
     };
 
-    Ok(results)
+    results
+}
+
+/// Moves the packed 2D queries to the device, returning `(num_queries, dim, packed, offsets)`.
+fn prepare_query_layout(
+    queries: &Tensor,
+    query_lengths: &[i64],
+    device: Device,
+) -> Result<(i64, i64, Tensor, Vec<i64>)> {
+    let [total_tokens, query_dim] = queries.size()[..] else {
+        bail!(
+            "Expected a 2D packed tensor [total_tokens, dim], got shape {:?}",
+            queries.size()
+        );
+    };
+    let offsets = packed_query_offsets(query_lengths);
+    if *offsets.last().unwrap_or(&0) != total_tokens {
+        bail!(
+            "query_lengths sum ({}) does not match packed token count ({})",
+            offsets.last().unwrap_or(&0),
+            total_tokens
+        );
+    }
+    let mut packed = queries.to_device(device);
+    if packed.kind() != Kind::Half {
+        packed = packed.to_kind(Kind::Half);
+    }
+    Ok((query_lengths.len() as i64, query_dim, packed, offsets))
+}
+
+/// Returns query `query_index` as a zero-copy view into the packed tensor.
+fn get_query_embedding(packed_queries: &Tensor, offsets: &[i64], query_index: i64) -> Tensor {
+    let start = offsets[query_index as usize];
+    packed_queries.narrow(0, start, offsets[query_index as usize + 1] - start)
 }
 
 /// Processes a batch of queries and returns results with token-level similarity matrices.
@@ -298,6 +576,7 @@ pub fn search_many_with_token_scores(
     device: Device,
     show_progress: bool,
     subset: Option<Vec<Vec<i64>>>,
+    query_lengths: Vec<i64>,
 ) -> Result<Vec<QueryResultWithTokenScores>> {
     let ivf_index = index.ivf_index_strided.as_ref().ok_or_else(|| {
         anyhow!(
@@ -306,15 +585,11 @@ pub fn search_many_with_token_scores(
         )
     })?;
 
-    let [num_queries, _, query_dim] = queries.size()[..] else {
-        bail!(
-            "Expected a 3D tensor for queries, but got shape {:?}",
-            queries.size()
-        );
-    };
+    let (num_queries, query_dim, packed_queries, offsets) =
+        prepare_query_layout(queries, &query_lengths, device)?;
 
-    let search_closure = |query_index| {
-        let query_embedding = queries.i(query_index).to(device);
+    let search_closure = |query_index: i64| -> Result<QueryResultWithTokenScores> {
+        let query_embedding = get_query_embedding(&packed_queries, &offsets, query_index);
 
         let query_subset = subset.as_ref().and_then(|s| s.get(query_index as usize));
         let subset_tensor = query_subset.map(|ids| {
@@ -331,25 +606,25 @@ pub fn search_many_with_token_scores(
             &index.doc_codes_strided,
             &index.doc_residuals_strided,
             params.n_ivf_probe as i64,
-            params.batch_size as i64,
             params.n_full_scores as i64,
             index.nbits,
             params.top_k,
             device,
             subset_tensor.as_ref(),
             true,
-        )
-        .unwrap_or_default();
+            params.batch_size as i64,
+            resolve_memory_budget(params),
+        )?;
 
-        QueryResultWithTokenScores {
+        Ok(QueryResultWithTokenScores {
             query_id: query_index as usize,
             passage_ids,
             scores,
             token_scores_inner: token_matrices.unwrap_or_default(),
-        }
+        })
     };
 
-    let results = if show_progress {
+    let results: Result<Vec<QueryResultWithTokenScores>> = if show_progress {
         let bar = ProgressBar::new(num_queries.try_into().unwrap());
         (0..num_queries)
             .progress_with(bar)
@@ -359,22 +634,18 @@ pub fn search_many_with_token_scores(
         (0..num_queries).map(search_closure).collect()
     };
 
-    Ok(results)
+    results
 }
 
 /// Reduces token-level similarity scores into a final document score using the ColBERT MaxSim strategy.
 ///
-/// This function implements the core reduction step of the ColBERT model's scoring mechanism.
-/// It first finds the maximum similarity score for each document token across all query tokens,
-/// effectively ignoring padded tokens in the document. Then, it sums these maximum scores to
-/// produce a single relevance score for each query-document pair in the batch.
-///
-///
+/// Takes ownership of `token_scores` (always freshly materialized by the caller) so the
+/// padding mask can be applied in place instead of allocating a full-size copy.
 ///
 /// # Arguments
 ///
-/// * `token_scores` - A 3D `Tensor` of shape `[batch_size, query_length, doc_length]`
-///   containing the token-level similarity scores.
+/// * `token_scores` - A 3D `Tensor` of shape `[batch_size, doc_length, query_length]`
+///   containing the token-level similarity scores (freshly allocated).
 /// * `attention_mask` - A 2D `Tensor` of shape `[batch_size, doc_length]` where `true`
 ///   indicates a valid token and `false` indicates a padded token.
 ///
@@ -382,17 +653,14 @@ pub fn search_many_with_token_scores(
 ///
 /// A 1D `Tensor` of shape `[batch_size]`, where each element is the final aggregated
 /// ColBERT score for a query-document pair.
-pub fn colbert_score_reduce(token_scores: &Tensor, attention_mask: &Tensor) -> Tensor {
-    let scores_shape = token_scores.size();
+pub fn colbert_score_reduce(token_scores: Tensor, attention_mask: &Tensor) -> Tensor {
+    // Broadcast the document padding mask across query tokens without
+    // materializing a full [batch, doc_len, query_len] boolean tensor.
+    let padding_mask = attention_mask.logical_not().unsqueeze(-1);
 
-    // Expand the document attention mask to match the shape of the token scores.
-    let expanded_mask = attention_mask.unsqueeze(-1).expand(&scores_shape, true);
-
-    // Invert the mask to identify padding positions.
-    let padding_mask = expanded_mask.logical_not();
-
-    // Nullify scores at padded positions by filling them with a large negative number.
-    let masked_scores = token_scores.masked_fill(&padding_mask, -9999.0);
+    // Mask padded positions in place: the tensor is freshly materialized, so no aliasing.
+    let mut token_scores = token_scores;
+    let masked_scores = token_scores.masked_fill_(&padding_mask, -9999.0);
 
     // For each document token, find the maximum similarity score across all query tokens (MaxSim).
     let (max_scores_per_token, _) = masked_scores.max_dim(1, false);
@@ -446,28 +714,33 @@ fn filter_passage_ids_with_subset(passage_ids: &Tensor, subset: &Tensor, device:
 /// 3.  **Re-ranking**: Filters the candidates based on approximate scores, then decompresses the residuals for a smaller subset and computes exact scores.
 /// 4.  **Top-K Selection**: Returns the highest-scoring documents.
 ///
-///
+/// Both scoring stages run in chunks planned from `memory_budget_bytes`, or in fixed
+/// `batch_size`-doc chunks when `batch_size` > 0; chunking is score-preserving
+/// (candidate set, `n_full_scores`, `n_ivf_probe` and `top_k` are unchanged).
 ///
 /// # Arguments
-/// * `query_embeddings` - A tensor containing the query embeddings.
+/// * `query_embeddings` - A 2D tensor `[query_tokens, dim]` holding the query embeddings
+///   (already trimmed of padding and resident on `device` for the packed path).
 /// * `ivf_index_strided` - A strided tensor representing the IVF index for coarse lookup.
 /// * `codec` - The `ResidualCodec` used for decompressing document vectors.
 /// * `embedding_dimension` - The dimensionality of the embeddings.
 /// * `doc_codes_strided` - A strided tensor containing the quantized codes for all documents.
 /// * `doc_residuals_strided` - A strided tensor containing the compressed residuals for all documents.
 /// * `n_ivf_probe` - The number of IVF cells to probe for candidate documents.
-/// * `batch_size` - The batch size used for processing documents during scoring.
 /// * `n_docs_for_full_score` - The number of top documents from the approximate scoring phase to re-rank with full scoring.
 /// * `nbits_param` - The number of bits used in the quantization codec.
 /// * `top_k` - The final number of top results to return.
 /// * `device` - The `tch::Device` (e.g., `Device::Cuda(0)`) on which to perform computations.
 /// * `subset` - An optional tensor of document IDs to restrict the search to.
 /// * `return_token_scores` - If true, also returns per-document token similarity matrices.
+/// * `batch_size` - Manual docs per scoring chunk; 0 plans chunks from the memory budget.
+/// * `memory_budget_bytes` - Per-device scoring workspace budget.
 ///
 /// # Returns
 /// A `Result` containing a tuple of: the top `k` passage IDs (`Vec<i64>`), their
 /// corresponding final scores (`Vec<f32>`), and optionally a list of token similarity
 /// matrices (each of shape `[query_tokens, doc_tokens]`).
+#[allow(clippy::too_many_arguments)]
 pub fn search(
     query_embeddings: &Tensor,
     ivf_index_strided: &StridedTensor,
@@ -476,19 +749,30 @@ pub fn search(
     doc_codes_strided: &StridedTensor,
     doc_residuals_strided: &StridedTensor,
     n_ivf_probe: i64,
-    batch_size: i64,
     n_docs_for_full_score: i64,
     nbits_param: i64,
     top_k: usize,
     device: Device,
     subset: Option<&Tensor>,
     return_token_scores: bool,
+    batch_size: i64,
+    memory_budget_bytes: i64,
 ) -> anyhow::Result<(Vec<i64>, Vec<f32>, Option<Vec<Tensor>>)> {
     let (passage_ids, scores, token_matrices) = tch::no_grad(|| {
+        let q_tokens = query_embeddings.size()[0];
+
         let query_embeddings_unsqueezed = query_embeddings.unsqueeze(0);
 
         // Compute query-centroid scores
         let query_centroid_scores = codec.centroids.matmul(&query_embeddings.transpose(0, 1));
+
+        // The centroid-score matrix stays alive through both stages; deduct it from the planner budget.
+        let num_centroids = codec.centroids.size()[0];
+        let centroid_scores_bytes = num_centroids * q_tokens * 2;
+        let stage_budget =
+            (memory_budget_bytes - centroid_scores_bytes).max(MIN_STAGE_BUDGET_BYTES);
+        // Manual chunking preserves the input order; auto mode sorts candidates by doc length.
+        let sort_enabled = batch_size <= 0;
 
         // Select IVF cells to probe
         let flat_cells_to_probe = if let Some(subset_tensor) = subset {
@@ -550,29 +834,23 @@ pub fn search(
             return Ok((vec![], vec![], None));
         }
 
+        // Candidate doc lengths drive the chunk planner for both stages.
+        let candidate_lengths = doc_codes_strided
+            .element_lengths
+            .index_select(
+                0,
+                &unique_passage_ids.to_device(doc_codes_strided.element_lengths.device()),
+            )
+            .to_device(Device::Cpu);
+        let candidate_lengths_cpu: Vec<i64> = candidate_lengths.try_into()?;
+
         // Approximate scoring using coarse centroids
-        let mut approx_score_chunks = Vec::new();
-        let total_passage_ids_for_approx = unique_passage_ids.size()[0];
-        let num_approx_batches = (total_passage_ids_for_approx + batch_size - 1) / batch_size;
-
-        for step in 0..num_approx_batches {
-            let batch_start = step * batch_size;
-            let batch_end = ((step + 1) * batch_size).min(total_passage_ids_for_approx);
-            if batch_start >= batch_end {
-                continue;
-            }
-
-            let batch_passage_ids =
-                unique_passage_ids.narrow(0, batch_start, batch_end - batch_start);
+        let mut approx_chunk_fn = |batch_ids: &Tensor| -> Result<Tensor> {
             let (batch_packed_codes, batch_doc_lengths) =
-                doc_codes_strided.lookup(&batch_passage_ids, device);
+                doc_codes_strided.lookup(batch_ids, device);
 
             if batch_packed_codes.numel() == 0 {
-                approx_score_chunks.push(Tensor::zeros(
-                    &[batch_passage_ids.size()[0]],
-                    (Kind::Float, device),
-                ));
-                continue;
+                return Ok(Tensor::zeros(&[batch_ids.size()[0]], (Kind::Float, device)));
             }
 
             let batch_approx_scores = query_centroid_scores.index_select(0, &batch_packed_codes);
@@ -580,16 +858,20 @@ pub fn search(
             let (padded_approx_scores, mask) =
                 direct_pad_sequences(&batch_approx_scores, &batch_doc_lengths, 0.0, device)?;
 
-            let padded_approx_scores = colbert_score_reduce(&padded_approx_scores, &mask);
-
-            approx_score_chunks.push(padded_approx_scores);
-        }
-
-        let mut approx_scores = if !approx_score_chunks.is_empty() {
-            Tensor::cat(&approx_score_chunks, 0)
-        } else {
-            Tensor::empty(&[0], (Kind::Float, device))
+            Ok(colbert_score_reduce(padded_approx_scores, &mask))
         };
+
+        let approx_scores = run_scoring_stage_with_oom_retry(
+            &unique_passage_ids,
+            &candidate_lengths_cpu,
+            approx_bytes_per_cell(q_tokens),
+            stage_budget,
+            batch_size,
+            doc_codes_strided,
+            device,
+            sort_enabled,
+            &mut approx_chunk_fn,
+        )?;
 
         if approx_scores.size().get(0) != Some(&unique_passage_ids.size()[0]) {
             return Err(anyhow!(
@@ -601,18 +883,21 @@ pub fn search(
 
         let mut passage_ids_to_rerank = unique_passage_ids;
 
-        // Prune candidates for re-ranking
+        // Prune to n_full_scores, then to the n/4 decompression set.
+        let n_passage_ids_for_decompression = (n_docs_for_full_score / 4).max(1);
         if n_docs_for_full_score < approx_scores.size()[0] && approx_scores.numel() > 0 {
-            let (top_scores, top_indices) =
-                approx_scores.topk(n_docs_for_full_score, 0, true, true);
+            let (_, top_indices) = approx_scores.topk(n_docs_for_full_score, 0, true, true);
 
             passage_ids_to_rerank = passage_ids_to_rerank.index_select(0, &top_indices);
-            approx_scores = top_scores;
-        }
 
-        // Further reduce candidates for decompression
-        let n_passage_ids_for_decompression = (n_docs_for_full_score / 4).max(1);
-        if n_passage_ids_for_decompression < approx_scores.size()[0] && approx_scores.numel() > 0 {
+            // top_indices is sorted by descending score, so the n/4 selection is a narrow.
+            if n_passage_ids_for_decompression < n_docs_for_full_score {
+                passage_ids_to_rerank =
+                    passage_ids_to_rerank.narrow(0, 0, n_passage_ids_for_decompression);
+            }
+        } else if n_passage_ids_for_decompression < approx_scores.size()[0]
+            && approx_scores.numel() > 0
+        {
             let (_, top_indices) =
                 approx_scores.topk(n_passage_ids_for_decompression, 0, true, true);
             passage_ids_to_rerank = passage_ids_to_rerank.index_select(0, &top_indices);
@@ -621,12 +906,6 @@ pub fn search(
         if passage_ids_to_rerank.numel() == 0 {
             return Ok((vec![], vec![], None));
         }
-
-        // Full decompression and exact scoring
-        let (final_codes, final_doc_lengths) =
-            doc_codes_strided.lookup(&passage_ids_to_rerank, device);
-
-        let (final_residuals, _) = doc_residuals_strided.lookup(&passage_ids_to_rerank, device);
 
         let bucket_weights = codec
             .bucket_weights
@@ -637,23 +916,51 @@ pub fn search(
                 anyhow!("Codec missing bucket_weight_indices_lookup for decompression.")
             })?;
 
-        let decompressed_embeddings = decompress_residuals(
-            &final_residuals,
-            bucket_weights,
-            &codec.byte_reversed_bits_map,
-            bucket_weight_indices_lookup,
-            &final_codes,
-            &codec.centroids,
-            embedding_dimension,
-            nbits_param,
-        );
+        // Full decompression and exact scoring, planned like the approximate stage.
+        let rerank_lengths = doc_codes_strided
+            .element_lengths
+            .index_select(
+                0,
+                &passage_ids_to_rerank.to_device(doc_codes_strided.element_lengths.device()),
+            )
+            .to_device(Device::Cpu);
+        let rerank_lengths_cpu: Vec<i64> = rerank_lengths.try_into()?;
 
-        let (padded_doc_embeddings, mask) =
-            direct_pad_sequences(&decompressed_embeddings, &final_doc_lengths, 0.0, device)?;
+        let mut exact_chunk_fn = |batch_ids: &Tensor| -> Result<Tensor> {
+            let (batch_codes, batch_doc_lengths) = doc_codes_strided.lookup(batch_ids, device);
+            let (batch_residuals, _) = doc_residuals_strided.lookup(batch_ids, device);
 
-        let token_scores_3d =
-            padded_doc_embeddings.matmul(&query_embeddings_unsqueezed.transpose(-2, -1));
-        let reduced_scores = colbert_score_reduce(&token_scores_3d, &mask);
+            let decompressed_embeddings = decompress_residuals(
+                &batch_residuals,
+                bucket_weights,
+                &codec.byte_reversed_bits_map,
+                bucket_weight_indices_lookup,
+                &batch_codes,
+                &codec.centroids,
+                embedding_dimension,
+                nbits_param,
+            );
+
+            let (padded_doc_embeddings, mask) =
+                direct_pad_sequences(&decompressed_embeddings, &batch_doc_lengths, 0.0, device)?;
+
+            let token_scores_3d =
+                padded_doc_embeddings.matmul(&query_embeddings_unsqueezed.transpose(-2, -1));
+
+            Ok(colbert_score_reduce(token_scores_3d, &mask))
+        };
+
+        let reduced_scores = run_scoring_stage_with_oom_retry(
+            &passage_ids_to_rerank,
+            &rerank_lengths_cpu,
+            exact_bytes_per_cell(q_tokens),
+            stage_budget,
+            batch_size,
+            doc_codes_strided,
+            device,
+            sort_enabled,
+            &mut exact_chunk_fn,
+        )?;
 
         // Final top-k sort
         let (reduced_scores, sorted_indices) = reduced_scores.sort(0, true);
@@ -664,11 +971,34 @@ pub fn search(
         let reduced_scores: Vec<f32> = reduced_scores.try_into()?;
 
         let result_count = top_k.min(sorted_passage_ids.len());
+        let result_passage_ids = sorted_passage_ids[..result_count].to_vec();
+        let result_scores = reduced_scores[..result_count].to_vec();
 
         let token_matrices = if return_token_scores {
-            let sorted_token_scores = token_scores_3d.index_select(0, &sorted_indices);
-            let sorted_doc_lengths: Vec<i64> =
-                final_doc_lengths.index_select(0, &sorted_indices).try_into()?;
+            let result_passage_ids_tensor = Tensor::from_slice(&result_passage_ids)
+                .to_device(device)
+                .to_kind(Kind::Int64);
+            let (result_codes, result_doc_lengths) =
+                doc_codes_strided.lookup(&result_passage_ids_tensor, device);
+            let (result_residuals, _) =
+                doc_residuals_strided.lookup(&result_passage_ids_tensor, device);
+
+            let result_embeddings = decompress_residuals(
+                &result_residuals,
+                bucket_weights,
+                &codec.byte_reversed_bits_map,
+                bucket_weight_indices_lookup,
+                &result_codes,
+                &codec.centroids,
+                embedding_dimension,
+                nbits_param,
+            );
+
+            let (padded_doc_embeddings, _) =
+                direct_pad_sequences(&result_embeddings, &result_doc_lengths, 0.0, device)?;
+            let sorted_token_scores =
+                padded_doc_embeddings.matmul(&query_embeddings_unsqueezed.transpose(-2, -1));
+            let sorted_doc_lengths: Vec<i64> = result_doc_lengths.try_into()?;
 
             let mut matrices = Vec::with_capacity(result_count);
             for i in 0..result_count {
@@ -685,11 +1015,7 @@ pub fn search(
             None
         };
 
-        Ok((
-            sorted_passage_ids[..result_count].to_vec(),
-            reduced_scores[..result_count].to_vec(),
-            token_matrices,
-        ))
+        Ok((result_passage_ids, result_scores, token_matrices))
     })?;
 
     Ok((passage_ids, scores, token_matrices))

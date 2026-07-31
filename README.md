@@ -275,6 +275,8 @@ fast_plaid = search.FastPlaid(index="index", index_gpu_memory="low")
 
 **If your index fits in VRAM, `"high"` is the fastest option**, because you skip a host to device copy on every single query. Drop to `"medium"` or `"low"` if you hit OOM, or lower `index_memory_fraction` to reserve more room for other work on the device.
 
+Upgrading from an earlier version: `index_gpu_memory` replaces the old `low_memory` flag, which is still accepted (as a keyword or positionally) but ignored, with a `DeprecationWarning`. `low_memory=True` corresponds to `index_gpu_memory="low"` and `low_memory=False` to `"high"`, and the `"auto"` default supersedes both.
+
 ### Scoring chunks: `batch_size`
 
 `search(batch_size=...)` sets how many documents are scored per chunk, in both the approximate scoring and the exact rerank stages. With `"auto"` (default), chunk sizes are planned from `search_memory_fraction` (default `0.5`) of the free VRAM sampled at query time, and chunking only kicks in when a query actually needs it, so short queries keep a full-speed single-chunk path. On CUDA OOM the stage retries with the budget halved. Passing an int forces fixed-size chunks instead.

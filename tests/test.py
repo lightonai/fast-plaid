@@ -1582,6 +1582,99 @@ class TestFreeze:
             index.close()
 
 
+class TestLegacyArguments:
+    """Call sites written against pre-1.4.7 versions must keep working."""
+
+    def _index(self, path) -> None:
+        """Build a small searchable index at `path`."""
+        index = search.FastPlaid(index=path, device="cpu")
+        try:
+            documents_embeddings = [
+                torch.randn(60, 128, device="cpu") for _ in range(40)
+            ]
+            index.create(documents_embeddings=documents_embeddings, kmeans_niters=4)
+        finally:
+            index.close()
+
+    @pytest.mark.parametrize("low_memory", [True, False])
+    def test_low_memory_keyword_is_ignored(self, test_index_path, low_memory):
+        """The removed low_memory flag is accepted as a keyword and ignored."""
+        self._index(test_index_path)
+
+        with pytest.warns(DeprecationWarning, match="low_memory"):
+            index = search.FastPlaid(
+                index=test_index_path, device="cpu", low_memory=low_memory
+            )
+
+        try:
+            results = index.search(
+                queries_embeddings=torch.randn(2, 30, 128, device="cpu"), top_k=5
+            )
+            assert len(results) == 2, f"Expected 2 query results, got {len(results)}"
+            assert index.index_gpu_memory == "auto", (
+                f"low_memory must not set placement, got {index.index_gpu_memory}"
+            )
+        finally:
+            index.close()
+
+    @pytest.mark.parametrize("low_memory", [True, False])
+    def test_low_memory_positional_is_ignored(self, test_index_path, low_memory):
+        """Pre-1.4.7 code passed low_memory as the third positional argument."""
+        self._index(test_index_path)
+
+        with pytest.warns(DeprecationWarning, match="low_memory"):
+            index = search.FastPlaid(test_index_path, "cpu", low_memory)
+
+        try:
+            assert index.index_gpu_memory == "auto", (
+                f"Expected 'auto' placement, got {index.index_gpu_memory}"
+            )
+            results = index.search(
+                queries_embeddings=torch.randn(2, 30, 128, device="cpu"), top_k=5
+            )
+            assert len(results) == 2, f"Expected 2 query results, got {len(results)}"
+        finally:
+            index.close()
+
+    def test_unknown_keywords_are_ignored(self, test_index_path):
+        """Unknown keyword arguments must not raise."""
+        self._index(test_index_path)
+
+        index = search.FastPlaid(
+            index=test_index_path, device="cpu", verbose=True, some_removed_option=7
+        )
+
+        try:
+            results = index.search(
+                queries_embeddings=torch.randn(1, 30, 128, device="cpu"), top_k=5
+            )
+            assert len(results) == 1, f"Expected 1 query result, got {len(results)}"
+        finally:
+            index.close()
+
+    def test_legacy_integer_batch_size(self, test_index_path):
+        """search(batch_size=<int>) predates batch_size='auto' and still works."""
+        self._index(test_index_path)
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+
+        try:
+            queries_embeddings = torch.randn(2, 30, 128, device="cpu")
+            auto = index.search(queries_embeddings=queries_embeddings, top_k=5)
+            fixed = index.search(
+                queries_embeddings=queries_embeddings, top_k=5, batch_size=2000
+            )
+            assert [[doc for doc, _ in q] for q in auto] == [
+                [doc for doc, _ in q] for q in fixed
+            ], "Fixed batch_size must not change the ranking"
+        finally:
+            index.close()
+
+    def test_invalid_index_gpu_memory_still_rejected(self, test_index_path):
+        """Tolerating legacy arguments must not weaken validation of real ones."""
+        with pytest.raises(ValueError, match="index_gpu_memory"):
+            search.FastPlaid(index=test_index_path, device="cpu", index_gpu_memory="hi")
+
+
 # Legacy test function for backwards compatibility
 def test():
     """Ensure that the Fast-PLAiD search index can be created and queried correctly."""

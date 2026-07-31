@@ -6,6 +6,7 @@ import json
 import math
 import os
 import threading
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -413,7 +414,7 @@ class FastPlaid:
         index_gpu_memory: Literal["auto", "low", "medium", "high"] = "auto",
         index_memory_fraction: float = 0.7,
         search_memory_fraction: float = 0.5,
-        **kwargs: Any,  # noqa: ARG002
+        **kwargs: Any,
     ) -> None:
         """Initialize the FastPlaid instance.
 
@@ -434,9 +435,25 @@ class FastPlaid:
             Fraction of free VRAM the scoring stages may use when batch_size
             is 'auto'.
         kwargs:
-            Additional keyword arguments.
+            Additional keyword arguments. Unknown keywords are ignored, so call
+            sites written against older versions keep working.
 
         """
+        # Before 1.4.7 the third parameter was `low_memory: bool`. Tolerate both the
+        # keyword and the positional form: placement is now chosen automatically.
+        legacy_low_memory = kwargs.pop("low_memory", None)
+        if isinstance(index_gpu_memory, bool):
+            legacy_low_memory = index_gpu_memory
+            index_gpu_memory = "auto"
+        if legacy_low_memory is not None:
+            warnings.warn(
+                "low_memory is deprecated and ignored since 1.4.7: index placement is"
+                " now chosen automatically from the free VRAM. Pass"
+                " index_gpu_memory='low', 'medium' or 'high' to force a tier.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
         if index_gpu_memory not in {"auto", "low", "medium", "high"}:
             error = "index_gpu_memory must be 'auto', 'low', 'medium' or 'high'."
             raise ValueError(error)

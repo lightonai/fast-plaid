@@ -27,7 +27,8 @@ def partial_reload(
     index_path: str,
     devices: list[str],
     indices_dict: dict[str, Any],
-    low_memory: bool,
+    index_gpu_memory: str,
+    index_memory_fraction: float,
 ) -> dict[str, Any]:
     """Reload index data after update.
 
@@ -39,8 +40,10 @@ def partial_reload(
         List of devices to reload the index on.
     indices_dict:
         Dictionary mapping devices to index objects, updated in place.
-    low_memory:
-        Whether to use low memory mode when loading.
+    index_gpu_memory:
+        GPU placement tier for the large document tensors; 'auto' adapts per device.
+    index_memory_fraction:
+        Fraction of device memory 'auto' placement may fill.
 
     """
     # Clear old indices first to release memory-mapped file handles
@@ -56,7 +59,8 @@ def partial_reload(
         indices_dict[device] = _construct_index_from_tensors(
             data=cpu_tensors,
             device=device,
-            low_memory=low_memory,
+            index_gpu_memory=index_gpu_memory,
+            index_memory_fraction=index_memory_fraction,
         )
 
     return indices_dict
@@ -207,7 +211,8 @@ def process_update(
     index_path: str,
     devices: list[str],
     torch_path: str,
-    low_memory: bool,
+    index_gpu_memory: str,
+    index_memory_fraction: float,
     indices_dict: dict[str, Any],
     documents_embeddings: list[torch.Tensor] | torch.Tensor,
     metadata: list[dict[str, Any]] | None,
@@ -234,8 +239,10 @@ def process_update(
         List of devices to use for the update.
     torch_path:
         Path to the torch shared library.
-    low_memory:
-        Whether to use low memory mode when loading.
+    index_gpu_memory:
+        GPU placement tier for the large document tensors; 'auto' adapts per device.
+    index_memory_fraction:
+        Fraction of device memory 'auto' placement may fill.
     indices_dict:
         Dictionary mapping devices to index objects.
     documents_embeddings:
@@ -286,7 +293,8 @@ def process_update(
             index_path=index_path,
             devices=devices,
             indices={},
-            low_memory=low_memory,
+            index_gpu_memory=index_gpu_memory,
+            index_memory_fraction=index_memory_fraction,
         )
 
     documents_embeddings = format_embeddings_fn(documents_embeddings)
@@ -345,7 +353,8 @@ def process_update(
             index_path=index_path,
             devices=devices,
             indices={},
-            low_memory=low_memory,
+            index_gpu_memory=index_gpu_memory,
+            index_memory_fraction=index_memory_fraction,
         )
 
     # Ensure index is loaded before update
@@ -354,7 +363,8 @@ def process_update(
             index_path=index_path,
             devices=devices,
             indices=indices_dict,
-            low_memory=low_memory,
+            index_gpu_memory=index_gpu_memory,
+            index_memory_fraction=index_memory_fraction,
         )
         indices_dict.clear()
         indices_dict.update(new_indices)
@@ -405,7 +415,8 @@ def process_update(
             index_path=index_path,
             devices=devices,
             indices=indices_dict,
-            low_memory=low_memory,
+            index_gpu_memory=index_gpu_memory,
+            index_memory_fraction=index_memory_fraction,
         )
 
         if os.path.exists(os.path.join(index_path, "buffer.npy")):
@@ -425,7 +436,8 @@ def process_update(
             index_path=index_path,
             devices=devices,
             indices_dict=indices_dict,
-            low_memory=low_memory,
+            index_gpu_memory=index_gpu_memory,
+            index_memory_fraction=index_memory_fraction,
         )
 
     # Buffer not reached - append to buffer and update without centroid expansion
@@ -448,5 +460,6 @@ def process_update(
         index_path=index_path,
         devices=devices,
         indices_dict=indices_dict,
-        low_memory=low_memory,
+        index_gpu_memory=index_gpu_memory,
+        index_memory_fraction=index_memory_fraction,
     )

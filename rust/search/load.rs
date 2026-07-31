@@ -102,8 +102,8 @@ fn ensure_tensor(t: PyTensor, device: Device, kind: Kind) -> Tensor {
 ///   directly without allocation.
 /// - **Codec Handling**: Small tensors (centroids, weights) are loaded into RAM/VRAM
 ///   immediately for fast lookup during decompression.
-/// - **Low Memory Mode**: If `low_memory` is true, the large document tensors are strictly
-///   kept on the CPU, even if the target `device` is CUDA.
+/// - **GPU Memory Tiers**: `index_gpu_memory` places codes/residuals: "low" = both on CPU,
+///   "medium" = codes on GPU, "high" = both on GPU. Doc lengths always follow the search device.
 ///
 /// # Arguments
 ///
@@ -118,7 +118,7 @@ fn ensure_tensor(t: PyTensor, device: Device, kind: Kind) -> Tensor {
 /// * `doc_residuals` - The compressed document residuals (uint8).
 /// * `doc_lengths` - The true lengths of documents (int64).
 /// * `device` - The target device string (e.g. "cuda:0").
-/// * `low_memory` - If true, keeps document data on CPU.
+/// * `index_gpu_memory` - Placement tier: "low", "medium" or "high".
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
 pub fn construct_index(
@@ -134,12 +134,21 @@ pub fn construct_index(
     doc_residuals: PyTensor,
     doc_lengths: PyTensor,
     device: String,
-    low_memory: bool,
+    index_gpu_memory: String,
 ) -> PyResult<PyLoadedIndex> {
     let main_device = get_device(&device)?;
 
-    // Force document tensors to CPU in low memory mode
-    let storage_device = if low_memory { Device::Cpu } else { main_device };
+    let (codes_device, residuals_device) = match index_gpu_memory.as_str() {
+        "low" => (Device::Cpu, Device::Cpu),
+        "medium" => (main_device, Device::Cpu),
+        "high" => (main_device, main_device),
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "Invalid index_gpu_memory: '{}'. Expected 'low', 'medium' or 'high'.",
+                other
+            )))
+        },
+    };
 
     // Load codec (small tensors)
     let codec = ResidualCodec::load(
@@ -162,15 +171,24 @@ pub fn construct_index(
         _ => None,
     };
 
-    // Load document data (large tensors, may stay on CPU in low memory mode)
-    let doc_lens_t = ensure_tensor(doc_lengths, storage_device, Kind::Int64);
-    let doc_codes_t = ensure_tensor(doc_codes, storage_device, Kind::Int64);
-    let doc_residuals_t = ensure_tensor(doc_residuals, storage_device, Kind::Uint8);
+    // Lengths follow the search device; codes/residuals follow their placement tier.
+    let doc_lens_t = ensure_tensor(doc_lengths, main_device, Kind::Int64);
+    let doc_codes_t = ensure_tensor(doc_codes, codes_device, Kind::Int64);
+    let doc_residuals_t = ensure_tensor(doc_residuals, residuals_device, Kind::Uint8);
 
-    let doc_codes_strided =
-        StridedTensor::new(doc_codes_t, doc_lens_t.shallow_clone(), storage_device);
+    let doc_codes_strided = StridedTensor::new_with_lengths_device(
+        doc_codes_t,
+        doc_lens_t.shallow_clone(),
+        codes_device,
+        main_device,
+    );
 
-    let doc_residuals_strided = StridedTensor::new(doc_residuals_t, doc_lens_t, storage_device);
+    let doc_residuals_strided = StridedTensor::new_with_lengths_device(
+        doc_residuals_t,
+        doc_lens_t,
+        residuals_device,
+        main_device,
+    );
 
     let loaded_index = LoadedIndex {
         codec,

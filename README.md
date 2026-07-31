@@ -98,11 +98,11 @@ import torch
 
 from fast_plaid import search
 
-fast_plaid = search.FastPlaid(index="index", device="cpu", low_memory=True) # or "cuda" for GPU.
+fast_plaid = search.FastPlaid(index="index", device="cpu") # or "cuda" for GPU.
 # Leave blank for auto-detect, including multi-GPU.
 # On CPU, specifying device speeds up initialization.
-# On GPU with spare VRAM, pass low_memory=False for significantly faster search but higher VRAM usage. 
-# The low_memory flag has no effect when device="cpu" and is set to True by default.
+# On GPU, index placement and search batch sizes are tuned automatically from the
+# available VRAM. See "GPU Memory Tuning" below to force a specific trade-off.
 
 embedding_dim = 128
 
@@ -245,24 +245,49 @@ for doc_id, score, token_scores in results[0]:
 
 &nbsp;
 
-## 🚀 Search Speed Tip: `low_memory=False`
+## 🚀 GPU Memory Tuning
 
-`low_memory` is a constructor flag on `FastPlaid` that controls **where the index lives at query time** on GPU devices. It defaults to `True` (VRAM-friendly), but for most production search workloads the real win is flipping it off. This parameter has no effect when `device="cpu"`.
+On GPU, FastPlaid sizes itself to the available VRAM: `index_gpu_memory="auto"` decides where the index lives, and `search(batch_size="auto")` plans the scoring chunk sizes at query time. The defaults are good starting points, and the knobs below let you force a specific trade-off. None of them have any effect when `device="cpu"`.
 
-| Setting                      | VRAM                                               | Search Speed                                |
-| ---------------------------- | -------------------------------------------------- | ------------------------------------------- |
-| `low_memory=True` (default)  | Minimal — index tensors stream from CPU per query  | Slower                                      |
-| `low_memory=False`           | Higher — index tensors live on GPU                 | **Significantly faster queries-per-second** |
+### Index placement: `index_gpu_memory`
+
+A constructor flag controlling **where the large document tensors live at query time**. Placement changes speed only, never results.
+
+| Setting            | VRAM                                                         | Search Speed                                |
+| ------------------ | ------------------------------------------------------------ | ------------------------------------------- |
+| `"low"`            | Minimal, codes and residuals stay on CPU                     | Slowest                                     |
+| `"medium"`         | Moderate, codes on GPU, residuals (the larger tensor) on CPU | Faster                                      |
+| `"high"`           | Highest, codes and residuals both live on GPU                | **Significantly faster queries-per-second** |
+| `"auto"` (default) | Adaptive, measured when the index loads                      | Highest tier that fits                      |
+
+`"auto"` reads the free VRAM of each device and picks the highest tier that keeps total device occupancy within `index_memory_fraction` (default `0.7`), leaving the rest for the search itself.
 
 ```python
-# Default — low VRAM, slightly slower search
+# Default, adapts to each device
 fast_plaid = search.FastPlaid(index="index")
 
-# GPU-resident — higher VRAM, faster queries
-fast_plaid = search.FastPlaid(index="index", low_memory=False)
+# Force the index onto the GPU for maximum QPS
+fast_plaid = search.FastPlaid(index="index", index_gpu_memory="high")
+
+# Keep the index off the GPU, for instance to share the device with a model
+fast_plaid = search.FastPlaid(index="index", index_gpu_memory="low")
 ```
 
-**If your index fits in VRAM, don't hesitate to try `low_memory=False`.** The speedup on high-QPS workloads is often substantial because you skip a host→device copy on every single query. Switch back if you hit OOM. The flag has no effect when `device="cpu"`.
+**If your index fits in VRAM, `"high"` is the fastest option**, because you skip a host to device copy on every single query. Drop to `"medium"` or `"low"` if you hit OOM, or lower `index_memory_fraction` to reserve more room for other work on the device.
+
+### Scoring chunks: `batch_size`
+
+`search(batch_size=...)` sets how many documents are scored per chunk, in both the approximate scoring and the exact rerank stages. With `"auto"` (default), chunk sizes are planned from `search_memory_fraction` (default `0.5`) of the free VRAM sampled at query time, and chunking only kicks in when a query actually needs it, so short queries keep a full-speed single-chunk path. On CUDA OOM the stage retries with the budget halved. Passing an int forces fixed-size chunks instead.
+
+```python
+# Default, chunks planned from the memory budget
+scores = fast_plaid.search(queries_embeddings=queries, top_k=10)
+
+# Fixed-size chunks
+scores = fast_plaid.search(queries_embeddings=queries, top_k=10, batch_size=25_000)
+```
+
+Long-context queries, with many tokens per query, are what the planner is for: it is what keeps them from running out of memory.
 
 &nbsp;
 
@@ -270,9 +295,11 @@ fast_plaid = search.FastPlaid(index="index", low_memory=False)
 
 ### Initialization
 
-| Parameter    | Default | Memory            | Speed           | Notes                                                                                                                                                          |
-| ------------ | ------- | ----------------- | --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `low_memory` | `True`  | Lower = less VRAM | `True` = slower | 👉 See [Search Speed Tip](#-search-speed-tip-low_memoryfalse). If your index fits in GPU memory, set to `False` for faster search. No effect on CPU. |
+| Parameter                 | Default  | Memory                  | Speed                    | Notes                                                                                                                                     |
+| ------------------------- | -------- | ----------------------- | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `index_gpu_memory`        | `"auto"` | `"low"` = less VRAM     | `"low"` = slower         | 👉 See [GPU Memory Tuning](#-gpu-memory-tuning). `"high"` is fastest when the index fits in GPU memory. No effect on CPU.                  |
+| `index_memory_fraction`   | `0.7`    | Higher = more VRAM used | Higher = faster tier     | Share of total device memory `"auto"` placement may fill. No effect on CPU.                                                                |
+| `search_memory_fraction`  | `0.5`    | Higher = more VRAM used | Higher = larger chunks   | Share of free VRAM the scoring stages may use when `batch_size="auto"`. No effect on CPU.                                                  |
 
 ### Indexing
 
@@ -286,9 +313,10 @@ kmeans_niters     4           higher = slower indexing     higher = better clust
 ### Search
 
 ```python
-Parameter         Default     Speed               Accuracy                    Description
-n_ivf_probe       8           higher = slower     higher = better recall      cluster probes per query
-n_full_scores     4096        higher = slower     higher = better ranking     candidates for full scoring
+Parameter         Default     Speed                       Accuracy                    Description
+batch_size        auto        auto = tuned to free VRAM   no effect                   documents scored per chunk
+n_ivf_probe       8           higher = slower             higher = better recall      cluster probes per query
+n_full_scores     4096        higher = slower             higher = better ranking     candidates for full scoring
 ```
 
 ### Update
@@ -382,7 +410,9 @@ class FastPlaid:
         self,
         index: str,
         device: str | list[str] | None = None,
-        low_memory: bool = True,
+        index_gpu_memory: Literal["auto", "low", "medium", "high"] = "auto",
+        index_memory_fraction: float = 0.7,
+        search_memory_fraction: float = 0.5,
     ) -> None:
 ```
 
@@ -400,17 +430,29 @@ device: str | list[str] | None = None
     - If multiple GPUs are specified and available, multiprocessing is automatically set up for parallel execution.
       Remember to include your code within an `if __name__ == "__main__":` block for proper multiprocessing behavior.
 
-low_memory: bool = True
-    Controls where the index lives at query time on GPU devices.
+index_gpu_memory: Literal["auto", "low", "medium", "high"] = "auto" (optional)
+    Controls where the large document tensors live at query time on GPU devices.
+    Placement changes speed only, never results.
 
-    - True (default): index tensors stay on CPU and are moved to the GPU per
-      query. Lowest VRAM usage; slightly slower search.
-    - False: index tensors are loaded onto the GPU once and stay there.
+    - "low": codes and residuals stay on CPU. Lowest VRAM usage, slowest search.
+    - "medium": codes are moved to the GPU, residuals (the larger tensor) stay on CPU.
+    - "high": codes and residuals are both loaded onto the GPU and stay there.
       Significantly faster queries-per-second when VRAM allows.
+    - "auto" (default): picks the highest tier that keeps total device occupancy
+      within index_memory_fraction, per device.
 
-    If your index fits in GPU memory, consider setting low_memory=False — the
+    If your index fits in GPU memory, consider index_gpu_memory="high", the
     speedup on high-QPS search workloads is often substantial. No effect when
     device="cpu".
+
+index_memory_fraction: float = 0.7 (optional)
+    Fraction of total device memory that "auto" index placement may fill, in (0, 1].
+    Lower it to reserve more VRAM for other work on the same device.
+    No effect when device="cpu".
+
+search_memory_fraction: float = 0.5 (optional)
+    Fraction of the free VRAM that the scoring stages may use when planning chunks
+    for search(batch_size="auto"), in (0, 1]. No effect when device="cpu".
 
 ```
 
@@ -548,11 +590,12 @@ The **`search` method** lets you query the created index with your query embeddi
         self,
         queries_embeddings: torch.Tensor | list[torch.Tensor],
         top_k: int = 10,
-        batch_size: int = 25_000,
+        batch_size: int | Literal["auto"] = "auto",
         n_full_scores: int = 4096,
         n_ivf_probe: int = 8,
         show_progress: bool = True,
         subset: list[list[int]] | list[int] | None = None,
+        n_processes: int | None = None,
     ) -> list[list[tuple[int, float]]]:
 ```
 
@@ -565,9 +608,13 @@ queries_embeddings: torch.Tensor | list[torch.Tensor]
 top_k: int = 10 (optional)
     The number of top-scoring documents to retrieve for each query.
 
-batch_size: int = 25_000 (optional)
-    The internal batch size used for processing queries.
-    A larger batch size might improve throughput on powerful GPUs but can consume more memory.
+batch_size: int | Literal["auto"] = "auto" (optional)
+    The number of documents scored per chunk, in both the approximate scoring and the
+    exact rerank stages.
+    - "auto" (default): chunk sizes are planned from search_memory_fraction of the free
+      VRAM at query time, and short queries keep a single-chunk fast path.
+    - An int forces fixed-size chunks. A larger value might improve throughput on
+      powerful GPUs but can consume more memory.
 
 n_full_scores: int = 4096 (optional)
     The number of candidate documents for which full (re-ranked) scores are computed.
@@ -587,6 +634,10 @@ subset: list[list[int]] | list[int] | None = None (optional)
     - If a single list is provided, the same filter will be applied to all queries.
     - If a list of lists is provided, each inner list corresponds to the filter for each query.
     - Document IDs correspond to the order of insertion, starting from 0.
+
+n_processes: int | None = None (optional)
+    Number of joblib workers used for CPU search. Ignored when running on GPU(s).
+    Defaults to 1.
 ```
 
 ### Deleting from the Index

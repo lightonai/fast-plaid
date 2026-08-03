@@ -439,7 +439,7 @@ class FastPlaid:
             sites written against older versions keep working.
 
         """
-        # Before 1.4.7 the third parameter was `low_memory: bool`. Tolerate both the
+        # Before 1.5.0 the third parameter was `low_memory: bool`. Tolerate both the
         # keyword and the positional form: placement is now chosen automatically.
         legacy_low_memory = kwargs.pop("low_memory", None)
         if isinstance(index_gpu_memory, bool):
@@ -447,7 +447,7 @@ class FastPlaid:
             index_gpu_memory = "auto"
         if legacy_low_memory is not None:
             warnings.warn(
-                "low_memory is deprecated and ignored since 1.4.7: index placement is"
+                "low_memory is deprecated and ignored since 1.5.0: index placement is"
                 " now chosen automatically from the free VRAM. Pass"
                 " index_gpu_memory='low', 'medium' or 'high' to force a tier.",
                 DeprecationWarning,

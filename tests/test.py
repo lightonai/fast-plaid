@@ -1583,7 +1583,7 @@ class TestFreeze:
 
 
 class TestLegacyArguments:
-    """Call sites written against pre-1.4.7 versions must keep working."""
+    """Call sites written against pre-1.5.0 versions must keep working."""
 
     def _index(self, path) -> None:
         """Build a small searchable index at `path`."""
@@ -1619,7 +1619,7 @@ class TestLegacyArguments:
 
     @pytest.mark.parametrize("low_memory", [True, False])
     def test_low_memory_positional_is_ignored(self, test_index_path, low_memory):
-        """Pre-1.4.7 code passed low_memory as the third positional argument."""
+        """Pre-1.5.0 code passed low_memory as the third positional argument."""
         self._index(test_index_path)
 
         with pytest.warns(DeprecationWarning, match="low_memory"):

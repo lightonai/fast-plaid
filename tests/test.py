@@ -240,6 +240,45 @@ class TestUpdate:
             # Ensure index is closed to release file handles on Windows
             index.close()
 
+    def test_update_immediately_after_create(self, test_index_path):
+        """Update directly after create, with no search in between.
+
+        create() defers device loads (self.indices holds None placeholders),
+        so the first update() must reload the index itself. Regression test
+        for _reload_index returning the caller's own dict: the reload branch
+        in process_update then cleared the result through the alias and
+        raised KeyError on the device key.
+
+        start_from_scratch=0 keeps create() from saving embeddings.npy, as
+        with a >1000-document index: without it, update() rebuilds the index
+        from scratch and never reaches the lazy-reload branch under test.
+        """
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+
+        try:
+            initial_embeddings = [
+                torch.randn(100, 128, device="cpu") for _ in range(50)
+            ]
+            index.create(
+                documents_embeddings=initial_embeddings,
+                kmeans_niters=4,
+                start_from_scratch=0,
+            )
+
+            new_embeddings = [torch.randn(100, 128, device="cpu") for _ in range(50)]
+            index.update(documents_embeddings=new_embeddings)
+
+            queries = torch.randn(2, 30, 128, device="cpu")
+            results = index.search(queries_embeddings=queries, top_k=50)
+
+            for query_results in results:
+                for doc_id, _ in query_results:
+                    assert 0 <= doc_id < 100, (
+                        f"Document ID {doc_id} out of updated range"
+                    )
+        finally:
+            index.close()
+
     def test_multiple_updates(self, test_index_path):
         """Test multiple sequential updates to the index."""
         index = search.FastPlaid(index=test_index_path, device="cpu")

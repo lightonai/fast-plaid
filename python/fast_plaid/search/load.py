@@ -459,6 +459,11 @@ def _reload_index(
         Fraction of device memory 'auto' placement may fill.
 
     """
+    # Work on a copy: callers refresh their own dict from the return value
+    # (e.g. `indices_dict.clear(); indices_dict.update(new_indices)`), which
+    # empties the result too if it aliases the input.
+    indices = dict(indices)
+
     if not os.path.exists(os.path.join(index_path, "metadata.json")):
         for device in devices:
             indices[device] = None

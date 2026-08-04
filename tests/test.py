@@ -248,6 +248,10 @@ class TestUpdate:
         for _reload_index returning the caller's own dict: the reload branch
         in process_update then cleared the result through the alias and
         raised KeyError on the device key.
+
+        start_from_scratch=0 keeps create() from saving embeddings.npy, as
+        with a >1000-document index: without it, update() rebuilds the index
+        from scratch and never reaches the lazy-reload branch under test.
         """
         index = search.FastPlaid(index=test_index_path, device="cpu")
 
@@ -255,7 +259,11 @@ class TestUpdate:
             initial_embeddings = [
                 torch.randn(100, 128, device="cpu") for _ in range(50)
             ]
-            index.create(documents_embeddings=initial_embeddings, kmeans_niters=4)
+            index.create(
+                documents_embeddings=initial_embeddings,
+                kmeans_niters=4,
+                start_from_scratch=0,
+            )
 
             new_embeddings = [torch.randn(100, 128, device="cpu") for _ in range(50)]
             index.update(documents_embeddings=new_embeddings)

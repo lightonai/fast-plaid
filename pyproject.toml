@@ -155,3 +155,7 @@ select = ["ALL"]
 fixable = ["ALL"]
 unfixable = []
 dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+[tool.ruff.lint.per-file-ignores]
+# Triton compile-time parameters are capitalised by convention.
+"python/fast_plaid/search/fused/kernels.py" = ["N803"]

@@ -504,6 +504,10 @@ class FastPlaid:
         # Load an index object for each device.
         self.indices: dict[str, Any] = {}
 
+        # Fused CUDA fast path, staged lazily on first eligible search.
+        self._fused_engine: Any = None
+        self._fused_attempted = False
+
         # Initial Load
         self._check_and_reload_index()
 
@@ -634,6 +638,8 @@ class FastPlaid:
         with self._index_swap_lock:
             self.indices = new_indices
             self._last_known_mtime = current_mtime
+            # The staged fused copy describes the previous index contents.
+            self._invalidate_fused()
 
         return True
 
@@ -1106,6 +1112,75 @@ class FastPlaid:
 
         return search_indices, packed_queries, query_lengths, subset  # type: ignore
 
+    def _maybe_fused(self) -> Any:
+        """Return the fused engine for this index, staging it once if eligible.
+
+        Staging is attempted at most once per loaded index; a decline is
+        remembered so that every later search goes straight to the standard
+        pipeline without re-running the gate.
+        """
+        if self._fused_attempted:
+            return self._fused_engine
+
+        self._fused_attempted = True
+
+        # Multi-device search fans out across devices; the fused engine is
+        # single-device and declines rather than owning that scheduling.
+        if len(self.devices) != 1:
+            self._fused_reason = "fused search requires a single device"
+            return None
+
+        from .fused import build_engine
+
+        data = _load_index_tensors_cpu(index_path=self.index)
+        if data is None:
+            self._fused_reason = "index tensors could not be loaded"
+            return None
+
+        self._fused_engine, self._fused_reason = build_engine(
+            data=data, device=self.devices[0]
+        )
+        return self._fused_engine
+
+    def _invalidate_fused(self) -> None:
+        """Drop the staged fused engine after an index swap."""
+        self._fused_engine = None
+        self._fused_attempted = False
+        self._fused_reason = None
+
+    def fused_status(self) -> dict[str, Any]:
+        """Report whether the fused CUDA fast path is serving searches.
+
+        Searches never need this: the fast path activates on its own and
+        produces bit-identical scores either way. It exists so that a
+        deployment can assert at startup which path it got, instead of
+        inferring it from latency.
+
+        Evaluating the gate also stages the engine when the index is eligible,
+        so calling this at startup doubles as a warm-up and moves staging cost
+        off the first user query. Kernel compilation still happens on the first
+        search.
+
+        Returns
+        -------
+        A mapping with ``active`` (the engine is staged and serving),
+        ``reason`` (why it is not, or None), and — once active — the device,
+        resident bytes, token and document counts.
+
+        """
+        engine = self._maybe_fused()
+        if engine is None:
+            return {"active": False, "reason": self._fused_reason}
+
+        return {
+            "active": True,
+            "reason": None,
+            "device": engine.device,
+            "resident_bytes": engine.resident_bytes(),
+            "n_tokens": engine.n_tokens,
+            "n_docs": engine.n_docs,
+        }
+
     def _dispatch_search(
         self,
         device_fn: Any,
@@ -1310,6 +1385,19 @@ class FastPlaid:
         search_indices, packed_queries, query_lengths, subset = self._prepare_search(
             queries_embeddings, subset
         )
+
+        # Subset filtering is served by the standard pipeline; the fused path
+        # scores whole IVF candidate sets.
+        if subset is None:
+            fused = self._maybe_fused()
+            if fused is not None:
+                return fused.search(
+                    packed_queries,
+                    query_lengths,
+                    top_k=top_k,
+                    n_full_scores=n_full_scores,
+                    n_probe=n_ivf_probe,
+                )
 
         return self._dispatch_search(
             search_on_device,

@@ -130,9 +130,14 @@ impl ResidualCodec {
                 }
 
                 Some(
+                    // Uint8 (values are 0..2^nbits-1): torch >= 2.8 routes CUDA
+                    // index_select through gather, which is ~100x slower on
+                    // small int64 tables with millions of indices (6ms/query
+                    // on H100); the uint8 path stays fast on every torch and
+                    // the consumer wants uint8 output anyway.
                     Tensor::from_slice(&table_data)
                         .reshape(&[256, keys_per_byte as i64])
-                        .to_kind(Kind::Int64)
+                        .to_kind(Kind::Uint8)
                         .to_device(device),
                 )
             } else {

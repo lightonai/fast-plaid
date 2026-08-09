@@ -26,6 +26,14 @@ MAX_DIM = 128
 DISABLE_ENV = "FAST_PLAID_DISABLE_FUSED"
 DEBUG_ENV = "FAST_PLAID_FUSED_DEBUG"
 
+# Share of free memory the staged copy may occupy. Deliberately its own
+# constant rather than the index's ``index_memory_fraction``: the fused copy is
+# staged alongside the standard index rather than replacing it, so that budget
+# has already been spent once by the time this check runs, and charging the
+# second copy against what remains declines exactly the large indexes the fast
+# path exists for. Revisit if residency ever becomes single.
+DEFAULT_MEMORY_FRACTION = 0.8
+
 # Per-token device bytes staged by the engine: int32 centroid id, packed
 # residuals, fp16 reconstruction norm.
 _CODE_BYTES = 4
@@ -48,6 +56,7 @@ def check(  # noqa: PLR0911 - one branch per precondition, each with its reason
     *,
     n_tokens: int,
     free_bytes: int | None = None,
+    memory_fraction: float = DEFAULT_MEMORY_FRACTION,
 ) -> str | None:
     """Return a reason the fused path cannot run, or ``None`` if it can.
 
@@ -62,6 +71,10 @@ def check(  # noqa: PLR0911 - one branch per precondition, each with its reason
     free_bytes:
         Free device memory to plan against. Sampled from the device when not
         supplied.
+    memory_fraction:
+        Share of free memory the staged copy may occupy. See
+        :data:`DEFAULT_MEMORY_FRACTION` for why this is not the index's
+        ``index_memory_fraction``.
 
     """
     if os.environ.get(DISABLE_ENV, "") not in ("", "0"):
@@ -106,10 +119,12 @@ def check(  # noqa: PLR0911 - one branch per precondition, each with its reason
         + data["ivf"].numel() * 4
     )
     # Staging needs headroom for the transient buffers of at least one query.
-    if required > 0.8 * free_bytes:
+    if required > memory_fraction * free_bytes:
         return (
             f"index needs {required / 2**30:.1f} GiB resident but only "
-            f"{free_bytes / 2**30:.1f} GiB is free"
+            f"{free_bytes / 2**30:.1f} GiB is free and "
+            f"the staged copy is capped at {memory_fraction:g} of that, "
+            f"i.e. {memory_fraction * free_bytes / 2**30:.1f} GiB"
         )
 
     return None

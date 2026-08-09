@@ -12,13 +12,23 @@ import sys
 from typing import Any
 
 from . import ceiling, gate
-from .engine import FusedEngine
+from .engine import FusedEngine, FusedOutOfMemoryError
 
-__all__ = ["FusedEngine", "build_engine", "ceiling", "gate"]
+__all__ = [
+    "FusedEngine",
+    "FusedOutOfMemoryError",
+    "build_engine",
+    "ceiling",
+    "gate",
+]
 
 
 def build_engine(
-    data: dict[str, Any], device: str
+    data: dict[str, Any],
+    device: str,
+    *,
+    index_memory_fraction: float = gate.DEFAULT_MEMORY_FRACTION,
+    search_memory_fraction: float = ceiling.BUDGET_FRACTION,
 ) -> tuple[FusedEngine | None, str | None]:
     """Stage a fused engine, or explain why the fast path cannot run.
 
@@ -32,17 +42,28 @@ def build_engine(
         Index tensors from ``_load_index_tensors_cpu``.
     device:
         Target CUDA device.
+    index_memory_fraction:
+        Share of free memory the resident copy may occupy.
+    search_memory_fraction:
+        Share of free memory this engine's per-search transients may occupy.
 
     """
     n_tokens = int(data["doc_lengths"].sum())
-    reason = gate.check(data=data, device=device, n_tokens=n_tokens)
+    reason = gate.check(
+        data=data,
+        device=device,
+        n_tokens=n_tokens,
+        memory_fraction=index_memory_fraction,
+    )
     if reason is not None:
         if gate.is_debug():
             print(f"[fast-plaid] fused path unavailable: {reason}", file=sys.stderr)
         return None, reason
 
     try:
-        engine = FusedEngine(data=data, device=device)
+        engine = FusedEngine(
+            data=data, device=device, budget_fraction=search_memory_fraction
+        )
     except RuntimeError as error:  # pragma: no cover - device dependent
         # torch.cuda.OutOfMemoryError derives from RuntimeError; staging that
         # cannot complete is a fallback, not a failure.

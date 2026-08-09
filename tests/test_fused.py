@@ -251,23 +251,237 @@ def test_fused_matches_standard_pipeline(tmp_path, monkeypatch, nbits: int) -> N
 
 
 @requires_fused
-def test_fused_invalidated_after_update(tmp_path) -> None:
-    """An index update drops the staged copy instead of serving stale data."""
+def test_fused_starves_without_inventing_documents(tmp_path, monkeypatch) -> None:
+    """A query with fewer candidates than ``top_k`` returns fewer results.
+
+    Candidates are held in a rectangle as wide as the batch's largest set, and
+    the unused tail is zero-filled -- which reads as document 0. A short query
+    probing one cell alongside a long query probing many is the case where that
+    tail gets selected, and returning document 0 there would be inventing a
+    result whose IVF cells were never probed.
+    """
     torch.manual_seed(0)
     dim = 96
     documents = [
-        torch.nn.functional.normalize(torch.randn(32, dim), p=2, dim=-1)
-        for _ in range(512)
+        torch.nn.functional.normalize(torch.randn(8, dim), p=2, dim=-1)
+        for _ in range(256)
+    ]
+
+    # One long query probes many cells, one single-token query probes one.
+    queries = [
+        torch.nn.functional.normalize(torch.randn(32, dim), p=2, dim=-1),
+        torch.nn.functional.normalize(torch.randn(1, dim), p=2, dim=-1),
     ]
 
     index_path = str(tmp_path / "index")
     engine = FastPlaid(index=index_path, device="cuda:0")
     engine.create(documents_embeddings=documents, nbits=4)
 
-    assert engine._maybe_fused() is not None
+    kwargs = {"top_k": 200, "n_ivf_probe": 1, "show_progress": False}
+
+    monkeypatch.setenv(gate.DISABLE_ENV, "1")
     engine._invalidate_fused()
+    expected = engine.search(queries_embeddings=queries, **kwargs)
+
+    monkeypatch.delenv(gate.DISABLE_ENV)
+    engine._invalidate_fused()
+    assert engine._maybe_fused() is not None, "fused path should be eligible here"
+    actual = engine.search(queries_embeddings=queries, **kwargs)
+
+    assert any(len(row) < kwargs["top_k"] for row in expected), (
+        "setup did not starve any query, so this test would pass vacuously"
+    )
+    assert [len(row) for row in actual] == [len(row) for row in expected]
+    assert_same_ranking(actual, expected)
+
+
+@requires_fused
+def test_fused_serves_documents_added_by_update(tmp_path) -> None:
+    """A staged copy must not outlive the index it was built from.
+
+    Asserting on the invalidation helper would only prove the helper works.
+    The property that matters is that a search issued after ``update`` sees
+    the documents that update added, which a stale copy cannot do: their ids
+    did not exist when it was staged.
+    """
+    torch.manual_seed(0)
+    dim = 96
+    original = [
+        torch.nn.functional.normalize(torch.randn(32, dim), p=2, dim=-1)
+        for _ in range(512)
+    ]
+    added = [
+        torch.nn.functional.normalize(torch.randn(32, dim), p=2, dim=-1)
+        for _ in range(64)
+    ]
+
+    index_path = str(tmp_path / "index")
+    engine = FastPlaid(index=index_path, device="cuda:0")
+    engine.create(documents_embeddings=original, nbits=4)
+
+    # A document that is about to be added, used as its own query.
+    probe = [added[0]]
+
+    engine.search(queries_embeddings=probe, top_k=5, show_progress=False)
+    assert engine.fused_status()["active"] is True
+
+    engine.update(documents_embeddings=added)
+
+    results = engine.search(queries_embeddings=probe, top_k=5, show_progress=False)
+    assert engine.fused_status()["active"] is True
+    assert results[0], "fused search returned nothing after update"
+    assert results[0][0][0] >= len(original), (
+        "fused search did not return the added document, so it served the "
+        "index generation that preceded update()"
+    )
+
+
+def test_max_batch_honours_the_search_memory_fraction() -> None:
+    """A caller sharing the GPU is not overridden by the module default."""
+    shared = {
+        "n_centroids": 262_144,
+        "max_query_tokens": 32,
+        "n_docs": 8_840_000,
+        "candidates_per_query": 1_330_000,
+        "device": "cpu",
+        "free_bytes": 60 * GIB,
+    }
+    default = ceiling.max_batch(**shared)
+    restricted = ceiling.max_batch(**shared, budget_fraction=0.1)
+
+    assert restricted < default
+    # Linear in the fraction once the fixed floor is subtracted.
+    assert restricted == pytest.approx(
+        default * 0.1 / ceiling.BUDGET_FRACTION, rel=0.05
+    )
+
+
+@requires_fused
+def test_gate_honours_its_memory_fraction() -> None:
+    """Residency is judged against the fraction the caller passes."""
+    data = {
+        "nbits": 4,
+        "centroids": torch.zeros(1024, 96, dtype=torch.float16),
+        "ivf": torch.zeros(4096, dtype=torch.int32),
+        "ivf_lengths": torch.zeros(1024, dtype=torch.int64),
+        "doc_lengths": torch.zeros(1, dtype=torch.int64),
+    }
+    # Sized to sit between the two fractions: fits under 0.8, not under 0.2.
+    n_tokens = int(0.5 * GIB / gate.bytes_per_token(dim=96, nbits=4))
+    shared = {"data": data, "device": "cuda:0", "n_tokens": n_tokens}
+
+    assert gate.check(**shared, free_bytes=GIB, memory_fraction=0.8) is None
+    restricted = gate.check(**shared, free_bytes=GIB, memory_fraction=0.2)
+    assert restricted is not None
+    assert "capped at 0.2" in restricted
+
+
+@requires_fused
+def test_fused_falls_back_when_a_single_query_cannot_fit(tmp_path, monkeypatch) -> None:
+    """An unrecoverable OOM answers the call instead of failing it.
+
+    The admission model is fitted, so it can be optimistic on an index shaped
+    unlike the ones it was fitted to. Raising there would fail a call the
+    standard pipeline serves happily, so the engine signals and the caller
+    falls through.
+    """
+    torch.manual_seed(0)
+    documents = [
+        torch.nn.functional.normalize(torch.randn(16, 96), p=2, dim=-1)
+        for _ in range(512)
+    ]
+    queries = torch.nn.functional.normalize(torch.randn(4, 32, 96), p=2, dim=-1)
+
+    engine = FastPlaid(index=str(tmp_path / "index"), device="cuda:0")
+    engine.create(documents_embeddings=documents, nbits=4)
+
+    monkeypatch.setenv(gate.DISABLE_ENV, "1")
+    engine._invalidate_fused()
+    expected = engine.search(queries_embeddings=queries, top_k=5, show_progress=False)
+
+    monkeypatch.delenv(gate.DISABLE_ENV)
+    engine._invalidate_fused()
+    fused = engine._maybe_fused()
+    assert fused is not None
+
+    calls = {"n": 0}
+
+    def always_oom(*_args, **_kwargs):
+        calls["n"] += 1
+        raise torch.cuda.OutOfMemoryError("synthetic")
+
+    monkeypatch.setattr(fused, "_search_batch", always_oom)
+
+    actual = engine.search(queries_embeddings=queries, top_k=5, show_progress=False)
+
+    assert calls["n"] > 1, "the engine should have halved the batch before giving up"
+    assert_same_ranking(actual, expected)
+    # Transient pressure is not a reason to restage.
+    assert engine._fused_engine is fused
+
+
+def test_stale_staging_is_not_published(tmp_path) -> None:
+    """A copy finished after the index moved is dropped, not published.
+
+    Staging runs outside the swap lock, so an update can land between reading
+    the generation and publishing the result. Needs no GPU: the generation
+    handshake is plain bookkeeping.
+    """
+    engine = FastPlaid(index=str(tmp_path / "index"), device="cpu")
+    stale_generation = engine._fused_generation
+
+    with engine._index_swap_lock:
+        engine._invalidate_fused()
+
+    sentinel = object()
+    assert engine._publish_fused(stale_generation, sentinel, None) is None
+    assert engine._fused_engine is None
+    # The attempt goes unrecorded, so the next search stages again rather than
+    # falling back to the standard path forever.
+    assert engine._fused_attempted is False
+
+    current = engine._fused_generation
+    assert engine._publish_fused(current, sentinel, None) is sentinel
+    assert engine._fused_engine is sentinel
+    assert engine._fused_attempted is True
+
+
+@pytest.mark.parametrize("mutation", ["create", "update", "delete", "close"])
+def test_index_mutations_retire_the_staged_copy(tmp_path, mutation: str) -> None:
+    """Every path that replaces ``indices`` also retires the fused copy.
+
+    ``_reload_under_lock`` is not the only writer: ``create``, ``update`` and
+    ``delete`` swap the index in place and then call ``_update_mtime``, which
+    is exactly what stops the reload path from noticing the change. Each has
+    to invalidate on its own. Needs no GPU -- a sentinel stands in for the
+    staged copy, since what is under test is the bookkeeping around the swap.
+    """
+    torch.manual_seed(0)
+    documents = [
+        torch.nn.functional.normalize(torch.randn(8, 96), p=2, dim=-1)
+        for _ in range(64)
+    ]
+
+    engine = FastPlaid(index=str(tmp_path / "index"), device="cpu")
+    engine.create(documents_embeddings=documents)
+
+    sentinel = object()
+    engine._fused_engine = sentinel
+    engine._fused_attempted = True
+    generation = engine._fused_generation
+
+    if mutation == "create":
+        engine.create(documents_embeddings=documents)
+    elif mutation == "update":
+        engine.update(documents_embeddings=documents[:8])
+    elif mutation == "delete":
+        engine.delete(subset=[0])
+    else:
+        engine.close()
+
     assert engine._fused_engine is None
     assert engine._fused_attempted is False
+    assert engine._fused_generation > generation
 
 
 @requires_fused

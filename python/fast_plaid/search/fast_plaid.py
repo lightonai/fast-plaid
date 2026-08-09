@@ -5,6 +5,7 @@ import glob
 import json
 import math
 import os
+import sys
 import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -507,6 +508,14 @@ class FastPlaid:
         # Fused CUDA fast path, staged lazily on first eligible search.
         self._fused_engine: Any = None
         self._fused_attempted = False
+        self._fused_reason: str | None = None
+        # Bumped whenever the loaded index is replaced. Staging records the
+        # generation it read, so a copy built while the index was changing is
+        # discarded rather than published over its successor.
+        self._fused_generation = 0
+        # Serializes staging so a burst of concurrent first searches builds
+        # one copy rather than one per thread.
+        self._fused_stage_lock = threading.Lock()
 
         # Initial Load
         self._check_and_reload_index()
@@ -520,6 +529,9 @@ class FastPlaid:
         """
         with self._index_swap_lock:
             self.indices.clear()
+            # The staged fused copy is device memory this call promised to
+            # release, and it maps the directory the caller is about to delete.
+            self._invalidate_fused()
         gc.collect()
 
     def __enter__(self) -> Self:
@@ -580,6 +592,8 @@ class FastPlaid:
             with self._index_swap_lock:
                 for device in self.devices:
                     self.indices[device] = None
+                # The index went away underneath a staged copy of it.
+                self._invalidate_fused()
             return True
 
         # 1. Optimistic Check (Fast, No Lock)
@@ -757,6 +771,7 @@ class FastPlaid:
             with self._index_swap_lock:
                 self.indices = dict.fromkeys(self.devices)
                 self._update_mtime()
+                self._invalidate_fused()
 
         return self
 
@@ -1036,6 +1051,7 @@ class FastPlaid:
             with self._index_swap_lock:
                 self.indices = new_indices
                 self._update_mtime()
+                self._invalidate_fused()
 
         return self
 
@@ -1117,43 +1133,92 @@ class FastPlaid:
 
         Staging is attempted at most once per loaded index; a decline is
         remembered so that every later search goes straight to the standard
-        pipeline without re-running the gate.
+        pipeline without re-running the gate. Replacing the index resets both,
+        so the next search re-stages against the contents now loaded.
         """
         if self._fused_attempted:
             return self._fused_engine
 
-        self._fused_attempted = True
+        with self._fused_stage_lock:
+            # Another thread may have finished staging while this one waited.
+            if self._fused_attempted:
+                return self._fused_engine
+            return self._stage_fused()
+
+    def _stage_fused(self) -> Any:
+        """Build the fused engine and publish it if the index has not moved.
+
+        Staging reads the index from disk and copies it to the device, which
+        takes seconds on a large corpus, so it deliberately runs outside
+        ``_index_swap_lock`` rather than blocking concurrent mutations for its
+        duration. Recording the generation first is what makes that safe: an
+        ``update`` landing mid-stage bumps the generation, and the finished
+        copy is then dropped instead of being published over the index that
+        replaced it.
+        """
+        generation = self._fused_generation
 
         # Multi-device search fans out across devices; the fused engine is
         # single-device and declines rather than owning that scheduling.
         if len(self.devices) != 1:
-            self._fused_reason = "fused search requires a single device"
-            return None
+            return self._publish_fused(
+                generation, None, "fused search requires a single device"
+            )
 
         from .fused import build_engine
 
         data = _load_index_tensors_cpu(index_path=self.index)
         if data is None:
-            self._fused_reason = "index tensors could not be loaded"
-            return None
+            return self._publish_fused(
+                generation, None, "index tensors could not be loaded"
+            )
 
-        self._fused_engine, self._fused_reason = build_engine(
-            data=data, device=self.devices[0]
+        # Only the transient budget takes the caller's setting. Residency
+        # deliberately keeps the gate's own default: while the fused copy is
+        # staged alongside the standard index rather than replacing it,
+        # `index_memory_fraction` has already been spent once, and charging
+        # the second copy against the remainder declines exactly the large
+        # indexes the fast path exists for. Revisit when residency is single.
+        engine, reason = build_engine(
+            data=data,
+            device=self.devices[0],
+            search_memory_fraction=self.search_memory_fraction,
         )
-        return self._fused_engine
+        return self._publish_fused(generation, engine, reason)
+
+    def _publish_fused(self, generation: int, engine: Any, reason: str | None) -> Any:
+        """Record a staging outcome, unless the index moved while it ran.
+
+        A stale outcome is discarded without marking the attempt, so the next
+        search stages again against the index that is actually loaded. Dropping
+        the last reference here also returns the copy's device memory.
+        """
+        with self._index_swap_lock:
+            if generation != self._fused_generation:
+                return None
+            self._fused_engine = engine
+            self._fused_reason = reason
+            self._fused_attempted = True
+            return engine
 
     def _invalidate_fused(self) -> None:
-        """Drop the staged fused engine after an index swap."""
+        """Drop the staged fused engine and retire the generation it describes.
+
+        Callers hold ``_index_swap_lock``. Bumping the generation is what stops
+        a staging attempt already in flight from publishing a copy of the index
+        this swap has just replaced.
+        """
         self._fused_engine = None
         self._fused_attempted = False
         self._fused_reason = None
+        self._fused_generation += 1
 
     def fused_status(self) -> dict[str, Any]:
         """Report whether the fused CUDA fast path is serving searches.
 
         Searches never need this: the fast path activates on its own and
-        produces bit-identical scores either way. It exists so that a
-        deployment can assert at startup which path it got, instead of
+        reproduces the standard pipeline's arithmetic either way. It exists so
+        that a deployment can assert at startup which path it got, instead of
         inferring it from latency.
 
         Evaluating the gate also stages the engine when the index is eligible,
@@ -1391,13 +1456,26 @@ class FastPlaid:
         if subset is None:
             fused = self._maybe_fused()
             if fused is not None:
-                return fused.search(
-                    packed_queries,
-                    query_lengths,
-                    top_k=top_k,
-                    n_full_scores=n_full_scores,
-                    n_probe=n_ivf_probe,
-                )
+                from .fused import FusedOutOfMemoryError, gate
+
+                try:
+                    return fused.search(
+                        packed_queries,
+                        query_lengths,
+                        top_k=top_k,
+                        n_full_scores=n_full_scores,
+                        n_probe=n_ivf_probe,
+                    )
+                except FusedOutOfMemoryError as error:
+                    # Declining costs latency; raising would fail a call the
+                    # standard pipeline can still serve. The staged copy is
+                    # kept, since memory pressure from elsewhere on the device
+                    # is usually transient.
+                    if gate.is_debug():
+                        print(
+                            f"[fast-plaid] fused path fell back: {error}",
+                            file=sys.stderr,
+                        )
 
         return self._dispatch_search(
             search_on_device,
@@ -1588,6 +1666,7 @@ class FastPlaid:
             with self._index_swap_lock:
                 self.indices = new_indices
                 self._update_mtime()
+                self._invalidate_fused()
 
         return self
 

@@ -138,6 +138,7 @@ def max_batch(
     candidates_per_query: int,
     device: str,
     free_bytes: int | None = None,
+    budget_fraction: float = BUDGET_FRACTION,
 ) -> int:
     """Largest query batch whose transients fit the memory budget.
 
@@ -155,6 +156,10 @@ def max_batch(
         Device to plan against.
     free_bytes:
         Free memory override. Sampled from the device when not supplied.
+    budget_fraction:
+        Share of free memory the transients may occupy. Callers pass the
+        index's own ``search_memory_fraction``, so a deployment that lowered it
+        to share the GPU is honoured here rather than overridden.
 
     """
     if free_bytes is None:
@@ -169,7 +174,7 @@ def max_batch(
     if per_query <= 0:
         return 1
 
-    budget = int(BUDGET_FRACTION * free_bytes) - FIXED_BYTES
+    budget = int(budget_fraction * free_bytes) - FIXED_BYTES
     if budget <= 0:
         return 1
     return max(1, budget // per_query)

@@ -26,10 +26,26 @@ _EXACT_FRACTION = 4
 _MIN_DOT_DIM = 16
 
 
+class FusedOutOfMemoryError(RuntimeError):
+    """A single query's transients did not fit, so the caller must fall back.
+
+    Raised only after the batch has been halved down to one query. It is not a
+    reason to retire the staged copy: the ceiling is recomputed from free
+    memory on every call, so pressure from another process on the same device
+    resolves itself without restaging.
+    """
+
+
 class FusedEngine:
     """Device-resident index served by fused Triton kernels."""
 
-    def __init__(self, data: dict[str, Any], device: str) -> None:
+    def __init__(
+        self,
+        data: dict[str, Any],
+        device: str,
+        *,
+        budget_fraction: float = ceiling.BUDGET_FRACTION,
+    ) -> None:
         """Stage index tensors onto the device.
 
         Args:
@@ -38,9 +54,13 @@ class FusedEngine:
             Index tensors from ``_load_index_tensors_cpu``.
         device:
             Target CUDA device.
+        budget_fraction:
+            Share of free memory this engine's transients may occupy, taken
+            from the index's ``search_memory_fraction``.
 
         """
         self.device = device
+        self.budget_fraction = budget_fraction
         self.nbits = int(data["nbits"])
         self.dim = int(data["centroids"].shape[1])
         self.arch = torch.cuda.get_device_capability(device)
@@ -206,7 +226,11 @@ class FusedEngine:
         bitmap = torch.zeros(batch, self.n_docs, dtype=torch.bool, device=self.device)
         bitmap[segment_id // cells.shape[1], docs] = True
         n_cand = bitmap.sum(1).to(torch.int32)
-        max_cand = int(n_cand.max())
+        # Both bounds come back in one transfer. The minimum decides whether
+        # any query can select padding at all, which keeps the batch-1 path
+        # free of a second device-to-host round trip per call.
+        bounds = torch.stack((n_cand.min(), n_cand.max())).cpu()
+        min_cand, max_cand = int(bounds[0]), int(bounds[1])
 
         nonzero = bitmap.nonzero(as_tuple=False)
         row_offsets = torch.zeros(batch + 1, dtype=torch.int64, device=self.device)
@@ -217,7 +241,7 @@ class FusedEngine:
         )
         cand = torch.zeros(batch, max_cand, dtype=torch.int64, device=self.device)
         cand[nonzero[:, 0], slots] = nonzero[:, 1]
-        return cand, n_cand, max_cand, qct
+        return cand, n_cand, min_cand, max_cand, qct
 
     def _search_batch(
         self,
@@ -230,7 +254,9 @@ class FusedEngine:
     ) -> list[list[tuple[int, float]]]:
         """Score one admissible batch of padded queries."""
         batch, max_q, _ = queries.shape
-        cand, n_cand, max_cand, qct = self._candidates(queries, lengths, n_probe)
+        cand, n_cand, min_cand, max_cand, qct = self._candidates(
+            queries, lengths, n_probe
+        )
 
         approx = torch.full((batch, max_cand), float("-inf"), device=self.device)
         approx_maxsim[(max_cand, batch)](
@@ -249,11 +275,24 @@ class FusedEngine:
         )
 
         n_sel = min(max(1, n_full_scores // _EXACT_FRACTION), max_cand)
-        selected = torch.gather(cand, 1, approx.topk(n_sel, dim=1).indices).contiguous()
+        approx_top, approx_slots = approx.topk(n_sel, dim=1)
+        selected = torch.gather(cand, 1, approx_slots).contiguous()
 
-        exact = torch.empty(batch, n_sel, device=self.device)
+        # The candidate matrix is a rectangle as wide as the batch's largest
+        # candidate set, so a query holding fewer keeps a zero-filled tail --
+        # which reads as document 0. Selection is sorted descending and those
+        # slots score -inf, so they land at the end and are marked here. They
+        # must not reach the output: document 0's IVF cells were never probed
+        # for this query, and the standard pipeline would never return it.
+        filled = torch.isfinite(approx_top)
+
+        # The kernel skips padded slots rather than scoring documents whose
+        # results are discarded, so this fill is their result: those entries
+        # are never written.
+        exact = torch.full((batch, n_sel), float("-inf"), device=self.device)
         exact_maxsim[(n_sel, batch)](
             selected,
+            n_cand,
             self.offsets,
             self.residuals,
             self.codes,
@@ -276,9 +315,23 @@ class FusedEngine:
         ids = torch.gather(selected, 1, order)
         ids_cpu = ids.cpu().tolist()
         scores_cpu = scores.to(torch.float32).cpu().tolist()
+        if min_cand >= n_sel:
+            # No query in this batch is short enough to have selected padding.
+            return [
+                list(zip(row_ids, row_scores))
+                for row_ids, row_scores in zip(ids_cpu, scores_cpu)
+            ]
+
+        # A query with fewer than top_k candidates returns fewer than top_k
+        # results, which is what the standard pipeline does too.
+        keep_cpu = torch.gather(filled, 1, order).cpu().tolist()
         return [
-            list(zip(row_ids, row_scores))
-            for row_ids, row_scores in zip(ids_cpu, scores_cpu)
+            [
+                (doc, score)
+                for doc, score, ok in zip(row_ids, row_scores, row_keep)
+                if ok
+            ]
+            for row_ids, row_scores, row_keep in zip(ids_cpu, scores_cpu, keep_cpu)
         ]
 
     def search(
@@ -325,17 +378,35 @@ class FusedEngine:
             n_docs=self.n_docs,
             candidates_per_query=candidates_per_query,
             device=self.device,
+            budget_fraction=self.budget_fraction,
         )
 
+        # The ceiling is a fitted model, not a proof, so it can be optimistic on
+        # an index whose posting lists are shaped unlike the ones it was fitted
+        # to. Halving is the cheapest correction: the retry costs one failed
+        # attempt, where propagating the error would fail a call the standard
+        # pipeline can serve.
         results: list[list[tuple[int, float]]] = []
-        for start in range(0, queries.shape[0], chunk):
-            results.extend(
-                self._search_batch(
-                    queries[start : start + chunk],
-                    lengths[start : start + chunk],
-                    top_k=top_k,
-                    n_full_scores=n_full_scores,
-                    n_probe=n_probe,
+        start = 0
+        n_queries = queries.shape[0]
+        while start < n_queries:
+            try:
+                results.extend(
+                    self._search_batch(
+                        queries[start : start + chunk],
+                        lengths[start : start + chunk],
+                        top_k=top_k,
+                        n_full_scores=n_full_scores,
+                        n_probe=n_probe,
+                    )
                 )
-            )
+            except torch.cuda.OutOfMemoryError as error:
+                if chunk == 1:
+                    raise FusedOutOfMemoryError(
+                        "fused search ran out of memory at batch 1"
+                    ) from error
+                torch.cuda.empty_cache()
+                chunk = max(1, chunk // 2)
+                continue
+            start += chunk
         return results

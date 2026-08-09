@@ -84,6 +84,7 @@ def approx_maxsim(
 @triton.jit
 def exact_maxsim(
     sel_ptr,
+    ncand_ptr,
     off_ptr,
     res_ptr,
     cid_ptr,
@@ -104,68 +105,85 @@ def exact_maxsim(
 
     One program per (selected document, query). The reconstructed embeddings
     live in registers only.
+
+    Queries in a batch rarely hold the same number of candidates, and the
+    selection is a rectangle ``n_sel`` wide, so a query with fewer candidates
+    than that carries padding in its tail. Those slots address document 0 and
+    their scores are discarded, so the guard below skips them rather than
+    decompressing a document whose result cannot be used. Without it a query
+    holding 300 candidates against a selection depth of 1024 would spend 70%
+    of this kernel on work that is thrown away.
     """
     slot = tl.program_id(0)
     b = tl.program_id(1)
-    doc = tl.load(sel_ptr + b.to(tl.int64) * n_sel + slot)
+    # Selection is sorted descending and padded slots score -inf, so the real
+    # candidates occupy the first min(n_sel, n_cand) positions.
+    n_valid = tl.load(ncand_ptr + b)
+    if slot < n_valid:
+        doc = tl.load(sel_ptr + b.to(tl.int64) * n_sel + slot)
 
-    codes_per_byte: tl.constexpr = 8 // NBITS
-    packed_bytes: tl.constexpr = (DIM * NBITS) // 8
-    code_mask: tl.constexpr = (1 << NBITS) - 1
+        codes_per_byte: tl.constexpr = 8 // NBITS
+        packed_bytes: tl.constexpr = (DIM * NBITS) // 8
+        code_mask: tl.constexpr = (1 << NBITS) - 1
 
-    offset = tl.load(off_ptr + doc)
-    doc_len = tl.load(dlen_ptr + doc)
+        offset = tl.load(off_ptr + doc)
+        doc_len = tl.load(dlen_ptr + doc)
 
-    lanes = tl.arange(0, 128)
-    dim_mask = lanes < DIM
-    q_lanes = tl.arange(0, MAXQ)
-    query = tl.load(
-        q_ptr + b.to(tl.int64) * MAXQ * DIM + q_lanes[:, None] * DIM + lanes[None, :],
-        mask=dim_mask[None, :],
-        other=0.0,
-    )
+        lanes = tl.arange(0, 128)
+        dim_mask = lanes < DIM
+        q_lanes = tl.arange(0, MAXQ)
+        query = tl.load(
+            q_ptr
+            + b.to(tl.int64) * MAXQ * DIM
+            + q_lanes[:, None] * DIM
+            + lanes[None, :],
+            mask=dim_mask[None, :],
+            other=0.0,
+        )
 
-    acc = tl.full((MAXQ,), float("-inf"), tl.float32)
-    for tile in range(0, MAXD, TB):
-        if tile < doc_len:
-            tokens = tile + tl.arange(0, TB)
-            mask = tokens < doc_len
-            global_tok = offset + tokens
+        acc = tl.full((MAXQ,), float("-inf"), tl.float32)
+        for tile in range(0, MAXD, TB):
+            if tile < doc_len:
+                tokens = tile + tl.arange(0, TB)
+                mask = tokens < doc_len
+                global_tok = offset + tokens
 
-            byte_lane = (lanes // codes_per_byte)[None, :]
-            packed = tl.load(
-                res_ptr + global_tok[:, None] * packed_bytes + byte_lane,
-                mask=mask[:, None] & dim_mask[None, :],
-                other=0,
-            ).to(tl.int32)
-            shift = (codes_per_byte - 1 - (lanes % codes_per_byte)) * NBITS
-            code = (packed >> shift[None, :]) & code_mask
-            residual = tl.where(
-                dim_mask[None, :], tl.load(bw_ptr + code).to(tl.float32), 0.0
-            )
+                byte_lane = (lanes // codes_per_byte)[None, :]
+                packed = tl.load(
+                    res_ptr + global_tok[:, None] * packed_bytes + byte_lane,
+                    mask=mask[:, None] & dim_mask[None, :],
+                    other=0,
+                ).to(tl.int32)
+                shift = (codes_per_byte - 1 - (lanes % codes_per_byte)) * NBITS
+                code = (packed >> shift[None, :]) & code_mask
+                residual = tl.where(
+                    dim_mask[None, :], tl.load(bw_ptr + code).to(tl.float32), 0.0
+                )
 
-            cid = tl.load(cid_ptr + global_tok, mask=mask, other=0)
-            centroid = tl.load(
-                cent_ptr + cid.to(tl.int64)[:, None] * DIM + lanes[None, :],
-                mask=mask[:, None] & dim_mask[None, :],
-                other=0.0,
-            ).to(tl.float32)
+                cid = tl.load(cid_ptr + global_tok, mask=mask, other=0)
+                centroid = tl.load(
+                    cent_ptr + cid.to(tl.int64)[:, None] * DIM + lanes[None, :],
+                    mask=mask[:, None] & dim_mask[None, :],
+                    other=0.0,
+                ).to(tl.float32)
 
-            # Reconstruction rounds to Half, matching the standard chain.
-            emb = (centroid + residual).to(tl.float16)
-            # Dividing by a precomputed Half norm reproduces the ATen Half
-            # divide, which rounds a single fp32 quotient (CUDA has no fp16
-            # divide instruction).
-            norm = tl.load(norm_ptr + global_tok, mask=mask, other=1.0).to(tl.float32)
-            emb = (emb.to(tl.float32) / norm[:, None]).to(tl.float16)
+                # Reconstruction rounds to Half, matching the standard chain.
+                emb = (centroid + residual).to(tl.float16)
+                # Dividing by a precomputed Half norm reproduces the ATen Half
+                # divide, which rounds a single fp32 quotient (CUDA has no fp16
+                # divide instruction).
+                norm = tl.load(norm_ptr + global_tok, mask=mask, other=1.0).to(
+                    tl.float32
+                )
+                emb = (emb.to(tl.float32) / norm[:, None]).to(tl.float16)
 
-            scores = tl.dot(emb, tl.trans(query))
-            # Rounding the fp32 accumulator to Half reproduces the Half output
-            # of the standard HGEMM.
-            scores = scores.to(tl.float16).to(tl.float32)
-            # Masking with -inf mirrors the padded-token masking of the
-            # standard reducer; the maximum is deliberately left unclamped.
-            scores = tl.where(mask[:, None], scores, float("-inf"))
-            acc = tl.maximum(acc, tl.max(scores, axis=0))
+                scores = tl.dot(emb, tl.trans(query))
+                # Rounding the fp32 accumulator to Half reproduces the Half
+                # output of the standard HGEMM.
+                scores = scores.to(tl.float16).to(tl.float32)
+                # Masking with -inf mirrors the padded-token masking of the
+                # standard reducer; the maximum is deliberately left unclamped.
+                scores = tl.where(mask[:, None], scores, float("-inf"))
+                acc = tl.maximum(acc, tl.max(scores, axis=0))
 
-    tl.store(out_ptr + b.to(tl.int64) * n_sel + slot, tl.sum(acc))
+        tl.store(out_ptr + b.to(tl.int64) * n_sel + slot, tl.sum(acc))

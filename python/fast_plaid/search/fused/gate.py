@@ -95,7 +95,7 @@ def check(  # noqa: PLR0911 - one branch per precondition, each with its reason
     data: dict[str, Any],
     device: str,
     *,
-    n_tokens: int,
+    n_tokens: int | None = None,
     free_bytes: int | None = None,
     memory_fraction: float = DEFAULT_MEMORY_FRACTION,
 ) -> str | None:
@@ -108,7 +108,9 @@ def check(  # noqa: PLR0911 - one branch per precondition, each with its reason
     device:
         Target device string, e.g. ``'cuda:0'``.
     n_tokens:
-        Total indexed tokens, i.e. the sum of document lengths.
+        Total indexed tokens. Derived from ``data`` when not supplied, which
+        happens only after the checks that need no index at all -- a device
+        without CUDA is declined without ever reading the tensors.
     free_bytes:
         Free device memory to plan against. Sampled from the device when not
         supplied.
@@ -154,7 +156,10 @@ def check(  # noqa: PLR0911 - one branch per precondition, each with its reason
         free_bytes, _ = torch.cuda.mem_get_info(device)
 
     centroids = data["centroids"]
-    n_docs = int(data["doc_lengths"].reshape(-1).numel())
+    doc_lengths = data["doc_lengths"].reshape(-1)
+    n_docs = int(doc_lengths.numel())
+    if n_tokens is None:
+        n_tokens = int(doc_lengths.sum())
     resident = resident_bytes(
         n_tokens=n_tokens,
         n_docs=n_docs,

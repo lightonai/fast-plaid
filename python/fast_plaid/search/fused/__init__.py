@@ -1,9 +1,14 @@
 """Fused CUDA search path.
 
 An optional fast path that reads the standard index format unmodified and
-reproduces the standard scoring chain rounding point for rounding point. When
-any precondition is unmet the caller runs the standard pipeline instead, so
-enabling this module can change latency but never results.
+follows the standard scoring chain rounding step for rounding step. When any
+precondition is unmet the caller runs the standard pipeline instead.
+
+It returns the same documents, and scores them to within a measured tolerance
+rather than to the bit: the Half GEMM accumulates in a different order here
+than in libtorch, which moves a per-token maximum by an ulp or two on some
+architectures. Measured worst case across the parity suite is 2.44e-4 on
+sm_86/sm_89, 1.22e-4 on sm_80 and exactly zero on sm_90.
 
 Importing this package must work everywhere the wheel installs, including the
 CPU, macOS and Windows builds that ship no Triton at all. ``engine`` is

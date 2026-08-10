@@ -54,26 +54,44 @@ def test_bytes_per_token_matches_layout(dim: int, nbits: int, expected: int) -> 
     assert gate.bytes_per_token(dim=dim, nbits=nbits) == expected
 
 
-# Query lengths here stay at or below 32 tokens, where the final fp32 sum runs
-# over few enough fp16-representable terms to be exact, so the two engines are
-# expected to agree to the bit. The tolerance absorbs only the accumulation
-# order of that last reduction on an architecture the kernels have not been
-# measured on; it is deliberately far tighter than any score gap that could
-# reorder a ranking.
-SCORE_TOLERANCE = 1e-6
+# The two engines are not bit-identical, and how far apart they land depends on
+# the architecture. Both round the same way through reconstruction,
+# normalisation and the fp16 GEMM output, but `tl.dot` and libtorch's Half
+# matmul accumulate in different orders, so a per-token maximum can land one or
+# two fp16 ulps apart -- and a maximum that moves changes the sum.
+#
+# Measured by this suite against a real install:
+#
+#     sm_90 (H100)   0.0          exactly bit-identical
+#     sm_80 (A100)   1.22e-4
+#     sm_86 (A10G)   2.44e-4      2**-12, ~2 ulps at these magnitudes
+#     sm_89 (L4)     2.44e-4
+#
+# The tolerance below is therefore an empirical bound with headroom, not a claim
+# of exactness -- and measuring on H100 alone, as the first benchmarks did,
+# would have suggested a guarantee the other three architectures do not honour.
+#
+# The *strict* part of this assertion is the document set: equivalence means the
+# same documents come back, and that is asserted exactly at every distance.
+SCORE_TOLERANCE = 1e-3
+
+# Populated by every comparison so the suite can report what it actually saw
+# rather than only that it stayed under the bound.
+OBSERVED_DELTAS: list[float] = []
 
 
 def assert_same_ranking(actual, expected) -> None:
-    """Assert both engines return the same documents at the same scores.
+    """Assert both engines return the same documents at near-identical scores.
 
     Ids are compared as sets rather than positionally, because equal scores may
     be ordered differently by two top-k implementations and neither engine
-    promises a tie-break. Everything else is exact.
+    promises a tie-break. Substitution is not tolerated at any score distance.
 
-    An earlier version compared only rank-aligned scores within 1e-3, which
-    let fused substitute a document mainline never returned as long as the two
-    scored closely -- precisely the failure "retrieval-equivalent" claims
-    cannot happen, passing a test meant to prove it.
+    An earlier version compared only rank-aligned scores within 1e-3 and made
+    the id check *conditional* on the scores differing, which let fused
+    substitute a document mainline never returned as long as the two scored
+    closely -- precisely the failure "retrieval-equivalent" claims cannot
+    happen, passing the test meant to prove it.
     """
     assert len(actual) == len(expected)
     for got, want in zip(actual, expected):
@@ -81,16 +99,21 @@ def assert_same_ranking(actual, expected) -> None:
             f"returned {len(got)} results where the standard pipeline "
             f"returned {len(want)}"
         )
-        got_scores = [score for _, score in got]
-        want_scores = [score for _, score in want]
-        assert got_scores == pytest.approx(want_scores, abs=SCORE_TOLERANCE), (
-            f"scores diverge: {got_scores} vs {want_scores}"
-        )
         got_ids = {doc for doc, _ in got}
         want_ids = {doc for doc, _ in want}
         assert got_ids == want_ids, (
             f"different documents returned: only fused {sorted(got_ids - want_ids)}, "
             f"only standard {sorted(want_ids - got_ids)}"
+        )
+
+        got_scores = [score for _, score in got]
+        want_scores = [score for _, score in want]
+        if got_scores:
+            OBSERVED_DELTAS.append(
+                max(abs(a - b) for a, b in zip(got_scores, want_scores))
+            )
+        assert got_scores == pytest.approx(want_scores, abs=SCORE_TOLERANCE), (
+            f"scores diverge: {got_scores} vs {want_scores}"
         )
 
 
@@ -923,3 +946,21 @@ def test_fused_matches_standard_pipeline_on_empty_input(tmp_path, monkeypatch) -
     actual = engine.search(queries_embeddings=[], top_k=5, show_progress=False)
 
     assert actual == expected
+
+
+def test_zz_report_observed_score_deltas() -> None:
+    """Report the worst score deviation this suite actually produced.
+
+    Named to sort last. Not an assertion about a threshold -- the per-comparison
+    bound already enforces that -- but a standing measurement, so the number in
+    the PR description stays tied to something the suite prints rather than to
+    a claim nobody re-checks.
+    """
+    if not OBSERVED_DELTAS:
+        pytest.skip("no GPU comparisons ran")
+    worst = max(OBSERVED_DELTAS)
+    print(
+        f"\nmax score delta across {len(OBSERVED_DELTAS)} query comparisons: "
+        f"{worst:.10f}"
+    )
+    assert worst <= SCORE_TOLERANCE

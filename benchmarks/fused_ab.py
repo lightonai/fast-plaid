@@ -150,6 +150,10 @@ def agreement(fused: list, standard: list, top_k: int) -> dict:
     pairs = 0
     min_gap = float("inf")
     ties = 0
+    positions_differing = 0
+    positions = 0
+    substituted = 0
+    genuine_reorders = 0
     for got, want in zip(fused, standard):
         for (_, got_score), (_, want_score) in zip(got, want):
             max_delta = max(max_delta, abs(got_score - want_score))
@@ -158,6 +162,28 @@ def agreement(fused: list, standard: list, top_k: int) -> dict:
         want_ids = {doc for doc, _ in want}
         if want_ids:
             overlaps.append(len(got_ids & want_ids) / len(want_ids))
+        substituted += len(want_ids - got_ids)
+
+        # Set overlap cannot see reordering, which is the failure a score
+        # deviation actually causes. Compare the sequences position by
+        # position as well, and separate the two reasons a position can
+        # differ: the standard ranking had an exact tie there, so the order
+        # between those documents was arbitrary and neither engine promises
+        # it -- or it did not, and the deviation genuinely moved a rank.
+        got_seq = [doc for doc, _ in got]
+        want_seq = [doc for doc, _ in want]
+        want_scores_row = [score for _, score in want]
+        for i, (got_doc, want_doc) in enumerate(zip(got_seq, want_seq)):
+            positions += 1
+            if got_doc == want_doc:
+                continue
+            positions_differing += 1
+            here = want_scores_row[i]
+            tied = (i > 0 and want_scores_row[i - 1] == here) or (
+                i + 1 < len(want_scores_row) and want_scores_row[i + 1] == here
+            )
+            if not tied:
+                genuine_reorders += 1
 
         scores = [score for _, score in want]
         for higher, lower in itertools.pairwise(scores):
@@ -174,8 +200,14 @@ def agreement(fused: list, standard: list, top_k: int) -> dict:
         "top_k": top_k,
         "min_rank_gap": min_gap,
         "ties": ties,
-        # How much smaller than the closest ranking decision the deviation is.
+        # Whether the deviation is small enough that it cannot swap any
+        # adjacent pair. Below 1.0 means reordering is arithmetically possible.
         "headroom": (min_gap / max_delta) if max_delta > 0 else float("inf"),
+        # What actually happened, as opposed to what could.
+        "positions": positions,
+        "positions_differing": positions_differing,
+        "substituted": substituted,
+        "genuine_reorders": genuine_reorders,
     }
 
 
@@ -250,9 +282,20 @@ def main() -> None:
         f"{scores['mean_overlap']:.4f}"
     )
     print(
-        f"ranking stability: smallest non-zero gap between adjacent ranks "
-        f"{scores['min_rank_gap']:.5f} ({scores['ties']} exact ties) | "
-        f"{scores['headroom']:.0f}x larger than the deviation"
+        f"ranking stability: smallest non-zero adjacent-rank gap "
+        f"{scores['min_rank_gap']:.6f} ({scores['ties']} exact ties) | "
+        f"gap/deviation = {scores['headroom']:.2f}"
+        + (
+            "  <-- above 1.0: no adjacent pair can swap"
+            if scores["headroom"] >= 1.0
+            else "  <-- below 1.0: reordering is arithmetically possible"
+        )
+    )
+    print(
+        f"observed: {scores['substituted']} documents substituted | "
+        f"{scores['positions_differing']} of {scores['positions']} rank "
+        f"positions differ, of which {scores['genuine_reorders']} are not "
+        f"explained by an exact tie"
     )
 
 

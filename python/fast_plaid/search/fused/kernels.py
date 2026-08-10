@@ -15,12 +15,21 @@ Both follow the standard chain rounding step for rounding step: Half
 reconstruction, Half normalise, Half GEMM output, fp32 sum. The annotations in
 ``exact_maxsim`` mark each of those steps.
 
-What that does *not* buy is a bit-identical result. ``tl.dot`` accumulates in a
-different order than libtorch's Half matmul, so a per-token maximum can land
-one or two fp16 ulps away, and a maximum that moves changes the sum that
-follows it. The effect is architecture-dependent -- nil on sm_90, up to 2.44e-4
-on sm_86 and sm_89 -- and is measured by the parity suite rather than argued
-about here.
+What that does *not* buy is a bit-identical result. fp16 multiply with fp32
+accumulate is non-associative, so the order the K dimension is summed in
+decides the last bits, and the two implementations pick that order
+independently: mainline reaches cuBLAS, which selects a kernel by heuristic on
+architecture *and* shape, while ``tl.dot`` lowers to a schedule Triton's
+compiler chose. Where the true dot product sits near an fp16 rounding boundary
+the two round apart, and a per-token maximum lands an ulp or two away.
+
+Because both sides choose independently, the deviation is a property of the
+(card, shape) pair rather than of either alone: nil on sm_90 for the shapes in
+the parity suite, 1.22e-4 on sm_80, 2.44e-4 on sm_86 and sm_89 -- and on a real
+corpus the same index deviates by 0.0 on an H100 and 4.9e-4 on an L4. It does
+not amplify: an ulp can change *which* token wins a maximum, but two candidates
+within an ulp give a maximum within an ulp either way. The parity suite
+measures and reports it rather than asserting it here.
 """
 
 from __future__ import annotations

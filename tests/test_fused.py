@@ -54,25 +54,28 @@ def test_bytes_per_token_matches_layout(dim: int, nbits: int, expected: int) -> 
     assert gate.bytes_per_token(dim=dim, nbits=nbits) == expected
 
 
-# The two engines are not bit-identical, and how far apart they land depends on
-# the architecture. Both round the same way through reconstruction,
-# normalisation and the fp16 GEMM output, but `tl.dot` and libtorch's Half
-# matmul accumulate in different orders, so a per-token maximum can land one or
-# two fp16 ulps apart -- and a maximum that moves changes the sum.
+# The two engines are not bit-identical. Both round the same way through
+# reconstruction, normalisation and the fp16 GEMM output, but fp16 multiply with
+# fp32 accumulate is non-associative, and cuBLAS and Triton pick their
+# K-accumulation order independently -- so a per-token maximum can land one or
+# two fp16 ulps apart, and a maximum that moves changes the sum.
 #
+# How far apart depends on the card and the shape together, not either alone.
 # Measured by this suite against a real install:
 #
-#     sm_90 (H100)   0.0          exactly bit-identical
-#     sm_80 (A100)   1.22e-4
-#     sm_86 (A10G)   2.44e-4      2**-12, ~2 ulps at these magnitudes
+#     sm_90 (H100)   0.0
+#     sm_80 (A100)   1.22e-4      exactly one fp16 ulp at these magnitudes
+#     sm_86 (A10G)   2.44e-4      two
 #     sm_89 (L4)     2.44e-4
 #
-# The tolerance below is therefore an empirical bound with headroom, not a claim
-# of exactness -- and measuring on H100 alone, as the first benchmarks did,
-# would have suggested a guarantee the other three architectures do not honour.
+# and on FiQA, same index and same code, 0.0 on an H100 against 4.9e-4 on an L4.
+# Measuring on H100 alone -- as the first benchmarks did -- would have suggested
+# a guarantee no other architecture honours.
 #
-# The *strict* part of this assertion is the document set: equivalence means the
-# same documents come back, and that is asserted exactly at every distance.
+# The tolerance below is therefore an empirical bound with headroom, not a claim
+# of exactness. The *strict* part of this assertion is the document set:
+# equivalence means the same documents come back, and that is asserted exactly
+# at every score distance. No measurement so far has substituted one.
 SCORE_TOLERANCE = 1e-3
 
 # Populated by every comparison so the suite can report what it actually saw

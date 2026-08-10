@@ -6,9 +6,11 @@ precondition is unmet the caller runs the standard pipeline instead.
 
 It returns the same documents, and scores them to within a measured tolerance
 rather than to the bit: the Half GEMM accumulates in a different order here
-than in libtorch, which moves a per-token maximum by an ulp or two on some
-architectures. Measured worst case across the parity suite is 2.44e-4 on
-sm_86/sm_89, 1.22e-4 on sm_80 and exactly zero on sm_90.
+than in libtorch, which moves a per-token maximum by an ulp or two. How far
+depends on the card and the shape together, since cuBLAS and Triton each pick
+their kernel independently -- the parity suite sees 2.44e-4 on sm_86/sm_89,
+1.22e-4 on sm_80 and zero on sm_90, while one real corpus deviates by zero on
+an H100 and 4.9e-4 on an L4. Zero documents were substituted in any of it.
 
 Importing this package must work everywhere the wheel installs, including the
 CPU, macOS and Windows builds that ship no Triton at all. ``engine`` is

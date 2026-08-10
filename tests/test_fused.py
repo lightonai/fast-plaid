@@ -8,12 +8,16 @@ the gate and the batch-ceiling arithmetic.
 
 from __future__ import annotations
 
+import subprocess
+import sys
+
 import numpy as np
 import pytest
 import torch
+from filelock import FileLock
 
 from fast_plaid.search import FastPlaid
-from fast_plaid.search.fused import ceiling, gate
+from fast_plaid.search.fused import FusedCompilationError, ceiling, gate
 
 GIB = 2**30
 
@@ -50,27 +54,44 @@ def test_bytes_per_token_matches_layout(dim: int, nbits: int, expected: int) -> 
     assert gate.bytes_per_token(dim=dim, nbits=nbits) == expected
 
 
-def assert_same_ranking(actual, expected) -> None:
-    """Assert the two engines agree, allowing only tie-order differences.
+# Query lengths here stay at or below 32 tokens, where the final fp32 sum runs
+# over few enough fp16-representable terms to be exact, so the two engines are
+# expected to agree to the bit. The tolerance absorbs only the accumulation
+# order of that last reduction on an architecture the kernels have not been
+# measured on; it is deliberately far tighter than any score gap that could
+# reorder a ranking.
+SCORE_TOLERANCE = 1e-6
 
-    Bit-equivalence is a claim about *scores*, not about how equal scores are
-    ordered against each other. Asserting exact id order would test the
-    tie-breaking of two different top-k implementations, which is not a
-    property either engine promises.
+
+def assert_same_ranking(actual, expected) -> None:
+    """Assert both engines return the same documents at the same scores.
+
+    Ids are compared as sets rather than positionally, because equal scores may
+    be ordered differently by two top-k implementations and neither engine
+    promises a tie-break. Everything else is exact.
+
+    An earlier version compared only rank-aligned scores within 1e-3, which
+    let fused substitute a document mainline never returned as long as the two
+    scored closely -- precisely the failure "retrieval-equivalent" claims
+    cannot happen, passing a test meant to prove it.
     """
     assert len(actual) == len(expected)
     for got, want in zip(actual, expected):
+        assert len(got) == len(want), (
+            f"returned {len(got)} results where the standard pipeline "
+            f"returned {len(want)}"
+        )
         got_scores = [score for _, score in got]
         want_scores = [score for _, score in want]
-        assert got_scores == pytest.approx(want_scores, abs=1e-3), (
-            f"scores diverge, not a tie: {got_scores} vs {want_scores}"
+        assert got_scores == pytest.approx(want_scores, abs=SCORE_TOLERANCE), (
+            f"scores diverge: {got_scores} vs {want_scores}"
         )
-        for (got_id, got_score), (want_id, want_score) in zip(got, want):
-            if got_id != want_id:
-                assert got_score == pytest.approx(want_score, abs=1e-3), (
-                    f"doc {got_id} replaced {want_id} at unequal scores "
-                    f"({got_score} vs {want_score})"
-                )
+        got_ids = {doc for doc, _ in got}
+        want_ids = {doc for doc, _ in want}
+        assert got_ids == want_ids, (
+            f"different documents returned: only fused {sorted(got_ids - want_ids)}, "
+            f"only standard {sorted(want_ids - got_ids)}"
+        )
 
 
 def test_gate_declines_cpu() -> None:
@@ -359,21 +380,95 @@ def test_max_batch_honours_the_search_memory_fraction() -> None:
 @requires_fused
 def test_gate_honours_its_memory_fraction() -> None:
     """Residency is judged against the fraction the caller passes."""
+    dim, nbits, n_tokens = 96, 4, 100_000
     data = {
-        "nbits": 4,
-        "centroids": torch.zeros(1024, 96, dtype=torch.float16),
+        "nbits": nbits,
+        "centroids": torch.zeros(1024, dim, dtype=torch.float16),
         "ivf": torch.zeros(4096, dtype=torch.int32),
         "ivf_lengths": torch.zeros(1024, dtype=torch.int64),
-        "doc_lengths": torch.zeros(1, dtype=torch.int64),
+        "doc_lengths": torch.full((1_000,), n_tokens // 1_000, dtype=torch.int64),
     }
-    # Sized to sit between the two fractions: fits under 0.8, not under 0.2.
-    n_tokens = int(0.5 * GIB / gate.bytes_per_token(dim=96, nbits=4))
+    # Sized from the gate's own accounting rather than a hand-tuned constant,
+    # so that changing what staging costs cannot silently make this vacuous.
+    required = gate.resident_bytes(
+        n_tokens=n_tokens,
+        n_docs=1_000,
+        n_centroids=1024,
+        n_ivf=4096,
+        dim=dim,
+        nbits=nbits,
+    ) + gate.staging_bytes(n_tokens=n_tokens, dim=dim)
+    free_bytes = int(required / 0.5)
     shared = {"data": data, "device": "cuda:0", "n_tokens": n_tokens}
 
-    assert gate.check(**shared, free_bytes=GIB, memory_fraction=0.8) is None
-    restricted = gate.check(**shared, free_bytes=GIB, memory_fraction=0.2)
+    assert gate.check(**shared, free_bytes=free_bytes, memory_fraction=0.8) is None
+    restricted = gate.check(**shared, free_bytes=free_bytes, memory_fraction=0.2)
     assert restricted is not None
     assert "capped at 0.2" in restricted
+
+
+def test_resident_bytes_counts_more_than_the_per_token_arrays() -> None:
+    """Residency includes the per-document and per-centroid arrays.
+
+    They are small beside the per-token ones but not nothing: on millions of
+    documents they run to hundreds of megabytes, and an estimate that omitted
+    them understated exactly the indexes closest to declining.
+    """
+    dim, nbits, n_tokens, n_docs, n_centroids = 128, 4, 4_000_000, 100_000, 8_192
+    resident = gate.resident_bytes(
+        n_tokens=n_tokens,
+        n_docs=n_docs,
+        n_centroids=n_centroids,
+        n_ivf=1_000_000,
+        dim=dim,
+        nbits=nbits,
+    )
+    per_token_only = n_tokens * gate.bytes_per_token(dim=dim, nbits=nbits)
+
+    assert resident > per_token_only
+    # The per-document arrays alone are worth counting at this corpus size.
+    assert resident - per_token_only > n_docs * 12
+
+
+@requires_fused
+def test_gate_counts_the_staging_transient() -> None:
+    """Residency alone is not what has to fit; the precompute peaks above it.
+
+    An index that fits resident but not while being built would otherwise pass
+    the gate and then fail inside the constructor, turning a clean decline into
+    a staging exception.
+    """
+    dim, nbits, n_tokens = 128, 4, 4_000_000
+    n_docs, n_centroids, n_ivf = 100_000, 8_192, 1_000_000
+    resident = gate.resident_bytes(
+        n_tokens=n_tokens,
+        n_docs=n_docs,
+        n_centroids=n_centroids,
+        n_ivf=n_ivf,
+        dim=dim,
+        nbits=nbits,
+    )
+    transient = gate.staging_bytes(n_tokens=n_tokens, dim=dim)
+    assert transient > 0, "no transient means this test proves nothing"
+
+    data = {
+        "nbits": nbits,
+        "centroids": torch.zeros(n_centroids, dim, dtype=torch.float16),
+        "ivf": torch.zeros(n_ivf, dtype=torch.int32),
+        "ivf_lengths": torch.zeros(n_centroids, dtype=torch.int64),
+        "doc_lengths": torch.full((n_docs,), n_tokens // n_docs, dtype=torch.int64),
+    }
+    shared = {"data": data, "device": "cuda:0", "n_tokens": n_tokens}
+
+    # Free memory that covers residency but only half the staging peak.
+    tight = int((resident + transient / 2) / 0.8)
+    reason = gate.check(**shared, free_bytes=tight, memory_fraction=0.8)
+    assert reason is not None
+    assert "to stage" in reason
+
+    # The same index passes once the peak is covered.
+    ample = int((resident + transient) / 0.8) + 1
+    assert gate.check(**shared, free_bytes=ample, memory_fraction=0.8) is None
 
 
 @requires_fused
@@ -497,11 +592,17 @@ def test_fused_status_reports_activation(tmp_path) -> None:
     engine = FastPlaid(index=index_path, device="cuda:0")
     engine.create(documents_embeddings=documents, nbits=4)
 
-    status = engine.fused_status()
+    # Reporting never stages, so the question has to be asked explicitly.
+    assert engine.fused_status()["active"] is False
+
+    status = engine.prepare_fused()
     assert status["active"] is True
     assert status["reason"] is None
     assert status["n_docs"] == 512
     assert status["resident_bytes"] > 0
+
+    # And now reporting agrees, without having caused it.
+    assert engine.fused_status() == status
 
 
 def test_fused_status_explains_unavailability(tmp_path, monkeypatch) -> None:
@@ -519,9 +620,10 @@ def test_fused_status_explains_unavailability(tmp_path, monkeypatch) -> None:
     )
     engine.create(documents_embeddings=documents, nbits=4)
 
-    status = engine.fused_status()
+    status = engine.prepare_fused()
     assert status["active"] is False
     assert status["reason"]
+    assert gate.DISABLE_ENV in status["reason"]
 
 
 @requires_fused
@@ -608,3 +710,216 @@ def test_fused_splits_batches_without_misaligning_queries(
     actual = engine.search(queries_embeddings=queries, top_k=5, show_progress=False)
 
     assert_same_ranking(actual, expected)
+
+
+def test_fused_package_imports_without_triton() -> None:
+    """Importing the package must not require Triton.
+
+    The gate exists to decline in words on hardware that cannot run the
+    kernels, but it used to be unreachable: the package imported ``engine``,
+    which imports ``kernels``, which imports Triton unconditionally. Every
+    CPU, macOS and Windows install therefore raised ``ModuleNotFoundError``
+    from inside the call meant to report that Triton was missing -- 32 of the
+    65 tests in the suite failed that way.
+
+    Run in a subprocess with Triton masked, because this process may legitimately
+    have it installed.
+    """
+    program = (
+        "import sys; sys.modules['triton'] = None;"
+        "import fast_plaid.search.fused as fused;"
+        "reason = fused.gate.check(data={}, device='cpu', n_tokens=1);"
+        "assert reason is not None, reason;"
+        "engine, reason = fused.build_engine(data={}, device='cpu');"
+        "assert engine is None and reason is not None;"
+        "print('declined:', reason)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", program], capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, (
+        f"the package is not importable without Triton:\n{result.stderr}"
+    )
+    assert "declined:" in result.stdout
+
+
+def test_fused_can_be_disabled_per_instance(tmp_path) -> None:
+    """The opt-out is per instance, not only per process.
+
+    The environment variable disables the fast path everywhere, which is the
+    wrong granularity for a library: one index sharing a GPU with a model may
+    need to decline the extra residency while another does not.
+    """
+    torch.manual_seed(0)
+    documents = [
+        torch.nn.functional.normalize(torch.randn(8, 96), p=2, dim=-1)
+        for _ in range(64)
+    ]
+
+    engine = FastPlaid(index=str(tmp_path / "index"), device="cpu", fused=False)
+    engine.create(documents_embeddings=documents)
+
+    status = engine.prepare_fused()
+    assert status["active"] is False
+    assert "fused=False" in status["reason"]
+    assert engine._maybe_fused() is None
+
+
+def test_staging_declines_while_a_writer_holds_the_lock(tmp_path) -> None:
+    """Staging reads a coherent snapshot or none at all.
+
+    ``_load_index_tensors_cpu`` memory-maps the merged files and can pad them
+    in place, so reading them while another process is mid-update yields
+    tensors that never described any one state of the index. The generation
+    counter cannot see that -- it is in-process bookkeeping -- so the file lock
+    is what makes the read coherent.
+
+    Declining must also leave the attempt *unmarked*, or one unlucky overlap
+    with a writer would strand the index on the standard pipeline forever.
+    """
+    torch.manual_seed(0)
+    documents = [
+        torch.nn.functional.normalize(torch.randn(8, 96), p=2, dim=-1)
+        for _ in range(64)
+    ]
+
+    engine = FastPlaid(index=str(tmp_path / "index"), device="cpu")
+    engine.create(documents_embeddings=documents)
+    engine._invalidate_fused()
+
+    writer = FileLock(engine.lock_path)
+    with writer:
+        assert engine._maybe_fused() is None
+        assert engine._fused_attempted is False, (
+            "a busy writer must not be remembered as a permanent decline"
+        )
+
+
+def test_invalid_batch_size_raises_rather_than_falling_back(tmp_path) -> None:
+    """Argument validation happens before the fast path, not inside it.
+
+    Validating within the fused attempt would let the fallback swallow a
+    ``ValueError`` the caller needs to see, and answer the malformed call from
+    the standard pipeline as though nothing were wrong.
+    """
+    torch.manual_seed(0)
+    documents = [
+        torch.nn.functional.normalize(torch.randn(8, 96), p=2, dim=-1)
+        for _ in range(64)
+    ]
+    queries = torch.nn.functional.normalize(torch.randn(2, 8, 96), p=2, dim=-1)
+
+    engine = FastPlaid(index=str(tmp_path / "index"), device="cpu")
+    engine.create(documents_embeddings=documents)
+
+    with pytest.raises(ValueError, match="batch_size"):
+        engine.search(queries_embeddings=queries, batch_size=-1, show_progress=False)
+
+
+@requires_fused
+def test_explicit_batch_size_is_served_by_the_standard_pipeline(
+    tmp_path, monkeypatch
+) -> None:
+    """An explicit batch_size is declined by fused, not silently ignored.
+
+    It budgets documents per scoring chunk; the fused path chunks by queries,
+    so there is no honest translation. Whoever serves the call should be the
+    one that can honour the setting.
+    """
+    torch.manual_seed(0)
+    documents = [
+        torch.nn.functional.normalize(torch.randn(32, 96), p=2, dim=-1)
+        for _ in range(512)
+    ]
+    queries = torch.nn.functional.normalize(torch.randn(4, 32, 96), p=2, dim=-1)
+
+    engine = FastPlaid(index=str(tmp_path / "index"), device="cuda:0")
+    engine.create(documents_embeddings=documents, nbits=4)
+
+    fused = engine._maybe_fused()
+    assert fused is not None
+
+    def refuse(*_args, **_kwargs):
+        pytest.fail("the fused path served a call carrying an explicit batch_size")
+
+    monkeypatch.setattr(fused, "search", refuse)
+    results = engine.search(
+        queries_embeddings=queries, top_k=5, batch_size=64, show_progress=False
+    )
+    assert len(results) == 4
+
+
+@requires_fused
+def test_compilation_failure_retires_the_staged_copy(tmp_path, monkeypatch) -> None:
+    """A failure that will recur is not retried on every search.
+
+    Out-of-memory is transient and deliberately keeps the staged copy, since
+    the admission ceiling is recomputed from free memory each call. A kernel
+    that cannot compile for this index's shapes is the opposite: it fails
+    identically forever, so the copy is dropped and the standard pipeline
+    takes over without paying the same failure again.
+    """
+    torch.manual_seed(0)
+    documents = [
+        torch.nn.functional.normalize(torch.randn(32, 96), p=2, dim=-1)
+        for _ in range(512)
+    ]
+    queries = torch.nn.functional.normalize(torch.randn(4, 32, 96), p=2, dim=-1)
+
+    engine = FastPlaid(index=str(tmp_path / "index"), device="cuda:0")
+    engine.create(documents_embeddings=documents, nbits=4)
+
+    monkeypatch.setenv(gate.DISABLE_ENV, "1")
+    engine._invalidate_fused()
+    expected = engine.search(queries_embeddings=queries, top_k=5, show_progress=False)
+
+    monkeypatch.delenv(gate.DISABLE_ENV)
+    engine._invalidate_fused()
+    fused = engine._maybe_fused()
+    assert fused is not None
+
+    calls = {"n": 0}
+
+    def cannot_compile(*_args, **_kwargs):
+        calls["n"] += 1
+        raise FusedCompilationError("synthetic compilation failure")
+
+    monkeypatch.setattr(fused, "_search_batch", cannot_compile)
+
+    actual = engine.search(queries_embeddings=queries, top_k=5, show_progress=False)
+    assert_same_ranking(actual, expected)
+
+    assert engine._fused_engine is None, "the doomed copy should have been retired"
+    assert engine._fused_attempted is True, "retiring must not trigger a restage"
+
+    # A second search must not pay the failure again.
+    engine.search(queries_embeddings=queries, top_k=5, show_progress=False)
+    assert calls["n"] == 1
+
+
+@requires_fused
+def test_fused_matches_standard_pipeline_on_empty_input(tmp_path, monkeypatch) -> None:
+    """An empty request is answered, not raised on.
+
+    Padding took the maximum of the query lengths, which is undefined for an
+    empty batch, so fused turned an empty result into a ValueError.
+    """
+    torch.manual_seed(0)
+    documents = [
+        torch.nn.functional.normalize(torch.randn(8, 96), p=2, dim=-1)
+        for _ in range(64)
+    ]
+
+    engine = FastPlaid(index=str(tmp_path / "index"), device="cuda:0")
+    engine.create(documents_embeddings=documents, nbits=4)
+
+    monkeypatch.setenv(gate.DISABLE_ENV, "1")
+    engine._invalidate_fused()
+    expected = engine.search(queries_embeddings=[], top_k=5, show_progress=False)
+
+    monkeypatch.delenv(gate.DISABLE_ENV)
+    engine._invalidate_fused()
+    assert engine._maybe_fused() is not None
+    actual = engine.search(queries_embeddings=[], top_k=5, show_progress=False)
+
+    assert actual == expected

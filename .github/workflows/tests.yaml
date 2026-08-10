@@ -40,7 +40,7 @@ jobs:
           uv pip install torch==2.11.0 maturin setuptools numpy
           uv pip install -e . --no-build-isolation
           uv pip install pytest pytest-cov
-          uv run --no-sync pytest tests/test.py
+          uv run --no-sync pytest tests/test.py tests/test_fused.py
 
       - name: Run Ubuntu-specific tests
         if: matrix.os == 'ubuntu-latest'

@@ -7,16 +7,15 @@ kernels. The staged layout is derived from the index files as loaded by
 
 from __future__ import annotations
 
+import importlib
 from typing import Any
 
 import torch
 
 from . import ceiling
+from .errors import FusedCompilationError, FusedOutOfMemoryError
+from .gate import NORM_CHUNK
 from .kernels import approx_maxsim, exact_maxsim, pad_pow2, token_tile
-
-# Tokens per chunk of the reconstruction-norm precompute. Bounds the transient
-# of staging independently of corpus size.
-_NORM_CHUNK = 2_000_000
 
 # The standard pipeline exact-scores the top quarter of the approximate
 # ranking and draws its final top-k from that set alone (rust/search/search.rs).
@@ -26,14 +25,31 @@ _EXACT_FRACTION = 4
 _MIN_DOT_DIM = 16
 
 
-class FusedOutOfMemoryError(RuntimeError):
-    """A single query's transients did not fit, so the caller must fall back.
+def _compile_error_types() -> tuple[type[BaseException], ...]:
+    """Triton's own failures, whose module paths move between releases.
 
-    Raised only after the batch has been halved down to one query. It is not a
-    reason to retire the staged copy: the ceiling is recomputed from free
-    memory on every call, so pressure from another process on the same device
-    resolves itself without restaging.
+    Resolved by name rather than imported directly so that a Triton version
+    which has relocated one of them narrows what is caught instead of making
+    this module unimportable.
     """
+    found: list[type[BaseException]] = []
+    for module_name, class_name in (
+        ("triton.compiler.errors", "CompilationError"),
+        ("triton.runtime.errors", "OutOfResources"),
+    ):
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:  # pragma: no cover - depends on the Triton release
+            continue
+        found_type = getattr(module, class_name, None)
+        if isinstance(found_type, type) and issubclass(found_type, BaseException):
+            found.append(found_type)
+    return tuple(found)
+
+
+# Compilation and resource failures are deterministic for a given shape, so
+# they retire the staged copy where an out-of-memory error does not.
+_COMPILE_ERRORS = _compile_error_types()
 
 
 class FusedEngine:
@@ -128,8 +144,8 @@ class FusedEngine:
         code_mask = (1 << self.nbits) - 1
         shifts = [(codes_per_byte - 1 - i) * self.nbits for i in range(codes_per_byte)]
 
-        for start in range(0, self.n_tokens, _NORM_CHUNK):
-            stop = min(self.n_tokens, start + _NORM_CHUNK)
+        for start in range(0, self.n_tokens, NORM_CHUNK):
+            stop = min(self.n_tokens, start + NORM_CHUNK)
             packed = self.residuals[start:stop]
             parts = [
                 ((packed >> shift) & code_mask).to(torch.int64) for shift in shifts
@@ -157,18 +173,25 @@ class FusedEngine:
         return sum(t.numel() * t.element_size() for t in tensors)
 
     def _pad_queries(
-        self, packed_queries: torch.Tensor, query_lengths: list[int]
+        self,
+        packed_queries: torch.Tensor,
+        query_lengths: list[int],
+        *,
+        max_tokens: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Pack per-query tokens into a padded ``[B, MAXQ, dim]`` tensor.
+        """Pack per-query tokens into a padded ``[B, max_tokens, dim]`` tensor.
 
         Padded rows are zero, so their MaxSim contribution is exactly zero and
         the sum runs over true query tokens only. The true lengths are returned
         alongside because the IVF probe must ignore padded rows entirely.
+
+        ``max_tokens`` is the width the whole call was admitted against, not
+        this chunk's own maximum. Sizing it per chunk would give the kernels a
+        new shape whenever a chunk happened to hold only short queries, which
+        both re-triggers Triton specialisation and invalidates the ceiling that
+        admitted the chunk.
         """
-        # tl.dot requires every operand dimension to be at least 16, so short
-        # queries pad up to that floor rather than to their own power of two.
         batch = len(query_lengths)
-        max_tokens = max(_MIN_DOT_DIM, pad_pow2(max(query_lengths)))
 
         # One host-to-device transfer and one scatter, rather than a copy per
         # query: at large batches the per-query transfers dominate the kernels
@@ -342,6 +365,7 @@ class FusedEngine:
         top_k: int,
         n_full_scores: int,
         n_probe: int,
+        max_batch: int | None = None,
     ) -> list[list[tuple[int, float]]]:
         """Answer a batch of queries, splitting it to fit the memory budget.
 
@@ -358,10 +382,23 @@ class FusedEngine:
             exact-scored, matching the standard pipeline.
         n_probe:
             IVF cells probed per query token.
+        max_batch:
+            Upper bound on the queries scored per launch, from the caller's
+            ``batch_size``. The admission ceiling may still choose less.
 
         """
-        queries, lengths = self._pad_queries(packed_queries, query_lengths)
-        max_q = queries.shape[1]
+        if not query_lengths:
+            # The standard pipeline answers an empty request with an empty
+            # list. Padding would take the maximum of nothing.
+            return []
+
+        # Derived from the host-side lengths so that admission is decided
+        # before anything is allocated. The padded batch is the largest
+        # transient in the call, and an earlier version built it up front --
+        # outside the retry, and uncounted by the ceiling that was supposed to
+        # admit it -- so an out-of-memory error there escaped instead of
+        # falling back, and halving the chunk could not release it.
+        max_q = max(_MIN_DOT_DIM, pad_pow2(max(query_lengths)))
 
         key = (n_probe, max_q)
         if key not in self._candidate_bound:
@@ -380,6 +417,14 @@ class FusedEngine:
             device=self.device,
             budget_fraction=self.budget_fraction,
         )
+        if max_batch is not None:
+            chunk = max(1, min(chunk, max_batch))
+
+        # Token boundaries of each query within the packed input, so a chunk
+        # can transfer its own slice rather than the whole batch.
+        token_offsets = [0]
+        for length in query_lengths:
+            token_offsets.append(token_offsets[-1] + length)
 
         # The ceiling is a fitted model, not a proof, so it can be optimistic on
         # an index whose posting lists are shaped unlike the ones it was fitted
@@ -388,13 +433,19 @@ class FusedEngine:
         # pipeline can serve.
         results: list[list[tuple[int, float]]] = []
         start = 0
-        n_queries = queries.shape[0]
+        n_queries = len(query_lengths)
         while start < n_queries:
+            stop = min(n_queries, start + chunk)
             try:
+                queries, lengths = self._pad_queries(
+                    packed_queries[token_offsets[start] : token_offsets[stop]],
+                    query_lengths[start:stop],
+                    max_tokens=max_q,
+                )
                 results.extend(
                     self._search_batch(
-                        queries[start : start + chunk],
-                        lengths[start : start + chunk],
+                        queries,
+                        lengths,
                         top_k=top_k,
                         n_full_scores=n_full_scores,
                         n_probe=n_probe,
@@ -405,8 +456,16 @@ class FusedEngine:
                     raise FusedOutOfMemoryError(
                         "fused search ran out of memory at batch 1"
                     ) from error
+                queries = lengths = None
                 torch.cuda.empty_cache()
                 chunk = max(1, chunk // 2)
                 continue
-            start += chunk
+            except _COMPILE_ERRORS as error:
+                # Deterministic for this shape, so retrying or shrinking the
+                # batch cannot help. The caller retires the staged copy rather
+                # than paying the same failed compilation on every search.
+                raise FusedCompilationError(
+                    f"fused kernels could not run for this shape: {error}"
+                ) from error
+            start = stop
         return results

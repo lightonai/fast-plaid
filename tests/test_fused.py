@@ -453,6 +453,28 @@ def test_resident_bytes_counts_more_than_the_per_token_arrays() -> None:
     assert resident - per_token_only > n_docs * 12
 
 
+def test_gate_admits_the_msmarco_index_that_was_measured() -> None:
+    """The staging transient must not refuse an index already shown to serve.
+
+    Measured on an 80GB H100 with the standard index resident: 43.7 GiB free,
+    31.9 GiB staged, and the fused path answered the whole dev split. Counting
+    the precompute transient is right -- an index that fits resident but not
+    while being built should decline rather than fail inside the constructor --
+    but at NORM_CHUNK = 2,000,000 that transient came to 3.9 GiB, which pushed
+    resident + staging past the 0.8 cap and declined the flagship corpus by
+    0.8 GiB. The chunk is a scheduling knob, so it was shrunk rather than the
+    accounting loosened.
+    """
+    resident = int(31.9 * GIB)  # measured, not modelled
+    transient = gate.staging_bytes(n_tokens=597_909_930, dim=96)
+    free = int(43.7 * GIB)
+
+    assert resident + transient <= gate.DEFAULT_MEMORY_FRACTION * free, (
+        f"staging transient of {transient / GIB:.2f} GiB refuses an index "
+        f"measured to stage and serve"
+    )
+
+
 @requires_fused
 def test_gate_counts_the_staging_transient() -> None:
     """Residency alone is not what has to fit; the precompute peaks above it.

@@ -42,7 +42,15 @@ _NORM_BYTES = 2
 # Tokens per chunk of the reconstruction-norm precompute, owned here rather
 # than by the engine because the transient it implies is part of what this
 # module has to plan for. The engine imports it back.
-NORM_CHUNK = 2_000_000
+#
+# Deliberately small. At 2,000,000 the precompute peaked near 4 GiB on a
+# 96-dimension index, which was enough to refuse MS MARCO on an 80GB card --
+# 31.9 GiB resident plus 3.9 GiB to stage against a 35.0 GiB cap -- for an
+# index that had already been shown to stage and serve. The chunk is a pure
+# scheduling knob: shrinking it costs a few hundred extra iterations of a
+# bandwidth-bound loop that runs once per staging, and buys back capacity that
+# the gate would otherwise decline.
+NORM_CHUNK = 500_000
 
 # Device bytes the norm precompute holds per token of its chunk: the unpacked
 # codes and the per-byte partials at int64 (8 each), then the gathered

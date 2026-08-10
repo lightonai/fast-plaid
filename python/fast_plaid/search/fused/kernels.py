@@ -11,9 +11,16 @@ Two kernels replace the materialise-then-score stages of the standard pipeline:
     so the ``candidates x doc_tokens x dim`` embedding tensor is never
     materialised.
 
-Both reproduce the arithmetic of the standard chain rounding point for rounding
-point: Half reconstruction, Half normalise, Half GEMM output, fp32 sum. The
-annotations in ``exact_maxsim`` mark each of those points.
+Both follow the standard chain rounding step for rounding step: Half
+reconstruction, Half normalise, Half GEMM output, fp32 sum. The annotations in
+``exact_maxsim`` mark each of those steps.
+
+What that does *not* buy is a bit-identical result. ``tl.dot`` accumulates in a
+different order than libtorch's Half matmul, so a per-token maximum can land
+one or two fp16 ulps away, and a maximum that moves changes the sum that
+follows it. The effect is architecture-dependent -- nil on sm_90, up to 2.44e-4
+on sm_86 and sm_89 -- and is measured by the parity suite rather than argued
+about here.
 """
 
 from __future__ import annotations

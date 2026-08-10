@@ -74,11 +74,13 @@ def build_engine(
         Share of free memory this engine's per-search transients may occupy.
 
     """
-    n_tokens = int(data["doc_lengths"].sum())
+    # The gate derives the token count itself, and only after the checks that
+    # need no index at all. Reading ``data`` here instead would make a decline
+    # depend on the tensors being well formed -- the same ordering mistake as
+    # importing the kernels before deciding whether they can run.
     reason = gate.check(
         data=data,
         device=device,
-        n_tokens=n_tokens,
         memory_fraction=index_memory_fraction,
     )
     if reason is not None:

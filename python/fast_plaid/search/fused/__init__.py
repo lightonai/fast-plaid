@@ -4,6 +4,12 @@ An optional fast path that reads the standard index format unmodified and
 reproduces the standard scoring chain rounding point for rounding point. When
 any precondition is unmet the caller runs the standard pipeline instead, so
 enabling this module can change latency but never results.
+
+Importing this package must work everywhere the wheel installs, including the
+CPU, macOS and Windows builds that ship no Triton at all. ``engine`` is
+therefore reached lazily: it pulls in ``kernels``, which imports Triton
+unconditionally, and an eager import would raise ``ModuleNotFoundError`` from
+inside the very call that exists to decline gracefully.
 """
 
 from __future__ import annotations
@@ -12,15 +18,35 @@ import sys
 from typing import Any
 
 from . import ceiling, gate
-from .engine import FusedEngine, FusedOutOfMemoryError
+from .errors import (
+    FusedCompilationError,
+    FusedOutOfMemoryError,
+    FusedUnavailableError,
+)
 
 __all__ = [
+    "FusedCompilationError",
     "FusedEngine",
     "FusedOutOfMemoryError",
+    "FusedUnavailableError",
     "build_engine",
     "ceiling",
     "gate",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    """Resolve ``FusedEngine`` on first use rather than at import.
+
+    Keeps the public name available to callers that can run the kernels while
+    leaving the module importable on installs that cannot.
+    """
+    if name == "FusedEngine":
+        from .engine import FusedEngine
+
+        return FusedEngine
+    error = f"module {__name__!r} has no attribute {name!r}"
+    raise AttributeError(error)
 
 
 def build_engine(
@@ -29,7 +55,7 @@ def build_engine(
     *,
     index_memory_fraction: float = gate.DEFAULT_MEMORY_FRACTION,
     search_memory_fraction: float = ceiling.BUDGET_FRACTION,
-) -> tuple[FusedEngine | None, str | None]:
+) -> tuple[Any | None, str | None]:
     """Stage a fused engine, or explain why the fast path cannot run.
 
     Returns ``(engine, None)`` when the fast path is available and
@@ -59,6 +85,10 @@ def build_engine(
         if gate.is_debug():
             print(f"[fast-plaid] fused path unavailable: {reason}", file=sys.stderr)
         return None, reason
+
+    # Only reached once the gate has confirmed a CUDA device with Triton
+    # installed, so importing the kernels here cannot raise for want of it.
+    from .engine import FusedEngine
 
     try:
         engine = FusedEngine(

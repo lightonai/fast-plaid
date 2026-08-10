@@ -39,10 +39,51 @@ DEFAULT_MEMORY_FRACTION = 0.8
 _CODE_BYTES = 4
 _NORM_BYTES = 2
 
+# Tokens per chunk of the reconstruction-norm precompute, owned here rather
+# than by the engine because the transient it implies is part of what this
+# module has to plan for. The engine imports it back.
+NORM_CHUNK = 2_000_000
+
+# Device bytes the norm precompute holds per token of its chunk: the unpacked
+# codes and the per-byte partials at int64 (8 each), then the gathered
+# centroids, the looked-up bucket weights and their sum at fp16 (2 each). It is
+# the largest transient staging allocates, and on a 128-dimension index it
+# reaches several GiB -- large enough that omitting it made this check
+# optimistic by more than its own safety margin.
+_NORM_TRANSIENT_BYTES_PER_DIM = 22
+
 
 def bytes_per_token(dim: int, nbits: int) -> int:
     """Device bytes the fused engine stages per indexed token."""
     return _CODE_BYTES + (dim * nbits) // 8 + _NORM_BYTES
+
+
+def resident_bytes(
+    *, n_tokens: int, n_docs: int, n_centroids: int, n_ivf: int, dim: int, nbits: int
+) -> int:
+    """Device bytes the staged copy holds, matching ``FusedEngine``.
+
+    Mirrors ``FusedEngine.resident_bytes`` term for term. The per-document and
+    per-centroid arrays are small beside the per-token ones but not nothing:
+    on a corpus of millions of documents they run to hundreds of megabytes,
+    and leaving them out understated exactly the indexes closest to declining.
+    """
+    return (
+        n_tokens * bytes_per_token(dim=dim, nbits=nbits)
+        # centroids, fp16
+        + n_centroids * dim * 2
+        # ivf int32, ivf_lengths int64, ivf_offsets int64 (one longer)
+        + n_ivf * 4
+        + n_centroids * 8
+        + (n_centroids + 1) * 8
+        # per document: token offsets int64, lengths int32
+        + n_docs * 12
+    )
+
+
+def staging_bytes(*, n_tokens: int, dim: int) -> int:
+    """Peak transient the norm precompute adds on top of residency."""
+    return min(n_tokens, NORM_CHUNK) * dim * _NORM_TRANSIENT_BYTES_PER_DIM
 
 
 def is_debug() -> bool:
@@ -113,15 +154,28 @@ def check(  # noqa: PLR0911 - one branch per precondition, each with its reason
         free_bytes, _ = torch.cuda.mem_get_info(device)
 
     centroids = data["centroids"]
-    required = (
-        n_tokens * bytes_per_token(dim=dim, nbits=nbits)
-        + centroids.numel() * 2
-        + data["ivf"].numel() * 4
+    n_docs = int(data["doc_lengths"].reshape(-1).numel())
+    resident = resident_bytes(
+        n_tokens=n_tokens,
+        n_docs=n_docs,
+        n_centroids=int(centroids.shape[0]),
+        n_ivf=int(data["ivf"].numel()),
+        dim=dim,
+        nbits=nbits,
     )
-    # Staging needs headroom for the transient buffers of at least one query.
+
+    # Staging has to survive its own peak, not just its steady state: the norm
+    # precompute holds a chunk-sized working set on top of everything already
+    # copied. Planning against the sum is what makes declining honest -- an
+    # index that fits resident but not while being built would otherwise pass
+    # this check and then fail inside the constructor.
+    transient = staging_bytes(n_tokens=n_tokens, dim=dim)
+    required = resident + transient
+
     if required > memory_fraction * free_bytes:
         return (
-            f"index needs {required / 2**30:.1f} GiB resident but only "
+            f"index needs {resident / 2**30:.1f} GiB resident plus "
+            f"{transient / 2**30:.1f} GiB to stage, but only "
             f"{free_bytes / 2**30:.1f} GiB is free and "
             f"the staged copy is capped at {memory_fraction:g} of that, "
             f"i.e. {memory_fraction * free_bytes / 2**30:.1f} GiB"

@@ -421,6 +421,7 @@ class FastPlaid:
         index_gpu_memory: Literal["auto", "low", "medium", "high"] = "auto",
         index_memory_fraction: float = 0.7,
         search_memory_fraction: float = 0.5,
+        fused: bool = True,
         **kwargs: Any,
     ) -> None:
         """Initialize the FastPlaid instance.
@@ -441,6 +442,13 @@ class FastPlaid:
         search_memory_fraction:
             Fraction of free VRAM the scoring stages may use when batch_size
             is 'auto'.
+        fused:
+            Whether the fused CUDA fast path may serve eligible searches. It
+            stages a second, device-resident copy of the index, so it trades
+            VRAM for latency; pass False to keep this instance on the standard
+            pipeline regardless of what the hardware supports. The
+            FAST_PLAID_DISABLE_FUSED environment variable disables it for
+            every instance in the process.
         kwargs:
             Additional keyword arguments. Unknown keywords are ignored, so call
             sites written against older versions keep working.
@@ -506,6 +514,7 @@ class FastPlaid:
         self.indices: dict[str, Any] = {}
 
         # Fused CUDA fast path, staged lazily on first eligible search.
+        self.fused = fused
         self._fused_engine: Any = None
         self._fused_attempted = False
         self._fused_reason: str | None = None
@@ -1136,6 +1145,8 @@ class FastPlaid:
         pipeline without re-running the gate. Replacing the index resets both,
         so the next search re-stages against the contents now loaded.
         """
+        if not self.fused:
+            return None
         if self._fused_attempted:
             return self._fused_engine
 
@@ -1148,13 +1159,13 @@ class FastPlaid:
     def _stage_fused(self) -> Any:
         """Build the fused engine and publish it if the index has not moved.
 
-        Staging reads the index from disk and copies it to the device, which
-        takes seconds on a large corpus, so it deliberately runs outside
-        ``_index_swap_lock`` rather than blocking concurrent mutations for its
-        duration. Recording the generation first is what makes that safe: an
-        ``update`` landing mid-stage bumps the generation, and the finished
-        copy is then dropped instead of being published over the index that
-        replaced it.
+        Two different races have to be closed here, and they need different
+        instruments. Within this process, ``update`` can replace the loaded
+        index while staging runs: recording the generation first is what makes
+        that safe, since a copy finished after the swap is dropped rather than
+        published over its successor. Across processes, a writer can be part
+        way through rewriting the very files being read, and no in-process
+        counter can see that -- hence the file lock.
         """
         generation = self._fused_generation
 
@@ -1167,23 +1178,47 @@ class FastPlaid:
 
         from .fused import build_engine
 
-        data = _load_index_tensors_cpu(index_path=self.index)
-        if data is None:
-            return self._publish_fused(
-                generation, None, "index tensors could not be loaded"
-            )
+        # ``_load_index_tensors_cpu`` memory-maps the merged files and can pad
+        # them in place, so reading them while another process is mid-update
+        # yields tensors that never described any single state of the index.
+        #
+        # A writer holding this lock is performing an update that would retire
+        # the copy as soon as it landed, so waiting would buy a copy with no
+        # future. Decline instead, and leave the attempt unmarked so the next
+        # search stages against whatever the writer leaves behind.
+        try:
+            self.lock.acquire(timeout=0)
+        except FileLockTimeout:
+            return None
 
-        # Only the transient budget takes the caller's setting. Residency
-        # deliberately keeps the gate's own default: while the fused copy is
-        # staged alongside the standard index rather than replacing it,
-        # `index_memory_fraction` has already been spent once, and charging
-        # the second copy against the remainder declines exactly the large
-        # indexes the fast path exists for. Revisit when residency is single.
-        engine, reason = build_engine(
-            data=data,
-            device=self.devices[0],
-            search_memory_fraction=self.search_memory_fraction,
-        )
+        try:
+            data = _load_index_tensors_cpu(index_path=self.index)
+            if data is None:
+                return self._publish_fused(
+                    generation, None, "index tensors could not be loaded"
+                )
+
+            # The device copy is built with the lock still held. Releasing it
+            # first and copying from the mmap afterwards would reintroduce the
+            # incoherence the lock exists to prevent. Searches in this process
+            # are unaffected -- they take ``_index_swap_lock``, not this one --
+            # so the cost falls on a concurrent writer, which waits for one
+            # staging pass rather than racing it.
+            #
+            # Only the transient budget takes the caller's setting. Residency
+            # deliberately keeps the gate's own default: while the fused copy is
+            # staged alongside the standard index rather than replacing it,
+            # `index_memory_fraction` has already been spent once, and charging
+            # the second copy against the remainder declines exactly the large
+            # indexes the fast path exists for. Revisit when residency is single.
+            engine, reason = build_engine(
+                data=data,
+                device=self.devices[0],
+                search_memory_fraction=self.search_memory_fraction,
+            )
+        finally:
+            self.lock.release()
+
         return self._publish_fused(generation, engine, reason)
 
     def _publish_fused(self, generation: int, engine: Any, reason: str | None) -> Any:
@@ -1213,6 +1248,36 @@ class FastPlaid:
         self._fused_reason = None
         self._fused_generation += 1
 
+    def _retire_fused(self, reason: str) -> None:
+        """Stop using the staged copy without waiting for the index to change.
+
+        For failures that will recur. A kernel that cannot compile for this
+        index's shapes fails identically on every later search, so the copy is
+        dropped and the attempt left *marked*, which keeps the standard
+        pipeline serving without paying the same failure again. Transient
+        failures -- memory pressure from another process on the device --
+        deliberately do not come here, since the admission ceiling is
+        recomputed from free memory on every call and resolves them by itself.
+        """
+        with self._index_swap_lock:
+            self._fused_engine = None
+            self._fused_attempted = True
+            self._fused_reason = reason
+
+    def prepare_fused(self) -> dict[str, Any]:
+        """Stage the fused fast path now rather than on the first search.
+
+        Returns the same mapping as :meth:`fused_status`. Staging copies the
+        index to the device, which takes seconds on a large corpus, so calling
+        this at startup moves that cost off the first user query.
+
+        This is a warm start rather than a fully warmed one: Triton specialises
+        its kernels per query shape, so the first search at each padded query
+        length still pays a compilation.
+        """
+        self._maybe_fused()
+        return self.fused_status()
+
     def fused_status(self) -> dict[str, Any]:
         """Report whether the fused CUDA fast path is serving searches.
 
@@ -1221,10 +1286,8 @@ class FastPlaid:
         that a deployment can assert at startup which path it got, instead of
         inferring it from latency.
 
-        Evaluating the gate also stages the engine when the index is eligible,
-        so calling this at startup doubles as a warm-up and moves staging cost
-        off the first user query. Kernel compilation still happens on the first
-        search.
+        Reporting is pure -- it never stages, so asking the question cannot
+        change the answer. Call :meth:`prepare_fused` to stage explicitly.
 
         Returns
         -------
@@ -1233,9 +1296,17 @@ class FastPlaid:
         resident bytes, token and document counts.
 
         """
-        engine = self._maybe_fused()
+        with self._index_swap_lock:
+            engine = self._fused_engine
+            reason = self._fused_reason
+            attempted = self._fused_attempted
+
         if engine is None:
-            return {"active": False, "reason": self._fused_reason}
+            if not self.fused:
+                reason = "disabled by fused=False"
+            elif not attempted and reason is None:
+                reason = "not staged yet: call prepare_fused() or run a search"
+            return {"active": False, "reason": reason}
 
         return {
             "active": True,
@@ -1451,12 +1522,20 @@ class FastPlaid:
             queries_embeddings, subset
         )
 
+        # Validated here rather than inside the attempt below, so that a
+        # malformed argument raises for every caller instead of being
+        # swallowed by the fallback and answered by the standard pipeline.
+        _resolve_batch_size(batch_size)
+
         # Subset filtering is served by the standard pipeline; the fused path
-        # scores whole IVF candidate sets.
-        if subset is None:
+        # scores whole IVF candidate sets. An explicit batch_size is declined
+        # rather than ignored: it budgets documents per scoring chunk, and the
+        # fused path chunks by queries, so there is no honest translation --
+        # whoever serves the call should be the one that can honour it.
+        if subset is None and batch_size == "auto":
             fused = self._maybe_fused()
             if fused is not None:
-                from .fused import FusedOutOfMemoryError, gate
+                from .fused import FusedCompilationError, FusedUnavailableError, gate
 
                 try:
                     return fused.search(
@@ -1466,11 +1545,16 @@ class FastPlaid:
                         n_full_scores=n_full_scores,
                         n_probe=n_ivf_probe,
                     )
-                except FusedOutOfMemoryError as error:
+                except FusedUnavailableError as error:
                     # Declining costs latency; raising would fail a call the
-                    # standard pipeline can still serve. The staged copy is
-                    # kept, since memory pressure from elsewhere on the device
-                    # is usually transient.
+                    # standard pipeline can still serve. Only failures named by
+                    # this hierarchy are recoverable. Anything else -- a bug in
+                    # the kernels, or a device-side assert that leaves the CUDA
+                    # context unusable for the rest of the process -- is left to
+                    # propagate, since falling back would either hide a defect
+                    # or fail a second time on the same broken context.
+                    if isinstance(error, FusedCompilationError):
+                        self._retire_fused(str(error))
                     if gate.is_debug():
                         print(
                             f"[fast-plaid] fused path fell back: {error}",

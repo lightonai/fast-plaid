@@ -20,6 +20,12 @@ synchronise measures the launch and not the work. Every timed region is
 bracketed by ``torch.cuda.synchronize()``, and a full warm-up pass runs outside
 the timers to absorb Triton's first-call compilation.
 
+``--batch`` is the number of queries per ``search`` call, and the timed sweep
+answers the whole query file in calls of exactly that size -- the figure is
+labelled by it, so it has to be what was run. Peak memory is reset per arm,
+since the high-water mark of the process would otherwise report the first
+arm's footprint alongside the second's.
+
 Usage:
     python benchmarks/fused_ab.py --index path/to/index --queries queries.pt
 
@@ -30,6 +36,7 @@ tensors or one ``[n_queries, tokens, dim]`` tensor.
 from __future__ import annotations
 
 import argparse
+import itertools
 import os
 import statistics
 import time
@@ -75,13 +82,18 @@ def run_arm(
 
     # Drop any copy staged by a previous arm and re-evaluate the gate, so the
     # assertion below reflects this arm rather than a leftover decision.
+    # Reporting is pure, so staging has to be asked for explicitly.
     engine._invalidate_fused()  # noqa: SLF001
-    status = engine.fused_status()
+    status = engine.prepare_fused()
     if status["active"] is not fused:
         raise RuntimeError(
             f"wanted fused={fused} but the gate reports {status}; "
             f"the arms would not be comparable"
         )
+
+    # Each arm reports its own peak rather than the high-water mark of the
+    # process, which after the first arm would carry the other arm's footprint.
+    torch.cuda.reset_peak_memory_stats()
 
     search = lambda qs: engine.search(  # noqa: E731
         queries_embeddings=qs,
@@ -91,11 +103,21 @@ def run_arm(
         show_progress=False,
     )
 
+    def sweep(size: int) -> list:
+        """Answer every query in ``size``-query calls, as a server would."""
+        out = []
+        for start in range(0, len(queries), size):
+            out.extend(search(queries[start : start + size]))
+        return out
+
     # Warm-up: Triton compiles on first call, and the caching allocator has to
     # reach steady state. Neither belongs in the reported number.
     search(queries[: min(len(queries), batch)])
 
-    batched = [timed(lambda: search(queries)) for _ in range(repeats)]
+    # ``batch`` is the number of queries per ``search`` call, which is what the
+    # reported figure is labelled by. Passing the whole file in one call would
+    # measure a different regime than the label claims.
+    batched = [timed(lambda: sweep(batch)) for _ in range(repeats)]
     ms_per_query = statistics.median(batched) / len(queries) * 1e3
 
     # Batch-1 latency is a different regime: both engines are dominated by
@@ -107,16 +129,27 @@ def run_arm(
         "ms_per_query": ms_per_query,
         "qps": 1e3 / ms_per_query,
         "b1_ms": b1_ms,
+        "batch": batch,
         "peak_gib": torch.cuda.max_memory_allocated() / 2**30,
-        "results": search(queries),
+        "results": sweep(batch),
     }
 
 
 def agreement(fused: list, standard: list, top_k: int) -> dict:
-    """Max score deviation and mean top-k overlap between the two arms."""
+    """Compare the two arms, and measure whether a delta could reorder a ranking.
+
+    Overlap of 1.0 is evidence that no ranking moved, not proof that none can.
+    The quantity that decides it is the smallest *non-zero* gap between two
+    adjacent ranks: a score deviation strictly below that gap cannot swap any
+    pair, so the ranking is stable for arithmetic reasons rather than lucky
+    ones. Exact ties are excluded because reordering equally scored documents
+    is not a ranking change, and neither engine promises a tie-break.
+    """
     max_delta = 0.0
     overlaps = []
     pairs = 0
+    min_gap = float("inf")
+    ties = 0
     for got, want in zip(fused, standard):
         for (_, got_score), (_, want_score) in zip(got, want):
             max_delta = max(max_delta, abs(got_score - want_score))
@@ -125,11 +158,24 @@ def agreement(fused: list, standard: list, top_k: int) -> dict:
         want_ids = {doc for doc, _ in want}
         if want_ids:
             overlaps.append(len(got_ids & want_ids) / len(want_ids))
+
+        scores = [score for _, score in want]
+        for higher, lower in itertools.pairwise(scores):
+            gap = abs(higher - lower)
+            if gap == 0.0:
+                ties += 1
+            else:
+                min_gap = min(min_gap, gap)
+
     return {
         "max_score_delta": max_delta,
         "mean_overlap": statistics.mean(overlaps) if overlaps else float("nan"),
         "pairs": pairs,
         "top_k": top_k,
+        "min_rank_gap": min_gap,
+        "ties": ties,
+        # How much smaller than the closest ranking decision the deviation is.
+        "headroom": (min_gap / max_delta) if max_delta > 0 else float("inf"),
     }
 
 
@@ -142,7 +188,9 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=10)
     parser.add_argument("--n-full-scores", type=int, default=4096)
     parser.add_argument("--n-ivf-probe", type=int, default=8)
-    parser.add_argument("--batch", type=int, default=250, help="warm-up batch size")
+    parser.add_argument(
+        "--batch", type=int, default=250, help="queries per search call"
+    )
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--batch1-queries", type=int, default=32)
     args = parser.parse_args()
@@ -192,13 +240,19 @@ def main() -> None:
 
     scores = agreement(fused["results"], standard["results"], args.top_k)
     print(
-        f"speedup {standard['ms_per_query'] / fused['ms_per_query']:.1f}x batched, "
+        f"speedup {standard['ms_per_query'] / fused['ms_per_query']:.1f}x "
+        f"at batch {args.batch}, "
         f"{standard['b1_ms'] / fused['b1_ms']:.1f}x at batch 1"
     )
     print(
         f"agreement: max score delta {scores['max_score_delta']:.5f} over "
         f"{scores['pairs']} pairs | mean top-{args.top_k} overlap "
         f"{scores['mean_overlap']:.4f}"
+    )
+    print(
+        f"ranking stability: smallest non-zero gap between adjacent ranks "
+        f"{scores['min_rank_gap']:.5f} ({scores['ties']} exact ties) | "
+        f"{scores['headroom']:.0f}x larger than the deviation"
     )
 
 

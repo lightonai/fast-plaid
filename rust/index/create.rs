@@ -4,6 +4,7 @@ use pyo3_tch::PyTensor;
 use rand::prelude::SliceRandom;
 use rand::rngs::StdRng;
 use rand::{RngCore, SeedableRng};
+use rayon::prelude::*;
 use regex::Regex;
 use serde::Serialize;
 use serde_json;
@@ -110,18 +111,30 @@ pub fn optimize_ivf(
     // Translate IVF from embedding IDs to passage IDs and deduplicate
     let pids_in_ivf = emb_to_pid.index_select(0, ivf);
 
-    let mut unique_pids_list: Vec<Tensor> = Vec::new();
-    let mut new_inverted_file_lengths_vec: Vec<i64> = Vec::new();
     let inverted_file_lengths_vec: Vec<i64> = Vec::<i64>::try_from(inverted_file_lengths)?;
-    let mut ivf_offset: i64 = 0;
 
-    for &len in &inverted_file_lengths_vec {
-        let pids_seg = pids_in_ivf.narrow(0, ivf_offset, len);
-        let (unique_pids, _, _) = pids_seg.unique_dim(0, true, false, false);
-        unique_pids_list.push(unique_pids.copy());
-        new_inverted_file_lengths_vec.push(unique_pids.size1().unwrap_or(0));
-        ivf_offset += len;
-    }
+    let offsets: Vec<i64> = inverted_file_lengths_vec
+        .iter()
+        .scan(0i64, |acc, &len| {
+            let off = *acc;
+            *acc += len;
+            Some(off)
+        })
+        .collect();
+
+    let results: Vec<(Tensor, i64)> = offsets
+        .par_iter()
+        .zip(inverted_file_lengths_vec.par_iter())
+        .map(|(&offset, &len)| {
+            let pids_seg = pids_in_ivf.narrow(0, offset, len);
+            let (unique_pids, _, _) = pids_seg.unique_dim(0, true, false, false);
+            let n = unique_pids.size1().unwrap_or(0);
+            (unique_pids.copy(), n)
+        })
+        .collect();
+
+    let (unique_pids_list, new_inverted_file_lengths_vec): (Vec<Tensor>, Vec<i64>) =
+        results.into_iter().unzip();
 
     let pids_in_ivf = Tensor::cat(&unique_pids_list, 0);
     let new_inverted_file_lengths = Tensor::from_slice(&new_inverted_file_lengths_vec)
@@ -213,81 +226,196 @@ pub fn create_index(
     batch_size: i64,
     seed: Option<u64>,
     compress_only: bool,
+    bucket_cutoffs_override: Option<Vec<f64>>,
+    bucket_weights_override: Option<Vec<f64>>,
+    avg_residual_override: Option<PyTensor>,
+    cluster_threshold_override: Option<PyTensor>,
 ) -> Result<()> {
     let n_docs = documents_embeddings.len();
     let n_chunks = (n_docs as f64 / (batch_size as f64).min(1.0 + n_docs as f64)).ceil() as usize;
     let num_documents = documents_embeddings.len();
 
-    // Sample documents for codec training
-    let sample_k_float = 16.0 * (120.0 * num_documents as f64).sqrt();
-    let sample_count = (1.0 + sample_k_float).min(num_documents as f64) as usize;
-
-    let mut rng = if let Some(seed_value) = seed {
-        Box::new(StdRng::seed_from_u64(seed_value)) as Box<dyn RngCore>
-    } else {
-        Box::new(rand::rng()) as Box<dyn RngCore>
-    };
-
-    let mut passage_indices: Vec<u32> = (0..num_documents as u32).collect();
-    passage_indices.shuffle(&mut *rng);
-    let sample_pids: Vec<u32> = passage_indices.into_iter().take(sample_count).collect();
-
-    let mut total_samples_i64: i64 = 0;
-
     // Calculate average doc len for metadata estimation
-    // Note: iterating all tensors just for size is cheap (metadata access)
     let total_doc_len_sum: f64 = documents_embeddings
         .iter()
         .map(|t| t.size()[0] as f64)
         .sum();
     let avg_doc_len = total_doc_len_sum / n_docs as f64;
 
-    let sample_tensors_refs: Vec<&PyTensor> = sample_pids
-        .iter()
-        .map(|&pid| {
-            let tensor = &documents_embeddings[pid as usize];
-            total_samples_i64 += tensor.size()[0];
-            tensor
-        })
-        .collect();
+    let n_options = 2_i32.pow(nbits as u32);
 
-    let total_samples_f64 = total_samples_i64 as f64;
-    let heldout_size = (0.05 * total_samples_f64).min(50_000f64).round() as i64;
+    // When ALL codec parameters are provided externally (avg_residual,
+    // cluster_threshold, bucket_cutoffs, bucket_weights), skip the entire
+    // heldout sampling + residual computation.  This saves significant time
+    // when multiple codec arms share the same codebook and seed.
+    let (bucket_cutoffs, bucket_weights, avg_res_per_dim, inferred_threshold, final_centroids) =
+        if let (Some(avg_res), Some(thresh), Some(c), Some(w)) = (
+            avg_residual_override,
+            cluster_threshold_override,
+            bucket_cutoffs_override.as_ref(),
+            bucket_weights_override.as_ref(),
+        ) {
+            if c.len() != (n_options - 1) as usize || w.len() != n_options as usize {
+                anyhow::bail!(
+                    "bucket override shapes must be ({} cutoffs, {} weights) for nbits={}; got ({}, {})",
+                    n_options - 1, n_options, nbits, c.len(), w.len()
+                );
+            }
+            let mut sorted = c.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            if &sorted != c {
+                anyhow::bail!("bucket override cutoffs must be sorted ascending");
+            }
+            let bc = Tensor::from_slice(c).to_kind(Kind::Float).to_device(device);
+            let bw = Tensor::from_slice(w).to_kind(Kind::Float).to_device(device);
+            let avg = avg_res.to_device(device).to_kind(Kind::Float);
+            let thr = thresh.to_device(device);
 
-    let mut heldout_tensors_vec: Vec<Tensor> = Vec::with_capacity(sample_count);
-    let mut current_heldout_count: i64 = 0;
+            let thresh_fpath = Path::new(index_path).join("cluster_threshold.npy");
+            thr.to_device(Device::Cpu).write_npy(&thresh_fpath)?;
 
-    for tensor in sample_tensors_refs.iter().rev() {
-        let needed = heldout_size - current_heldout_count;
-        if needed <= 0 {
-            break;
-        }
-        let t_size = tensor.size()[0];
-
-        let t_half = if tensor.kind() == Kind::Half {
-            tensor.shallow_clone()
+            (bc, bw, avg, thr, centroids)
         } else {
-            tensor.to_kind(Kind::Half)
+            // Standard path: sample documents, compute heldout residuals, derive codec
+            let sample_k_float = 16.0 * (120.0 * num_documents as f64).sqrt();
+            let sample_count = (1.0 + sample_k_float).min(num_documents as f64) as usize;
+
+            let mut rng = if let Some(seed_value) = seed {
+                Box::new(StdRng::seed_from_u64(seed_value)) as Box<dyn RngCore>
+            } else {
+                Box::new(rand::rng()) as Box<dyn RngCore>
+            };
+
+            let mut passage_indices: Vec<u32> = (0..num_documents as u32).collect();
+            passage_indices.shuffle(&mut *rng);
+            let sample_pids: Vec<u32> = passage_indices.into_iter().take(sample_count).collect();
+
+            let mut total_samples_i64: i64 = 0;
+
+            let sample_tensors_refs: Vec<&PyTensor> = sample_pids
+                .iter()
+                .map(|&pid| {
+                    let tensor = &documents_embeddings[pid as usize];
+                    total_samples_i64 += tensor.size()[0];
+                    tensor
+                })
+                .collect();
+
+            let total_samples_f64 = total_samples_i64 as f64;
+            let heldout_size = (0.05 * total_samples_f64).min(50_000f64).round() as i64;
+
+            let mut heldout_tensors_vec: Vec<Tensor> = Vec::with_capacity(sample_count);
+            let mut current_heldout_count: i64 = 0;
+
+            for tensor in sample_tensors_refs.iter().rev() {
+                let needed = heldout_size - current_heldout_count;
+                if needed <= 0 {
+                    break;
+                }
+                let t_size = tensor.size()[0];
+
+                let t_half = if tensor.kind() == Kind::Half {
+                    tensor.shallow_clone()
+                } else {
+                    tensor.to_kind(Kind::Half)
+                };
+
+                if t_size <= needed {
+                    heldout_tensors_vec.push(t_half);
+                    current_heldout_count += t_size;
+                } else {
+                    let partial_tensor = t_half.narrow(0, t_size - needed, needed);
+                    heldout_tensors_vec.push(partial_tensor);
+                    current_heldout_count += needed;
+                }
+            }
+            heldout_tensors_vec.reverse();
+
+            let heldout_samples = if heldout_tensors_vec.is_empty() {
+                Tensor::empty(&[0, embedding_dim], (Kind::Half, device))
+            } else {
+                Tensor::cat(&heldout_tensors_vec, 0).to_device(device)
+            };
+
+            drop(heldout_tensors_vec);
+
+            if heldout_samples.size()[0] == 0 {
+                return Err(anyhow!(
+                    "Cannot train codec: no heldout samples were generated."
+                ));
+            }
+
+            let initial_codec = ResidualCodec::load(
+                nbits,
+                centroids,
+                Tensor::zeros(&[embedding_dim], (Kind::Half, device)),
+                None,
+                None,
+                device,
+            )?;
+
+            let heldout_codes = compress_into_codes(&heldout_samples, &initial_codec.centroids);
+
+            let mut reconstructed_embeddings_vec = Vec::new();
+            for code_batch_indexes in heldout_codes.split(batch_size, 0) {
+                reconstructed_embeddings_vec
+                    .push(initial_codec.centroids.index_select(0, &code_batch_indexes));
+            }
+            let heldout_reconstructed_embeddings = Tensor::cat(&reconstructed_embeddings_vec, 0);
+
+            let heldout_res_raw =
+                (&heldout_samples - &heldout_reconstructed_embeddings).to_kind(Kind::Float);
+
+            drop(heldout_samples);
+            drop(heldout_reconstructed_embeddings);
+
+            let heldout_distances = heldout_res_raw.norm_scalaropt_dim(2, &[1], false);
+            let inferred_threshold = scalar_quantile_kthvalue(&heldout_distances, 0.75);
+
+            let thresh_fpath = Path::new(index_path).join("cluster_threshold.npy");
+            inferred_threshold
+                .to_device(Device::Cpu)
+                .write_npy(&thresh_fpath)?;
+
+            let avg_res_per_dim = heldout_res_raw
+                .abs()
+                .mean_dim(Some(&[0i64][..]), false, Kind::Float)
+                .to_device(device);
+
+            let heldout_flat = heldout_res_raw.flatten(0, -1);
+
+            let (bucket_cutoffs, bucket_weights) = if let (Some(c), Some(w)) =
+                (bucket_cutoffs_override, bucket_weights_override)
+            {
+                if c.len() != (n_options - 1) as usize || w.len() != n_options as usize {
+                    anyhow::bail!(
+                        "bucket override shapes must be ({} cutoffs, {} weights) for nbits={}; got ({}, {})",
+                        n_options - 1, n_options, nbits, c.len(), w.len()
+                    );
+                }
+                (
+                    Tensor::from_slice(&c).to_kind(Kind::Float).to_device(device),
+                    Tensor::from_slice(&w).to_kind(Kind::Float).to_device(device),
+                )
+            } else {
+                let mut cutoff_vals: Vec<Tensor> = Vec::new();
+                for i in 1..n_options as i64 {
+                    let q = i as f64 / n_options as f64;
+                    cutoff_vals.push(scalar_quantile_kthvalue(&heldout_flat, q));
+                }
+                let mut weight_vals: Vec<Tensor> = Vec::new();
+                for i in 0..n_options as i64 {
+                    let q = (i as f64 + 0.5) / n_options as f64;
+                    weight_vals.push(scalar_quantile_kthvalue(&heldout_flat, q));
+                }
+                (Tensor::cat(&cutoff_vals, 0), Tensor::cat(&weight_vals, 0))
+            };
+
+            drop(heldout_flat);
+            drop(heldout_res_raw);
+
+            (bucket_cutoffs, bucket_weights, avg_res_per_dim, inferred_threshold, initial_codec.centroids)
         };
-
-        if t_size <= needed {
-            heldout_tensors_vec.push(t_half);
-            current_heldout_count += t_size;
-        } else {
-            let partial_tensor = t_half.narrow(0, t_size - needed, needed);
-            heldout_tensors_vec.push(partial_tensor);
-            current_heldout_count += needed;
-        }
-    }
-    heldout_tensors_vec.reverse();
-
-    let heldout_samples = if heldout_tensors_vec.is_empty() {
-        Tensor::empty(&[0, embedding_dim], (Kind::Half, device))
-    } else {
-        Tensor::cat(&heldout_tensors_vec, 0).to_device(device)
-    };
-
-    drop(heldout_tensors_vec);
 
     let mut est_total_embeddings_f64 = (num_documents as f64) * avg_doc_len;
     est_total_embeddings_f64 = (16.0 * est_total_embeddings_f64.sqrt()).log2().floor();
@@ -298,78 +426,9 @@ pub fn create_index(
     let mut plan_file = File::create(plan_fpath)?;
     writeln!(plan_file, "{}", serde_json::to_string_pretty(&plan_data)?)?;
 
-    if heldout_samples.size()[0] == 0 {
-        return Err(anyhow!(
-            "Cannot train codec: no heldout samples were generated."
-        ));
-    }
-
-    // Train codec for residual quantization
-    let initial_codec = ResidualCodec::load(
-        nbits,
-        centroids,
-        Tensor::zeros(&[embedding_dim], (Kind::Half, device)),
-        None,
-        None,
-        device,
-    )?;
-
-    let heldout_codes = compress_into_codes(&heldout_samples, &initial_codec.centroids);
-
-    let mut reconstructed_embeddings_vec = Vec::new();
-    for code_batch_indexes in heldout_codes.split(batch_size, 0) {
-        reconstructed_embeddings_vec
-            .push(initial_codec.centroids.index_select(0, &code_batch_indexes));
-    }
-    let heldout_reconstructed_embeddings = Tensor::cat(&reconstructed_embeddings_vec, 0);
-
-    let heldout_res_raw =
-        (&heldout_samples - &heldout_reconstructed_embeddings).to_kind(Kind::Float);
-
-    drop(heldout_samples);
-    drop(heldout_reconstructed_embeddings);
-
-    // Compute cluster threshold from residual distances
-    let heldout_distances = heldout_res_raw.norm_scalaropt_dim(2, &[1], false);
-    let inferred_threshold = scalar_quantile_kthvalue(&heldout_distances, 0.75);
-
-    let thresh_fpath = Path::new(index_path).join("cluster_threshold.npy");
-    inferred_threshold
-        .to_device(Device::Cpu)
-        .write_npy(&thresh_fpath)?;
-
-    let avg_res_per_dim = heldout_res_raw
-        .abs()
-        .mean_dim(Some(&[0i64][..]), false, Kind::Float)
-        .to_device(device);
-
-    let n_options = 2_i32.pow(nbits as u32);
-
-    // Use scalar_quantile_kthvalue instead of Tensor::quantile to avoid
-    // PyTorch's "input tensor is too large" error on large datasets.
-    let heldout_flat = heldout_res_raw.flatten(0, -1);
-
-    let mut cutoff_vals: Vec<Tensor> = Vec::new();
-    for i in 1..n_options as i64 {
-        let q = i as f64 / n_options as f64;
-        cutoff_vals.push(scalar_quantile_kthvalue(&heldout_flat, q));
-    }
-    let bucket_cutoffs = Tensor::cat(&cutoff_vals, 0);
-
-    let mut weight_vals: Vec<Tensor> = Vec::new();
-    for i in 0..n_options as i64 {
-        let q = (i as f64 + 0.5) / n_options as f64;
-        weight_vals.push(scalar_quantile_kthvalue(&heldout_flat, q));
-    }
-    let bucket_weights = Tensor::cat(&weight_vals, 0);
-
-    drop(heldout_flat);
-
-    drop(heldout_res_raw);
-
     let final_codec = ResidualCodec::load(
         nbits,
-        initial_codec.centroids,
+        final_centroids,
         avg_res_per_dim,
         Some(bucket_cutoffs.copy()),
         Some(bucket_weights.copy()),

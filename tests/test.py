@@ -1740,6 +1740,152 @@ class TestLegacyArguments:
             search.FastPlaid(index=test_index_path, device="cpu", index_gpu_memory="hi")
 
 
+class TestPrecomputedCentroids:
+    """Tests for passing precomputed centroids to skip K-means."""
+
+    def test_precomputed_centroids_same_results(self, test_index_path):
+        """Passing centroids from a prior run produces identical search results."""
+        rng = torch.Generator()
+        rng.manual_seed(7)
+        documents_embeddings = [torch.randn(30 + (i % 20), 128, generator=rng) for i in range(200)]
+        queries = torch.randn(5, 25, 128, generator=rng)
+
+        path_b = test_index_path + "_precomp"
+        os.makedirs(path_b)
+
+        index_a = search.FastPlaid(index=test_index_path, device="cpu")
+        index_a.create(documents_embeddings=documents_embeddings, kmeans_niters=4, seed=42, n_samples_kmeans=50)
+        results_a = index_a.search(queries_embeddings=queries, top_k=10)
+
+        centroids = torch.from_numpy(
+            __import__("numpy").load(os.path.join(test_index_path, "centroids.npy"))
+        )
+        index_a.close()
+
+        index_b = search.FastPlaid(index=path_b, device="cpu")
+        index_b.create(
+            documents_embeddings=documents_embeddings,
+            centroids=centroids,
+            seed=42,
+        )
+        results_b = index_b.search(queries_embeddings=queries, top_k=10)
+        index_b.close()
+        shutil.rmtree(path_b)
+
+        for q, (ra, rb) in enumerate(zip(results_a, results_b)):
+            ids_a = [doc_id for doc_id, _ in ra]
+            ids_b = [doc_id for doc_id, _ in rb]
+            assert ids_a == ids_b, f"query {q}: centroids passthrough changed results {ids_a} != {ids_b}"
+
+
+class TestBucketOverrides:
+    """Tests for explicit bucket_cutoffs / bucket_weights overrides."""
+
+    def test_explicit_buckets_creates_searchable_index(self, test_index_path):
+        """An index built with explicit bucket overrides is searchable."""
+        import numpy as np
+
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+        documents_embeddings = [torch.randn(100, 128, device="cpu") for _ in range(50)]
+
+        index.create(
+            documents_embeddings=documents_embeddings,
+            kmeans_niters=4,
+            nbits=2,
+            bucket_cutoffs=[-0.5, 0.0, 0.5],
+            bucket_weights=[-0.75, -0.25, 0.25, 0.75],
+        )
+
+        queries = torch.randn(3, 30, 128, device="cpu")
+        results = index.search(queries_embeddings=queries, top_k=10)
+
+        assert len(results) == 3
+        for query_results in results:
+            assert len(query_results) == 10
+
+        saved_cutoffs = np.load(os.path.join(test_index_path, "bucket_cutoffs.npy"))
+        assert saved_cutoffs.shape == (3,)
+
+    def test_bucket_override_bad_shape_raises(self, test_index_path):
+        """Wrong number of cutoffs/weights is rejected."""
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+        documents_embeddings = [torch.randn(100, 128, device="cpu") for _ in range(50)]
+
+        with pytest.raises(RuntimeError):
+            index.create(
+                documents_embeddings=documents_embeddings,
+                kmeans_niters=4,
+                nbits=2,
+                bucket_cutoffs=[-0.5, 0.5],
+                bucket_weights=[-0.75, 0.75],
+            )
+
+
+class TestFastPathOverrides:
+    """Tests for the full fast-path (avg_residual + cluster_threshold + buckets)."""
+
+    def test_fast_path_matches_standard_path(self, test_index_path):
+        """Full override path produces identical results to the standard path."""
+        import numpy as np
+
+        rng = torch.Generator()
+        rng.manual_seed(99)
+        documents_embeddings = [torch.randn(30 + (i % 15), 128, generator=rng) for i in range(100)]
+        queries = torch.randn(5, 25, 128, generator=rng)
+
+        index_a = search.FastPlaid(index=test_index_path, device="cpu")
+        index_a.create(documents_embeddings=documents_embeddings, kmeans_niters=4, seed=42, n_samples_kmeans=50)
+        results_a = index_a.search(queries_embeddings=queries, top_k=10)
+
+        centroids = torch.from_numpy(np.load(os.path.join(test_index_path, "centroids.npy")))
+        avg_residual = torch.from_numpy(np.load(os.path.join(test_index_path, "avg_residual.npy")))
+        cluster_threshold = torch.from_numpy(np.load(os.path.join(test_index_path, "cluster_threshold.npy")))
+        bucket_cutoffs_np = np.load(os.path.join(test_index_path, "bucket_cutoffs.npy"))
+        bucket_weights_np = np.load(os.path.join(test_index_path, "bucket_weights.npy"))
+        index_a.close()
+
+        path_b = test_index_path + "_fast"
+        os.makedirs(path_b)
+
+        index_b = search.FastPlaid(index=path_b, device="cpu")
+        index_b.create(
+            documents_embeddings=documents_embeddings,
+            centroids=centroids,
+            seed=42,
+            avg_residual=avg_residual,
+            cluster_threshold=cluster_threshold,
+            bucket_cutoffs=bucket_cutoffs_np.tolist(),
+            bucket_weights=bucket_weights_np.tolist(),
+        )
+        results_b = index_b.search(queries_embeddings=queries, top_k=10)
+        index_b.close()
+        shutil.rmtree(path_b)
+
+        for q, (ra, rb) in enumerate(zip(results_a, results_b)):
+            ids_a = [doc_id for doc_id, _ in ra]
+            ids_b = [doc_id for doc_id, _ in rb]
+            assert ids_a == ids_b, (
+                f"query {q}: fast-path changed results {ids_a} != {ids_b}"
+            )
+
+    def test_fast_path_partial_override_still_works(self, test_index_path):
+        """Providing only bucket overrides (no avg_residual/cluster_threshold) still works."""
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+        documents_embeddings = [torch.randn(100, 128, device="cpu") for _ in range(50)]
+
+        index.create(
+            documents_embeddings=documents_embeddings,
+            kmeans_niters=4,
+            nbits=2,
+            bucket_cutoffs=[-0.5, 0.0, 0.5],
+            bucket_weights=[-0.75, -0.25, 0.25, 0.75],
+        )
+
+        queries = torch.randn(3, 30, 128, device="cpu")
+        results = index.search(queries_embeddings=queries, top_k=10)
+        assert len(results) == 3
+
+
 # Legacy test function for backwards compatibility
 def test():
     """Ensure that the Fast-PLAiD search index can be created and queried correctly."""

@@ -108,8 +108,11 @@ pub fn optimize_ivf(
         .to_device(device)
         .to_kind(Kind::Int64);
 
-    // Translate IVF from embedding IDs to passage IDs and deduplicate
-    let pids_in_ivf = emb_to_pid.index_select(0, ivf);
+    // Translate IVF from embedding IDs to passage IDs and deduplicate.
+    // Extract to Vec<i64> so each rayon thread gets an owned slice (Tensor
+    // contains *mut C_tensor which is !Sync).
+    let pids_in_ivf_vec: Vec<i64> =
+        Vec::<i64>::try_from(&emb_to_pid.index_select(0, ivf))?;
 
     let inverted_file_lengths_vec: Vec<i64> = Vec::<i64>::try_from(inverted_file_lengths)?;
 
@@ -126,7 +129,8 @@ pub fn optimize_ivf(
         .par_iter()
         .zip(inverted_file_lengths_vec.par_iter())
         .map(|(&offset, &len)| {
-            let pids_seg = pids_in_ivf.narrow(0, offset, len);
+            let slice = &pids_in_ivf_vec[offset as usize..(offset + len) as usize];
+            let pids_seg = Tensor::from_slice(slice).to_device(device);
             let (unique_pids, _, _) = pids_seg.unique_dim(0, true, false, false);
             let n = unique_pids.size1().unwrap_or(0);
             (unique_pids.copy(), n)
@@ -248,7 +252,7 @@ pub fn create_index(
     // cluster_threshold, bucket_cutoffs, bucket_weights), skip the entire
     // heldout sampling + residual computation.  This saves significant time
     // when multiple codec arms share the same codebook and seed.
-    let (bucket_cutoffs, bucket_weights, avg_res_per_dim, inferred_threshold, final_centroids) =
+    let (bucket_cutoffs, bucket_weights, avg_res_per_dim, _inferred_threshold, final_centroids) =
         if let (Some(avg_res), Some(thresh), Some(c), Some(w)) = (
             avg_residual_override,
             cluster_threshold_override,

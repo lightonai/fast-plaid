@@ -15,12 +15,40 @@ from fast_plaid import fast_plaid_rust
 from usearch.index import Index
 
 from ..filtering import update as update_metadata_db
+from . import storage
 from .load import (
     _construct_index_from_tensors,
     _load_index_tensors_cpu,
     _reload_index,
     save_list_tensors_on_disk,
 )
+
+
+def _stage_last_shard(index_path: str) -> None:
+    """Re-materialize the last shard's payload files before a Rust update.
+
+    The Rust core folds new documents into the last chunk when it holds fewer
+    than 2000 documents, which means reading that chunk's codes and residuals
+    from disk — files the single-copy layout has already folded into the merged
+    copy and unlinked.
+    """
+    meta_path = os.path.join(index_path, "metadata.json")
+    if not os.path.exists(meta_path):
+        return
+    with open(meta_path) as f:
+        num_chunks = json.load(f).get("num_chunks", 0)
+    if num_chunks == 0:
+        return
+    last = num_chunks - 1
+    last_meta_path = os.path.join(index_path, f"{last}.metadata.json")
+    if not os.path.exists(last_meta_path):
+        return
+    with open(last_meta_path) as f:
+        n_docs = json.load(f).get("num_documents", 0)
+    if n_docs >= 2000:
+        return
+    storage.materialize_shards(index_path, num_chunks, "codes", [last])
+    storage.materialize_shards(index_path, num_chunks, "residuals", [last])
 
 
 def partial_reload(
@@ -422,6 +450,7 @@ def process_update(
         if os.path.exists(os.path.join(index_path, "buffer.npy")):
             os.remove(os.path.join(index_path, "buffer.npy"))
 
+        _stage_last_shard(index_path)
         fast_plaid_rust.update(
             index_path=index_path,
             index=indices_dict[devices[0]],
@@ -446,6 +475,7 @@ def process_update(
         tensors=existing_buffer_embeddings + documents_embeddings,
     )
 
+    _stage_last_shard(index_path)
     fast_plaid_rust.update(
         index_path=index_path,
         index=indices_dict[devices[0]],

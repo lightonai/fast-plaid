@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 from datetime import date
@@ -1418,10 +1419,10 @@ class TestFilteringModule:
 
 
 class TestFreeze:
-    """Tests for the freeze() API that drops per-shard codes/residuals."""
+    """Tests for the freeze() API that marks an index immutable."""
 
-    def test_freeze_removes_shards_and_search_still_works(self, test_index_path):
-        """freeze() deletes per-shard files but search results stay identical."""
+    def test_storage_is_single_copy_and_freeze_keeps_results(self, test_index_path):
+        """Payload shards are dropped at first load; freeze() changes nothing on disk."""
         index = search.FastPlaid(index=test_index_path, device="cpu")
 
         try:
@@ -1435,29 +1436,22 @@ class TestFreeze:
                 queries_embeddings=queries_embeddings, top_k=10
             )
 
-            # Shards must exist before freeze.
-            shard_files_before = [
+            # The index is single-copy from the first load: no payload shards.
+            shard_files = [
                 f
                 for f in os.listdir(test_index_path)
-                if f.endswith(".codes.npy") and not f.startswith("merged_")
+                if (f.endswith(".codes.npy") or f.endswith(".residuals.npy"))
+                and not f.startswith("merged_")
             ]
-            assert len(shard_files_before) > 0, "expected per-shard codes files"
-
-            index.freeze()
-
-            # Shards gone, merged files retained.
-            shard_files_after = [
-                f
-                for f in os.listdir(test_index_path)
-                if f.endswith(".codes.npy") and not f.startswith("merged_")
-            ]
-            assert shard_files_after == [], (
-                f"expected all shard codes files deleted, got {shard_files_after}"
+            assert shard_files == [], (
+                f"expected no per-shard payload files, got {shard_files}"
             )
             assert os.path.exists(os.path.join(test_index_path, "merged_codes.npy"))
             assert os.path.exists(
                 os.path.join(test_index_path, "merged_residuals.npy")
             )
+
+            index.freeze()
 
             results_after = index.search(
                 queries_embeddings=queries_embeddings, top_k=10
@@ -1643,6 +1637,202 @@ class TestFreeze:
             ]
             index.create(documents_embeddings=documents_embeddings, kmeans_niters=4)
             index.unfreeze()  # never frozen → no-op, must not raise
+        finally:
+            index.close()
+
+
+
+class TestSingleCopyStorage:
+    """The merged files are the only durable payload copy (issue #53)."""
+
+    def _payload_shards(self, path):
+        return sorted(
+            f
+            for f in os.listdir(path)
+            if (f.endswith(".codes.npy") or f.endswith(".residuals.npy"))
+            and not f.startswith("merged_")
+        )
+
+    def _build(self, path, n_docs=60, doc_len=60):
+        index = search.FastPlaid(index=path, device="cpu")
+        documents_embeddings = [
+            torch.randn(doc_len, 128, device="cpu") for _ in range(n_docs)
+        ]
+        index.create(documents_embeddings=documents_embeddings, kmeans_niters=4)
+        return index
+
+    def test_update_stays_single_copy_and_is_searchable(self, test_index_path):
+        """update() stages what Rust needs, then returns to a single copy."""
+        index = self._build(test_index_path, n_docs=40)
+        try:
+            new_embeddings = [torch.randn(60, 128, device="cpu") for _ in range(10)]
+            index.update(documents_embeddings=new_embeddings)
+
+            assert self._payload_shards(test_index_path) == [], (
+                "payload shards must be dropped again after update()"
+            )
+            queries = torch.randn(2, 30, 128, device="cpu")
+            results = index.search(queries_embeddings=queries, top_k=50)
+            seen = {doc_id for r in results for doc_id, _ in r}
+            assert any(doc_id >= 40 for doc_id in seen), (
+                "updated documents must be retrievable"
+            )
+        finally:
+            index.close()
+
+    def test_delete_stays_single_copy_and_is_searchable(self, test_index_path):
+        """delete() re-materializes shards for Rust, then drops them again."""
+        index = self._build(test_index_path, n_docs=40)
+        try:
+            index.delete(subset=[0, 1, 2])
+
+            assert self._payload_shards(test_index_path) == [], (
+                "payload shards must be dropped again after delete()"
+            )
+            queries = torch.randn(2, 30, 128, device="cpu")
+            results = index.search(queries_embeddings=queries, top_k=37)
+            for query_results in results:
+                assert len(query_results) == 37
+        finally:
+            index.close()
+
+    def test_double_copy_index_upgrades_on_load(self, test_index_path, monkeypatch):
+        """An index from an older version (shards + merged) converts in place."""
+        monkeypatch.setenv("FAST_PLAID_KEEP_SHARDS", "1")
+        index = self._build(test_index_path, n_docs=40)
+        queries = torch.randn(2, 30, 128, device="cpu")
+        results_before = index.search(queries_embeddings=queries, top_k=10)
+        index.close()
+        assert self._payload_shards(test_index_path) != []
+
+        # Recreate the exact legacy on-disk state: no merged-manifest flags,
+        # no frozen/mutable markers, numpy-written merged headers.
+        for suffix in ("codes", "residuals"):
+            manifest_path = os.path.join(
+                test_index_path, f"merged_{suffix}.manifest.json"
+            )
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+            for entry in manifest.values():
+                entry.pop("merged", None)
+            with open(manifest_path, "w") as f:
+                json.dump(manifest, f)
+        meta_path = os.path.join(test_index_path, "metadata.json")
+        with open(meta_path) as f:
+            meta = json.load(f)
+        meta.pop("frozen", None)
+        meta.pop("mutable", None)
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=4)
+
+        monkeypatch.delenv("FAST_PLAID_KEEP_SHARDS")
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+        try:
+            results_after = index.search(queries_embeddings=queries, top_k=10)
+            assert results_before == results_after, (
+                "conversion must not change search results"
+            )
+            assert self._payload_shards(test_index_path) == [], (
+                "conversion must drop the redundant payload copy"
+            )
+            with open(meta_path) as f:
+                meta = json.load(f)
+            assert meta.get("frozen") is True and meta.get("mutable") is True, (
+                "converted metadata must be read-only-safe for older versions"
+            )
+        finally:
+            index.close()
+
+    def test_manifest_loss_recovers_from_doclens(self, test_index_path):
+        """Deleting the manifests must not make the index appear empty."""
+        index = self._build(test_index_path, n_docs=40)
+        queries = torch.randn(2, 30, 128, device="cpu")
+        results_before = index.search(queries_embeddings=queries, top_k=10)
+        index.close()
+
+        for suffix in ("codes", "residuals"):
+            os.remove(
+                os.path.join(test_index_path, f"merged_{suffix}.manifest.json")
+            )
+
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+        try:
+            results_after = index.search(queries_embeddings=queries, top_k=10)
+            assert results_before == results_after, (
+                "the doclens files define the merged layout; losing the manifest "
+                "must be recoverable"
+            )
+        finally:
+            index.close()
+
+    def test_stale_staging_shard_is_reabsorbed(self, test_index_path):
+        """A staging file surviving a crash is folded back in, not duplicated."""
+        from fast_plaid.search import storage
+
+        index = self._build(test_index_path, n_docs=40)
+        queries = torch.randn(2, 30, 128, device="cpu")
+        results_before = index.search(queries_embeddings=queries, top_k=10)
+        index.close()
+
+        # Simulate a crash after re-materialization: shard 0 exists on disk again.
+        storage.materialize_shards(test_index_path, 1, "codes", [0])
+        storage.materialize_shards(test_index_path, 1, "residuals", [0])
+        assert self._payload_shards(test_index_path) != []
+
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+        try:
+            results_after = index.search(queries_embeddings=queries, top_k=10)
+            assert results_before == results_after
+            assert self._payload_shards(test_index_path) == [], (
+                "recovered staging files must be dropped again"
+            )
+        finally:
+            index.close()
+
+    def test_keep_shards_opt_out(self, test_index_path, monkeypatch):
+        """FAST_PLAID_KEEP_SHARDS=1 preserves the double-copy layout."""
+        monkeypatch.setenv("FAST_PLAID_KEEP_SHARDS", "1")
+        index = self._build(test_index_path, n_docs=40)
+        try:
+            assert self._payload_shards(test_index_path) != [], (
+                "opt-out must keep payload shards on disk"
+            )
+            meta_path = os.path.join(test_index_path, "metadata.json")
+            with open(meta_path) as f:
+                meta = json.load(f)
+            assert "mutable" not in meta, (
+                "opt-out must not stamp single-copy metadata"
+            )
+        finally:
+            index.close()
+
+    def test_legacy_frozen_index_unfreezes_and_updates(self, test_index_path):
+        """An index frozen by an older version becomes mutable again."""
+        index = self._build(test_index_path, n_docs=40)
+        index.close()
+
+        # Recreate the legacy frozen state: no payload shards (already true),
+        # frozen flag without the mutable marker.
+        meta_path = os.path.join(test_index_path, "metadata.json")
+        with open(meta_path) as f:
+            meta = json.load(f)
+        meta["frozen"] = True
+        meta.pop("mutable", None)
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=2)
+
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+        try:
+            new_embeddings = [torch.randn(60, 128, device="cpu") for _ in range(5)]
+            with pytest.raises(RuntimeError, match="frozen"):
+                index.update(documents_embeddings=new_embeddings)
+
+            index.unfreeze()
+            index.update(documents_embeddings=new_embeddings)
+            queries = torch.randn(2, 30, 128, device="cpu")
+            results = index.search(queries_embeddings=queries, top_k=45)
+            for query_results in results:
+                assert len(query_results) == 45
         finally:
             index.close()
 

@@ -1837,6 +1837,315 @@ class TestSingleCopyStorage:
             index.close()
 
 
+
+class TestSingleCopyContracts:
+    """CI guards for the invariants the single-copy layout promises (issue #53).
+
+    Each test pins one contract that was validated manually during development:
+    the downgrade-safe manifest schema, byte-identical shard materialization,
+    crash-window recovery, mutation bookkeeping under churn, and the fixed-length
+    merged header that makes in-place resizing unconditional.
+    """
+
+    def _build(self, path, n_docs=60, doc_len=60, **create_kwargs):
+        index = search.FastPlaid(index=path, device="cpu")
+        documents_embeddings = [
+            torch.randn(doc_len, 128, device="cpu") for _ in range(n_docs)
+        ]
+        index.create(
+            documents_embeddings=documents_embeddings,
+            kmeans_niters=4,
+            **create_kwargs,
+        )
+        return index
+
+    def _payload_shards(self, path):
+        return sorted(
+            f
+            for f in os.listdir(path)
+            if (f.endswith(".codes.npy") or f.endswith(".residuals.npy"))
+            and not f.startswith("merged_")
+        )
+
+    def test_manifest_entries_keep_the_downgrade_contract(self, test_index_path):
+        """Every manifest entry carries "rows" and "mtime" keys, always.
+
+        Older fast-plaid versions subscript entry["mtime"] directly; an entry
+        without the key turns a downgrade into a KeyError instead of a clean
+        re-merge. "mtime" may be None (rows live only in the merged file), but
+        it must exist. This regressed once during development.
+        """
+        index = self._build(test_index_path, n_docs=40)
+        try:
+            index.update(
+                documents_embeddings=[torch.randn(60, 128) for _ in range(5)]
+            )
+            index.delete(subset=[0, 1])
+        finally:
+            index.close()
+
+        for suffix in ("codes", "residuals"):
+            manifest_path = os.path.join(
+                test_index_path, f"merged_{suffix}.manifest.json"
+            )
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+            assert manifest, f"empty {suffix} manifest"
+            for filename, entry in manifest.items():
+                assert "rows" in entry, f"{filename}: missing rows"
+                assert "mtime" in entry, (
+                    f"{filename}: missing mtime key — old versions subscript "
+                    f"entry['mtime'] and would crash on this manifest"
+                )
+
+    def test_materialized_shards_are_byte_identical(self, test_index_path, monkeypatch):
+        """Re-materialized staging files must equal what the Rust core wrote.
+
+        The Rust core reads staging shards with tch's npy parser; a drifting
+        header format or a wrong slice offset would corrupt every update and
+        delete. Compare materialized bytes against a double-copy snapshot.
+        """
+        import filecmp
+
+        from fast_plaid.search import storage
+
+        monkeypatch.setenv("FAST_PLAID_KEEP_SHARDS", "1")
+        index = self._build(test_index_path, n_docs=80)
+        index.close()
+        originals = {
+            name: os.path.join(test_index_path, name)
+            for name in self._payload_shards(test_index_path)
+        }
+        assert originals, "expected payload shards under FAST_PLAID_KEEP_SHARDS"
+        snapshot_dir = os.path.join(test_index_path, "snapshot")
+        os.makedirs(snapshot_dir)
+        for name, path in originals.items():
+            shutil.copy2(path, os.path.join(snapshot_dir, name))
+
+        monkeypatch.delenv("FAST_PLAID_KEEP_SHARDS")
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+        index.close()
+        assert self._payload_shards(test_index_path) == []
+
+        with open(os.path.join(test_index_path, "metadata.json")) as f:
+            num_chunks = json.load(f)["num_chunks"]
+        storage.materialize_shards(test_index_path, num_chunks, "codes")
+        storage.materialize_shards(test_index_path, num_chunks, "residuals")
+
+        mismatches = [
+            name
+            for name in originals
+            if not filecmp.cmp(
+                os.path.join(test_index_path, name),
+                os.path.join(snapshot_dir, name),
+                shallow=False,
+            )
+        ]
+        assert mismatches == [], (
+            f"materialized shards diverge from what Rust wrote: {mismatches}"
+        )
+
+    def test_crash_after_staging_before_merge_recovers(self, test_index_path):
+        """A crash after writing staging but before merging must self-heal.
+
+        Simulated state: the last chunk exists only as a staging file, the
+        merged file was never extended with its rows, and the manifest predates
+        it. The next load must fold the chunk back in and return the same
+        results as before the "crash".
+        """
+        import numpy as np
+
+        from fast_plaid.search import storage
+
+        index = self._build(test_index_path, n_docs=80)
+        queries = torch.randn(3, 30, 128, device="cpu")
+        reference = index.search(queries_embeddings=queries, top_k=10)
+        index.close()
+
+        with open(os.path.join(test_index_path, "metadata.json")) as f:
+            num_chunks = json.load(f)["num_chunks"]
+        last = num_chunks - 1
+        last_rows = storage.shard_rows(test_index_path, last)
+        assert last_rows > 0
+
+        # Recreate the pre-crash staging file from the intact merged copy,
+        # then rewind the merged files and manifests to before the merge.
+        storage.materialize_shards(test_index_path, num_chunks, "codes", [last])
+        storage.materialize_shards(test_index_path, num_chunks, "residuals", [last])
+        for suffix, numpy_dtype in (("codes", np.int64), ("residuals", np.uint8)):
+            merged_path = os.path.join(test_index_path, f"merged_{suffix}.npy")
+            arr = np.load(merged_path, mmap_mode="r")
+            shorter = (arr.shape[0] - last_rows, *arr.shape[1:])
+            del arr
+            storage.open_merged(merged_path, numpy_dtype, shorter, fresh=False)
+            manifest = storage.load_manifest(test_index_path, suffix)
+            manifest.pop(f"{last}.{suffix}.npy", None)
+            storage.save_manifest(test_index_path, suffix, manifest)
+
+        recovered = search.FastPlaid(index=test_index_path, device="cpu")
+        try:
+            results = recovered.search(queries_embeddings=queries, top_k=10)
+            assert results == reference, (
+                "recovery from a pre-merge crash changed search results"
+            )
+            assert self._payload_shards(test_index_path) == [], (
+                "recovered staging must be dropped after re-merging"
+            )
+        finally:
+            recovered.close()
+
+    def test_crash_mid_materialization_recovers(self, test_index_path):
+        """A staging file whose manifest entry was never updated is harmless.
+
+        materialize_shards writes the file first and the manifest second; a
+        crash between the two leaves a file whose recorded mtime is stale
+        (None). The scan must treat it as dirty, rewrite the same bytes in
+        place, and keep every later merged-only chunk readable — this is the
+        offsets-equal tolerance path in _get_merged_mmap.
+        """
+        from fast_plaid.search import storage
+
+        # batch_size forces several chunks; the scenario needs a chain break
+        # between a staged chunk and merged-only chunks after it.
+        index = self._build(test_index_path, n_docs=80, batch_size=30)
+        queries = torch.randn(3, 30, 128, device="cpu")
+        reference = index.search(queries_embeddings=queries, top_k=10)
+        index.close()
+
+        with open(os.path.join(test_index_path, "metadata.json")) as f:
+            num_chunks = json.load(f)["num_chunks"]
+        assert num_chunks >= 2, "need at least two chunks for a chain break"
+
+        # Materialize chunk 0, then erase its mtime from the manifest: the
+        # scan sees the file as dirty while chunk 1+ live only in merged.
+        for suffix in ("codes", "residuals"):
+            storage.materialize_shards(test_index_path, num_chunks, suffix, [0])
+            manifest = storage.load_manifest(test_index_path, suffix)
+            manifest[f"0.{suffix}.npy"]["mtime"] = None
+            storage.save_manifest(test_index_path, suffix, manifest)
+
+        recovered = search.FastPlaid(index=test_index_path, device="cpu")
+        try:
+            results = recovered.search(queries_embeddings=queries, top_k=10)
+            assert results == reference, (
+                "spurious chain break changed search results"
+            )
+            assert self._payload_shards(test_index_path) == []
+        finally:
+            recovered.close()
+
+    def test_churn_keeps_bookkeeping_and_self_retrieval(self, test_index_path):
+        """Cycles of update/random-delete keep ids exact and metadata honest.
+
+        The compact version of the churn stress test: after every mutation the
+        index's document count must equal the tracker's, and at the end each
+        probed document must retrieve itself by its own embedding — which
+        fails loudly if any position/id mapping drifted.
+        """
+        import random
+
+        rng = random.Random(7)
+        docs = [torch.randn(50, 128, device="cpu") for _ in range(300)]
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+        try:
+            index.create(documents_embeddings=docs[:100], kmeans_niters=4)
+            live = list(range(100))
+            fed = 100
+            while fed < len(docs):
+                batch = list(range(fed, min(fed + 100, len(docs))))
+                index.update(
+                    documents_embeddings=[docs[i] for i in batch],
+                    start_from_scratch=0,
+                )
+                live.extend(batch)
+                fed = batch[-1] + 1
+
+                positions = sorted(rng.sample(range(len(live)), 50))
+                index.delete(subset=positions)
+                kill = set(positions)
+                live = [d for p, d in enumerate(live) if p not in kill]
+
+                with open(os.path.join(test_index_path, "metadata.json")) as f:
+                    meta_docs = json.load(f)["num_documents"]
+                assert meta_docs == len(live), (
+                    f"bookkeeping drift: index {meta_docs} vs tracker {len(live)}"
+                )
+
+            probe_positions = rng.sample(range(len(live)), 5)
+            results = index.search(
+                queries_embeddings=[docs[live[p]] for p in probe_positions],
+                top_k=1,
+            )
+            for position, res in zip(probe_positions, results):
+                assert res and res[0][0] == position, (
+                    f"self-retrieval failed at position {position}: {res}"
+                )
+        finally:
+            index.close()
+
+    def test_merged_header_is_fixed_length_across_growth(self, tmp_path):
+        """The merged header never changes length, so resizing is in place.
+
+        The old numpy-written header silently forced a full merged rewrite
+        whenever the row count crossed a digit boundary. The fixed prologue
+        must hold from 1 row to 20-digit row counts, and open_merged with
+        fresh=False must preserve existing data bytes across a resize.
+        """
+        import numpy as np
+
+        from fast_plaid.search import storage
+
+        path = str(tmp_path / "merged_probe.npy")
+        for rows in (1, 9, 10, 99, 100, 10**6, 10**12, 10**19):
+            storage.write_merged_header(path, np.int64, (rows, 64))
+            assert storage.has_fixed_header(path), f"header drifted at rows={rows}"
+
+        os.remove(path)
+        first = storage.open_merged(path, np.uint8, (10, 4), fresh=True)
+        first[:] = np.arange(40, dtype=np.uint8).reshape(10, 4)
+        first.flush()
+        del first
+
+        grown = storage.open_merged(path, np.uint8, (1000, 4), fresh=False)
+        assert (
+            grown[:10] == np.arange(40, dtype=np.uint8).reshape(10, 4)
+        ).all(), "in-place growth clobbered existing rows"
+        del grown
+
+        loaded = np.load(path)
+        assert loaded.shape == (1000, 4)
+        assert (loaded[:10] == np.arange(40, dtype=np.uint8).reshape(10, 4)).all()
+
+    def test_second_instance_sees_first_instances_update(self, test_index_path):
+        """Two FastPlaid objects on one index: mutation by one is seen by the other.
+
+        The single-copy layout mutates the merged files in place and unlinks
+        staging, so the mtime-based reload of a concurrently open instance is
+        the path most at risk — especially on Windows, where unlinking and
+        truncating around live mmaps is what this repo historically fought.
+        """
+        docs = [torch.randn(50, 128, device="cpu") for _ in range(120)]
+        writer = search.FastPlaid(index=test_index_path, device="cpu")
+        reader = None
+        try:
+            writer.create(documents_embeddings=docs, kmeans_niters=4)
+            reader = search.FastPlaid(index=test_index_path, device="cpu")
+            queries = torch.randn(2, 30, 128, device="cpu")
+            reader.search(queries_embeddings=queries, top_k=5)
+
+            new_doc = torch.randn(50, 128, device="cpu")
+            writer.update(documents_embeddings=[new_doc], start_from_scratch=0)
+
+            results = reader.search(queries_embeddings=[new_doc], top_k=1)
+            assert results and results[0][0][0] == len(docs), (
+                "reader did not observe the writer's update after reload"
+            )
+        finally:
+            if reader is not None:
+                reader.close()
+            writer.close()
+
+
 class TestLegacyArguments:
     """Call sites written against pre-1.5.0 versions must keep working."""
 

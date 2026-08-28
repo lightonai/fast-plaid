@@ -664,7 +664,11 @@ class FastPlaid:
         max_points_per_centroid:
             The maximum number of points allowed per centroid.
         nbits:
-            The number of bits used for compression.
+            Bits per residual dimension: 4 (default), 2, or 1. ``nbits=1`` is
+            asymmetric quantization: each document dimension keeps a single
+            sign bit on top of its centroid while queries stay full precision,
+            quartering residual storage relative to ``nbits=4`` at a small
+            retrieval-quality cost.
         n_samples_kmeans:
             The number of samples used for K-means training.
         batch_size:
@@ -682,6 +686,9 @@ class FastPlaid:
             ``get_embeddings()`` but not ``search()``.
 
         """
+        if nbits not in (1, 2, 4):
+            error = f"nbits must be 1, 2 or 4, got {nbits}."
+            raise ValueError(error)
         # Exclusive Lock for Modification
         with self.lock:
             documents_embeddings = self._format_embeddings(documents_embeddings)

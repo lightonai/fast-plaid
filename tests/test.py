@@ -2162,12 +2162,16 @@ class TestAsymmetricQuantization:
             index.create(documents_embeddings=docs, nbits=1, kmeans_niters=4)
 
             # Residuals must be dim/8 bytes per embedding: one bit per dimension.
+            # Read the npy header only — an open memmap would block the in-place
+            # resize that update() performs below on Windows.
             import numpy as np
 
-            residuals = np.load(
-                os.path.join(test_index_path, "merged_residuals.npy"), mmap_mode="r"
-            )
-            assert residuals.shape[1] == 128 // 8, residuals.shape
+            with open(
+                os.path.join(test_index_path, "merged_residuals.npy"), "rb"
+            ) as f:
+                np.lib.format.read_magic(f)
+                shape, _, _ = np.lib.format.read_array_header_1_0(f)
+            assert shape[1] == 128 // 8, shape
 
             queries = [docs[i][:30] for i in (5, 42, 900)]
             results = index.search(queries_embeddings=queries, top_k=1)

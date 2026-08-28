@@ -2146,6 +2146,49 @@ class TestSingleCopyContracts:
             writer.close()
 
 
+
+class TestNarrowDtypes:
+    """ivf int32 and centroids fp16 on disk, widened on load (both directions)."""
+
+    def test_new_index_dtypes_and_old_index_still_loads(self, test_index_path):
+        """New indexes store narrow dtypes; wide-dtype indexes keep loading."""
+        import numpy as np
+
+        torch.manual_seed(0)
+        docs = [
+            torch.nn.functional.normalize(torch.randn(60, 128), dim=-1)
+            for _ in range(1200)
+        ]
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+        try:
+            index.create(documents_embeddings=docs, kmeans_niters=4)
+            ivf_path = os.path.join(test_index_path, "ivf.npy")
+            cen_path = os.path.join(test_index_path, "centroids.npy")
+            assert np.load(ivf_path, mmap_mode="r").dtype == np.int32
+            assert np.load(cen_path, mmap_mode="r").dtype == np.float16
+            reference = index.search(queries_embeddings=[docs[7][:30]], top_k=1)
+            assert reference[0][0][0] == 7
+        finally:
+            index.close()
+
+        # Rewrite both files with the pre-1.8 wide dtypes: the loader must
+        # widen/narrow on read either way, so results are unchanged.
+        ivf = np.load(ivf_path).astype(np.int64)
+        cen = np.load(cen_path).astype(np.float32)
+        np.save(ivf_path, ivf)
+        np.save(cen_path, cen)
+
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+        try:
+            results = index.search(queries_embeddings=[docs[7][:30]], top_k=1)
+            assert results[0][0][0] == 7
+            # Mutation migrates the files to the narrow dtypes.
+            index.delete(subset=[0])
+            assert np.load(ivf_path, mmap_mode="r").dtype == np.int32
+        finally:
+            index.close()
+
+
 class TestLegacyArguments:
     """Call sites written against pre-1.5.0 versions must keep working."""
 

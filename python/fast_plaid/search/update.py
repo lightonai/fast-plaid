@@ -210,7 +210,8 @@ def update_centroids(  # noqa: PLR0912
     k_new = new_centroids_np.shape[0]
     final_centroids = np.concatenate([existing_centroids_np, new_centroids_np], axis=0)
 
-    np.save(centroids_path, final_centroids)
+    # fp16 on disk, matching the Rust writer: the loader casts to fp16 anyway.
+    np.save(centroids_path, final_centroids.astype(np.float16))
 
     ivf_path = os.path.join(index_path, "ivf_lengths.npy")
     if os.path.exists(ivf_path):

@@ -120,60 +120,59 @@ pub fn update_index(
     let bar = ProgressBar::new(n_new_chunks.try_into().unwrap());
     bar.set_message("Updating index...");
 
-    let process_batch =
-        |batch_tensor: Tensor| -> Result<(Tensor, Tensor, Option<Tensor>)> {
-            let mut codes_list = Vec::new();
-            let mut packed_list = Vec::new();
-            let mut norms_list = Vec::new();
+    let process_batch = |batch_tensor: Tensor| -> Result<(Tensor, Tensor, Option<Tensor>)> {
+        let mut codes_list = Vec::new();
+        let mut packed_list = Vec::new();
+        let mut norms_list = Vec::new();
 
-            let safe_batch_size = if device == Device::Cpu {
-                batch_size
-            } else {
-                let target_bytes: i64 = 4 * 1024 * 1024 * 1024;
-                (target_bytes / (num_centroids * 2)).min(batch_size)
-            };
+        let safe_batch_size = if device == Device::Cpu {
+            batch_size
+        } else {
+            let target_bytes: i64 = 4 * 1024 * 1024 * 1024;
+            (target_bytes / (num_centroids * 2)).min(batch_size)
+        };
 
-            let split_embs = batch_tensor.split(safe_batch_size, 0);
+        let split_embs = batch_tensor.split(safe_batch_size, 0);
 
-            for micro_batch in split_embs.into_iter() {
-                let codes = compress_into_codes(&micro_batch, &index.codec.centroids);
+        for micro_batch in split_embs.into_iter() {
+            let codes = compress_into_codes(&micro_batch, &index.codec.centroids);
 
-                let reconstructed = index.codec.centroids.index_select(0, &codes);
-                let mut res = &micro_batch - &reconstructed;
+            let reconstructed = index.codec.centroids.index_select(0, &codes);
+            let mut res = &micro_batch - &reconstructed;
 
-                if update_threshold {
-                    let n = res.to_kind(Kind::Float).norm_scalaropt_dim(2, &[1], false);
-                    norms_list.push(n.to_device(Device::Cpu));
-                }
-
-                res = Tensor::bucketize(&res, b_cutoffs, true, false);
-                let mut res_shape = res.size();
-                res_shape.push(nbits);
-                res = res.unsqueeze(-1).expand(&res_shape, false);
-                res = res.bitwise_right_shift(&index.codec.bit_helper);
-                let ones = Tensor::ones_like(&res).to_device(device);
-                res = res.bitwise_and_tensor(&ones);
-
-                let res_flat = res.flatten(0, -1);
-                let packed = packbits(&res_flat);
-                let shape = [res.size()[0], embedding_dim / 8 * nbits];
-
-                codes_list.push(codes.to_device(Device::Cpu));
-                packed_list.push(packed.reshape(&shape).to_device(Device::Cpu));
-
-                drop(reconstructed);
+            if update_threshold {
+                let n = res.to_kind(Kind::Float).norm_scalaropt_dim(2, &[1], false);
+                norms_list.push(n.to_device(Device::Cpu));
             }
 
-            let final_codes = Tensor::cat(&codes_list, 0);
-            let final_packed = Tensor::cat(&packed_list, 0);
-            let final_norms = if update_threshold && !norms_list.is_empty() {
-                Some(Tensor::cat(&norms_list, 0))
-            } else {
-                None
-            };
+            res = Tensor::bucketize(&res, b_cutoffs, true, false);
+            let mut res_shape = res.size();
+            res_shape.push(nbits);
+            res = res.unsqueeze(-1).expand(&res_shape, false);
+            res = res.bitwise_right_shift(&index.codec.bit_helper);
+            let ones = Tensor::ones_like(&res).to_device(device);
+            res = res.bitwise_and_tensor(&ones);
 
-            Ok((final_codes, final_packed, final_norms))
+            let res_flat = res.flatten(0, -1);
+            let packed = packbits(&res_flat);
+            let shape = [res.size()[0], embedding_dim / 8 * nbits];
+
+            codes_list.push(codes.to_device(Device::Cpu));
+            packed_list.push(packed.reshape(&shape).to_device(Device::Cpu));
+
+            drop(reconstructed);
+        }
+
+        let final_codes = Tensor::cat(&codes_list, 0);
+        let final_packed = Tensor::cat(&packed_list, 0);
+        let final_norms = if update_threshold && !norms_list.is_empty() {
+            Some(Tensor::cat(&norms_list, 0))
+        } else {
+            None
         };
+
+        Ok((final_codes, final_packed, final_norms))
+    };
 
     for i in (0..n_new_chunks).progress_with(bar) {
         let global_chunk_idx = start_chunk_idx + i;
@@ -438,7 +437,7 @@ pub fn update_index(
 
         // Write updated global files
         final_ivf_tensor
-            .to_kind(Kind::Int64)
+            .to_kind(Kind::Int)
             .write_npy(&idx_path_obj.join("ivf.npy"))?;
         final_lengths_tensor.write_npy(&idx_path_obj.join("ivf_lengths.npy"))?;
     }

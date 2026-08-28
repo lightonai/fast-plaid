@@ -119,7 +119,9 @@ pub fn delete_from_index(subset: &[i64], idx_path: &str, device: Device) -> Resu
     let code_counts = sorted_codes.bincount::<Tensor>(None, est_num_embeddings);
     let (opt_ivf, opt_ivf_lens) = optimize_ivf(&sorted_indices, &code_counts, idx_path, device)?;
 
-    opt_ivf.write_npy(&idx_path_obj.join("ivf.npy"))?;
+    opt_ivf
+        .to_kind(Kind::Int)
+        .write_npy(&idx_path_obj.join("ivf.npy"))?;
     opt_ivf_lens.write_npy(&idx_path_obj.join("ivf_lengths.npy"))?;
 
     // Update main metadata

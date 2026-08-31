@@ -652,6 +652,11 @@ class FastPlaid:
         metadata: list[dict[str, Any]] | None = None,
         start_from_scratch: int = 1000,
         compress_only: bool = False,
+        centroids: torch.Tensor | None = None,
+        bucket_cutoffs: list[float] | None = None,
+        bucket_weights: list[float] | None = None,
+        avg_residual: torch.Tensor | None = None,
+        cluster_threshold: torch.Tensor | None = None,
     ) -> "FastPlaid":
         """Create and saves the FastPlaid index.
 
@@ -680,6 +685,22 @@ class FastPlaid:
         compress_only:
             If True, skip IVF construction. The index can be used with
             ``get_embeddings()`` but not ``search()``.
+        centroids:
+            Precomputed centroids, skipping K-means.  Must be an
+            L2-normalised ``(n_centroids, dim)`` tensor in **float16**.
+        bucket_cutoffs:
+            Explicit residual bucket cutoffs (``2**nbits - 1`` sorted
+            values).  Must be given together with ``bucket_weights``.
+        bucket_weights:
+            Explicit reconstruction values (``2**nbits`` values).
+        avg_residual:
+            Pre-computed per-dimension average residual (shape ``[dim]``,
+            float32).  When provided together with ``cluster_threshold``,
+            ``bucket_cutoffs`` and ``bucket_weights``, the entire heldout
+            sampling is skipped.
+        cluster_threshold:
+            Pre-computed cluster pruning threshold (scalar tensor).  See
+            ``avg_residual`` for the full skip condition.
 
         """
         # Exclusive Lock for Modification
@@ -716,15 +737,19 @@ class FastPlaid:
             # Use the first device for creation logic
             primary_device = self.devices[0]
 
-            centroids = compute_kmeans(
-                documents_embeddings=documents_embeddings,
-                dim=dim,
-                kmeans_niters=kmeans_niters,
-                device=primary_device,
-                max_points_per_centroid=max_points_per_centroid,
-                n_samples_kmeans=n_samples_kmeans,
-                seed=seed,
-                use_triton_kmeans=use_triton_kmeans,
+            centroids = (
+                centroids.to(device=primary_device)
+                if centroids is not None
+                else compute_kmeans(
+                    documents_embeddings=documents_embeddings,
+                    dim=dim,
+                    kmeans_niters=kmeans_niters,
+                    device=primary_device,
+                    max_points_per_centroid=max_points_per_centroid,
+                    n_samples_kmeans=n_samples_kmeans,
+                    seed=seed,
+                    use_triton_kmeans=use_triton_kmeans,
+                )
             )
 
             fast_plaid_rust.create(
@@ -738,6 +763,10 @@ class FastPlaid:
                 batch_size=batch_size,
                 seed=seed,
                 compress_only=compress_only,
+                bucket_cutoffs=bucket_cutoffs,
+                bucket_weights=bucket_weights,
+                avg_residual=avg_residual,
+                cluster_threshold=cluster_threshold,
             )
 
             # Explicit cleanup of create objects

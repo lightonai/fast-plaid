@@ -129,6 +129,10 @@ fn initialize_torch(_py: Python<'_>, torch_path: String) -> PyResult<()> {
 /// Raises:
 ///     RuntimeError: If index creation fails or `libtorch` fails to load.
 #[pyfunction]
+#[pyo3(signature = (index, torch_path, device, embedding_dim, nbits, embeddings, centroids,
+                    batch_size, seed, compress_only,
+                    bucket_cutoffs=None, bucket_weights=None,
+                    avg_residual=None, cluster_threshold=None))]
 fn create(
     _py: Python<'_>,
     index: String,
@@ -141,6 +145,10 @@ fn create(
     batch_size: i64,
     seed: Option<u64>,
     compress_only: bool,
+    bucket_cutoffs: Option<Vec<f64>>,
+    bucket_weights: Option<Vec<f64>>,
+    avg_residual: Option<PyTensor>,
+    cluster_threshold: Option<PyTensor>,
 ) -> PyResult<()> {
     call_torch(torch_path)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
@@ -158,6 +166,10 @@ fn create(
         batch_size,
         seed,
         compress_only,
+        bucket_cutoffs,
+        bucket_weights,
+        avg_residual,
+        cluster_threshold,
     )
     .map_err(|e| PyRuntimeError::new_err(format!("Failed to create index: {}", e)));
 

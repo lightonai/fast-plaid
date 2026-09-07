@@ -85,10 +85,16 @@ def build_engine(
     # need no index at all. Reading ``data`` here instead would make a decline
     # depend on the tensors being well formed -- the same ordering mistake as
     # importing the kernels before deciding whether they can run.
+    # Whatever the standard index already holds on this device is borrowed,
+    # not copied: the gate budgets only what the engine has to allocate itself.
+    shared = (
+        gate.shared_keys(data, device) if device.startswith("cuda") else frozenset()
+    )
     reason = gate.check(
         data=data,
         device=device,
         memory_fraction=index_memory_fraction,
+        shared=shared,
     )
     if reason is not None:
         if gate.is_debug():
@@ -101,7 +107,10 @@ def build_engine(
 
     try:
         engine = FusedEngine(
-            data=data, device=device, budget_fraction=search_memory_fraction
+            data=data,
+            device=device,
+            budget_fraction=search_memory_fraction,
+            shared=shared,
         )
     except RuntimeError as error:  # pragma: no cover - device dependent
         # torch.cuda.OutOfMemoryError derives from RuntimeError; staging that
@@ -115,7 +124,8 @@ def build_engine(
         print(
             f"[fast-plaid] fused path active on {device}: "
             f"{engine.n_tokens} tokens, {engine.n_docs} docs, "
-            f"{engine.resident_bytes() / 2**30:.2f} GiB resident",
+            f"{engine.resident_bytes() / 2**30:.2f} GiB allocated, "
+            f"{engine.shared_bytes() / 2**30:.2f} GiB shared with the standard index",
             file=sys.stderr,
         )
     return engine, None

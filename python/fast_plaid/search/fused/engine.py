@@ -8,7 +8,7 @@ kernels. The staged layout is derived from the index files as loaded by
 from __future__ import annotations
 
 import importlib
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 
@@ -61,22 +61,31 @@ class FusedEngine:
         device: str,
         *,
         budget_fraction: float = ceiling.BUDGET_FRACTION,
+        shared: frozenset[str] = frozenset(),
     ) -> None:
-        """Stage index tensors onto the device.
+        """Stage index tensors onto the device, borrowing what is already there.
 
         Args:
         ----
         data:
-            Index tensors from ``_load_index_tensors_cpu``.
+            Index tensors from ``_load_index_tensors_cpu``, or the device
+            tensors the standard index was constructed from.
         device:
             Target CUDA device.
         budget_fraction:
             Share of free memory this engine's transients may occupy, taken
             from the index's ``search_memory_fraction``.
+        shared:
+            Keys of ``data`` already resident on ``device`` and owned by the
+            standard index. Those tensors are used in place -- the kernels only
+            need a pointer into them -- so the engine allocates nothing for
+            them. Codes are read at their stored int64 width rather than
+            narrowed to int32, which is the price of not copying.
 
         """
         self.device = device
         self.budget_fraction = budget_fraction
+        self.shared = frozenset(shared)
         self.nbits = int(data["nbits"])
         self.dim = int(data["centroids"].shape[1])
         self.arch = torch.cuda.get_device_capability(device)
@@ -92,12 +101,23 @@ class FusedEngine:
         self.doc_lengths = lengths.to(torch.int32).contiguous()
 
         packed_bytes = (self.dim * self.nbits) // 8
-        codes = data["doc_codes"].to(torch.int64).reshape(-1)[: self.n_tokens]
+        # Slicing a contiguous tensor along its first dimension is a view, so
+        # the shared branches allocate nothing.
+        if "doc_codes" in self.shared:
+            self.codes = data["doc_codes"].reshape(-1)[: self.n_tokens]
+        else:
+            codes = data["doc_codes"].to(torch.int64).reshape(-1)[: self.n_tokens]
+            self.codes = codes.to(torch.int32).to(device).contiguous()
         residuals = data["doc_residuals"].reshape(-1, packed_bytes)[: self.n_tokens]
-        self.codes = codes.to(torch.int32).to(device).contiguous()
-        self.residuals = residuals.to(device).contiguous()
+        if "doc_residuals" in self.shared:
+            self.residuals = residuals
+        else:
+            self.residuals = residuals.to(device).contiguous()
 
-        self.centroids = data["centroids"].to(device).to(torch.float16).contiguous()
+        if "centroids" in self.shared:
+            self.centroids = data["centroids"]
+        else:
+            self.centroids = data["centroids"].to(device).to(torch.float16).contiguous()
         self.n_centroids = int(self.centroids.shape[0])
 
         # The indexer stores bucket weights in natural code order while the
@@ -114,7 +134,10 @@ class FusedEngine:
             weights[permutation].to(torch.float16).to(device).contiguous()
         )
 
-        self.ivf = data["ivf"].to(torch.int32).reshape(-1).to(device)
+        if "ivf" in self.shared:
+            self.ivf = data["ivf"].reshape(-1)
+        else:
+            self.ivf = data["ivf"].to(torch.int32).reshape(-1).to(device)
         self.ivf_lengths = data["ivf_lengths"].to(torch.int64).reshape(-1).to(device)
         self.ivf_offsets = torch.zeros(
             self.ivf_lengths.numel() + 1, dtype=torch.int64, device=device
@@ -124,9 +147,9 @@ class FusedEngine:
         self.norms = self._precompute_norms()
         self.token_tile = token_tile(self.arch)
         # Fixed once staged; the admission ceiling caps each launch's
-        # transients at this footprint so the process never holds more
-        # scratch than index.
-        self._resident_bytes = self.resident_bytes()
+        # transients at the footprint the kernels read -- borrowed tensors
+        # included -- so the process never holds more scratch than index.
+        self._footprint_bytes = self.resident_bytes() + self.shared_bytes()
 
         # The candidate bound depends only on the index and the padded query
         # length, so it is computed once per shape rather than per search.
@@ -161,20 +184,42 @@ class FusedEngine:
             del packed, parts, codes, centroids, embeddings
         return norms
 
+    # Engine attribute -> the ``data`` key it may have been borrowed under.
+    _BORROWABLE: ClassVar[dict[str, str]] = {
+        "codes": "doc_codes",
+        "residuals": "doc_residuals",
+        "centroids": "centroids",
+        "ivf": "ivf",
+    }
+
+    def _device_tensors(self) -> dict[str, torch.Tensor]:
+        return {
+            "codes": self.codes,
+            "residuals": self.residuals,
+            "norms": self.norms,
+            "centroids": self.centroids,
+            "ivf": self.ivf,
+            "ivf_lengths": self.ivf_lengths,
+            "ivf_offsets": self.ivf_offsets,
+            "offsets": self.offsets,
+            "doc_lengths": self.doc_lengths,
+        }
+
     def resident_bytes(self) -> int:
-        """Device bytes held by the staged index."""
-        tensors = (
-            self.codes,
-            self.residuals,
-            self.norms,
-            self.centroids,
-            self.ivf,
-            self.ivf_lengths,
-            self.ivf_offsets,
-            self.offsets,
-            self.doc_lengths,
+        """Device bytes this engine allocated itself."""
+        return sum(
+            t.numel() * t.element_size()
+            for name, t in self._device_tensors().items()
+            if self._BORROWABLE.get(name) not in self.shared
         )
-        return sum(t.numel() * t.element_size() for t in tensors)
+
+    def shared_bytes(self) -> int:
+        """Device bytes read in place from the standard index's tensors."""
+        return sum(
+            t.numel() * t.element_size()
+            for name, t in self._device_tensors().items()
+            if self._BORROWABLE.get(name) in self.shared
+        )
 
     def _pad_queries(
         self,
@@ -429,7 +474,7 @@ class FusedEngine:
             candidates_per_query=candidates_per_query,
             device=self.device,
             budget_fraction=self.budget_fraction,
-            resident_bytes=self._resident_bytes,
+            resident_bytes=self._footprint_bytes,
         )
         if max_batch is not None:
             chunk = max(1, min(chunk, max_batch))

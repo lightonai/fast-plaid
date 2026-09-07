@@ -1073,6 +1073,116 @@ def test_fused_transients_do_not_grow_with_the_batch(tmp_path) -> None:
     )
 
 
+@requires_fused
+def test_fused_borrows_the_standard_index_tensors(tmp_path) -> None:
+    """With codes and residuals on the device, the engine reads them in place.
+
+    The loader hands Rust the very tensors it moved to the device and keeps a
+    reference on the index object, so the fused engine needs no second copy of
+    the index: it allocates the reconstruction norms and bookkeeping only.
+    """
+    torch.manual_seed(0)
+    dim = 96
+    documents = [
+        torch.nn.functional.normalize(torch.randn(48, dim), p=2, dim=-1)
+        for _ in range(2_000)
+    ]
+    queries = torch.nn.functional.normalize(torch.randn(8, 32, dim), p=2, dim=-1)
+
+    engine = FastPlaid(
+        index=str(tmp_path / "index"), device="cuda:0", index_gpu_memory="high"
+    )
+    engine.create(documents_embeddings=documents, nbits=4)
+    # Loads the standard index, then stages the fused path from its tensors.
+    engine.search(queries_embeddings=queries, top_k=5, show_progress=False)
+
+    status = engine.fused_status()
+    assert status["active"], status
+    fused = engine._fused_engine
+    attached = engine.indices["cuda:0"]._device_tensors
+    assert fused.residuals.data_ptr() == attached["doc_residuals"].data_ptr()
+    assert fused.codes.data_ptr() == attached["doc_codes"].data_ptr()
+    assert fused.centroids.data_ptr() == attached["centroids"].data_ptr()
+    assert fused.ivf.data_ptr() == attached["ivf"].data_ptr()
+
+    residual_block = attached["doc_residuals"].numel()
+    assert status["shared_bytes"] >= residual_block
+    # Norms are two bytes per token against 48 of residuals: the engine's own
+    # allocation is a small fraction of what it used to stage.
+    assert status["resident_bytes"] < residual_block // 4
+
+    # And it still answers the standard pipeline's ranking.
+    expected_standard = engine.search(
+        queries_embeddings=queries, top_k=10, show_progress=False, batch_size=64
+    )
+    actual_fused = engine.search(
+        queries_embeddings=queries, top_k=10, show_progress=False
+    )
+    assert_same_ranking(actual_fused, expected_standard)
+
+
+@requires_fused
+def test_fused_stages_its_own_copy_when_the_tier_keeps_the_index_on_cpu(
+    tmp_path,
+) -> None:
+    """A 'low' tier leaves codes and residuals on the host; the engine copies them.
+
+    Sharing is opportunistic, so the fused path must still serve -- and still
+    match -- when there is nothing on the device to borrow.
+    """
+    torch.manual_seed(0)
+    dim = 96
+    documents = [
+        torch.nn.functional.normalize(torch.randn(48, dim), p=2, dim=-1)
+        for _ in range(2_000)
+    ]
+    queries = torch.nn.functional.normalize(torch.randn(8, 32, dim), p=2, dim=-1)
+
+    engine = FastPlaid(
+        index=str(tmp_path / "index"), device="cuda:0", index_gpu_memory="low"
+    )
+    engine.create(documents_embeddings=documents, nbits=4)
+    actual_fused = engine.search(
+        queries_embeddings=queries, top_k=10, show_progress=False
+    )
+
+    status = engine.fused_status()
+    assert status["active"], status
+    fused = engine._fused_engine
+    attached = engine.indices["cuda:0"]._device_tensors
+    # The tier left codes and residuals on the host, so the engine copied them;
+    # only the small tensors the tier always places on the device are borrowed.
+    assert attached["doc_residuals"].device.type == "cpu"
+    assert "doc_residuals" not in fused.shared
+    assert "doc_codes" not in fused.shared
+    assert fused.residuals.device.type == "cuda"
+    assert fused.codes.dtype == torch.int32
+    assert status["shared_bytes"] < attached["doc_residuals"].numel()
+    assert status["resident_bytes"] >= attached["doc_residuals"].numel()
+
+    expected_standard = engine.search(
+        queries_embeddings=queries, top_k=10, show_progress=False, batch_size=64
+    )
+    assert_same_ranking(actual_fused, expected_standard)
+
+
+def test_gate_charges_only_what_is_not_shared() -> None:
+    """Borrowed codes and residuals cost the gate nothing but the norms."""
+    kwargs = {
+        "n_tokens": 1_000_000,
+        "n_docs": 10_000,
+        "n_centroids": 8_192,
+        "n_ivf": 1_000_000,
+        "dim": 96,
+        "nbits": 4,
+    }
+    alone = gate.resident_bytes(**kwargs)
+    borrowed = gate.resident_bytes(**kwargs, shared=frozenset(gate.SHAREABLE))
+    assert borrowed < alone
+    # Two bytes per token of norms plus the per-centroid and per-document arrays.
+    assert borrowed == 1_000_000 * 2 + 8_192 * 8 + (8_192 + 1) * 8 + 10_000 * 12
+
+
 def test_zz_report_observed_score_deltas() -> None:
     """Report the worst score deviation this suite actually produced.
 

@@ -117,9 +117,7 @@ def _get_merged_mmap(  # noqa: PLR0912
                 cols = shape[1]
 
             is_clean = (
-                entry
-                and entry.get("mtime") == current_mtime
-                and entry["rows"] == rows
+                entry and entry.get("mtime") == current_mtime and entry["rows"] == rows
             )
             if chain_broken or not is_clean:
                 chain_broken = True
@@ -143,8 +141,13 @@ def _get_merged_mmap(  # noqa: PLR0912
             rows = entry["rows"]
             if rows == 0:
                 valid_chunks.append(
-                    {"source": "merged", "filename": filename, "rows": 0,
-                     "write": False, "offset": total_rows_scan}
+                    {
+                        "source": "merged",
+                        "filename": filename,
+                        "rows": 0,
+                        "write": False,
+                        "offset": total_rows_scan,
+                    }
                 )
                 continue
             if chain_broken and old_offsets.get(i) != total_rows_scan:
@@ -155,8 +158,13 @@ def _get_merged_mmap(  # noqa: PLR0912
                 )
                 raise RuntimeError(error)
             valid_chunks.append(
-                {"source": "merged", "filename": filename, "rows": rows,
-                 "write": False, "offset": total_rows_scan}
+                {
+                    "source": "merged",
+                    "filename": filename,
+                    "rows": rows,
+                    "write": False,
+                    "offset": total_rows_scan,
+                }
             )
             total_rows_scan += rows
             if merged_shape is not None and len(merged_shape) > 1:
@@ -167,17 +175,20 @@ def _get_merged_mmap(  # noqa: PLR0912
     # merged layout exactly, so rebuild the manifest instead of reporting an
     # empty index.
     if total_rows_scan == 0 and merged_shape is not None:
-        doclens_rows = [
-            storage.shard_rows(index_path, i) for i in range(num_chunks)
-        ]
+        doclens_rows = [storage.shard_rows(index_path, i) for i in range(num_chunks)]
         data_rows = sum(doclens_rows)
         if 0 < data_rows <= merged_shape[0]:
             valid_chunks = []
             offset = 0
             for i, rows in enumerate(doclens_rows):
                 valid_chunks.append(
-                    {"source": "merged", "filename": f"{i}.{name_suffix}.npy",
-                     "rows": rows, "write": False, "offset": offset}
+                    {
+                        "source": "merged",
+                        "filename": f"{i}.{name_suffix}.npy",
+                        "rows": rows,
+                        "write": False,
+                        "offset": offset,
+                    }
                 )
                 offset += rows
             total_rows_scan = data_rows
@@ -445,20 +456,48 @@ def _construct_index_from_tensors(
         data, device, index_gpu_memory, index_memory_fraction
     )
 
+    # Placement mirrors the Rust side: 'high' puts codes and residuals on the
+    # device, 'medium' only the codes, 'low' neither. Doing the move here rather
+    # than in Rust changes nothing about where the bytes end up -- Rust's
+    # ensure_tensor finds them already on the right device and aliases them --
+    # but it leaves Python holding a reference to the very same storage, which
+    # is what lets the fused search path borrow the index instead of staging a
+    # second copy of it.
+    on_device = device.startswith("cuda")
+    codes_on_device = on_device and index_gpu_memory in ("medium", "high")
+    residuals_on_device = on_device and index_gpu_memory == "high"
+
     gpu_data: dict[str, Any] = {}
     for key, val in data.items():
         if val is None:
             gpu_data[key] = None
         elif isinstance(val, torch.Tensor):
-            if key in ["doc_codes", "doc_residuals", "doc_lengths"]:
-                # Tier placement happens on the Rust side; hand these over on CPU.
+            if key == "doc_lengths":
+                # Rust moves the lengths itself; the CPU copy is what callers need.
                 gpu_data[key] = val
+            elif key == "doc_codes":
+                gpu_data[key] = val.to(device) if codes_on_device else val
+            elif key == "doc_residuals":
+                gpu_data[key] = val.to(device) if residuals_on_device else val
+            elif key == "ivf" and on_device and data.get("ivf_lengths") is not None:
+                # Rust pads every strided tensor to hold one maximal element past
+                # the last offset, and allocates a fresh copy to do so unless the
+                # padding is already there. The merged codes and residuals are
+                # written padded; the IVF is not, so pad it here and Rust aliases
+                # this tensor instead of duplicating it.
+                pad = (
+                    int(data["ivf_lengths"].max()) if data["ivf_lengths"].numel() else 0
+                )
+                ivf = val.to(device)
+                gpu_data[key] = torch.cat(
+                    [ivf, torch.zeros(pad, dtype=ivf.dtype, device=ivf.device)]
+                )
             else:
                 gpu_data[key] = val.to(device, non_blocking=True)
         else:
             gpu_data[key] = val
 
-    return fast_plaid_rust.construct_index(
+    index = fast_plaid_rust.construct_index(
         nbits=gpu_data["nbits"],
         centroids=gpu_data["centroids"],
         avg_residual=gpu_data["avg_residual"],
@@ -472,6 +511,31 @@ def _construct_index_from_tensors(
         device=device,
         index_gpu_memory=index_gpu_memory,
     )
+
+    # The tensors Rust now holds, attached to the object that owns them so they
+    # live exactly as long as the index does. Whatever the tier left on the
+    # device is shared storage; the rest are the memory-mapped CPU tensors.
+    try:
+        index._device_tensors = {  # noqa: SLF001
+            key: gpu_data[key]
+            for key in (
+                "nbits",
+                "centroids",
+                "bucket_weights",
+                "ivf",
+                "ivf_lengths",
+                "doc_lengths",
+                "doc_codes",
+                "doc_residuals",
+            )
+        }
+        index._device_tensors["index_gpu_memory"] = index_gpu_memory  # noqa: SLF001
+    except AttributeError:
+        # An extension built without an instance dict: the fused path falls
+        # back to staging its own copy from disk.
+        pass
+
+    return index
 
 
 def _reload_index(

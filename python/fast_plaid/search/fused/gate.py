@@ -63,27 +63,59 @@ NORM_CHUNK = 65_536
 _NORM_TRANSIENT_BYTES_PER_DIM = 22
 
 
+# Index tensors the engine can borrow from the standard index when the
+# placement tier has already put them on the device.
+SHAREABLE = ("doc_codes", "doc_residuals", "centroids", "ivf")
+
+
 def bytes_per_token(dim: int, nbits: int) -> int:
-    """Device bytes the fused engine stages per indexed token."""
+    """Device bytes the fused engine stages per indexed token, sharing nothing."""
     return _CODE_BYTES + (dim * nbits) // 8 + _NORM_BYTES
 
 
-def resident_bytes(
-    *, n_tokens: int, n_docs: int, n_centroids: int, n_ivf: int, dim: int, nbits: int
-) -> int:
-    """Device bytes the staged copy holds, matching ``FusedEngine``.
+def shared_keys(data: dict[str, Any], device: str) -> frozenset[str]:
+    """Index tensors already resident on ``device``, which the engine borrows."""
+    target = torch.device(device)
+    return frozenset(
+        key
+        for key in SHAREABLE
+        if isinstance(data.get(key), torch.Tensor) and data[key].device == target
+    )
 
-    Mirrors ``FusedEngine.resident_bytes`` term for term. The per-document and
+
+def resident_bytes(
+    *,
+    n_tokens: int,
+    n_docs: int,
+    n_centroids: int,
+    n_ivf: int,
+    dim: int,
+    nbits: int,
+    shared: frozenset[str] = frozenset(),
+) -> int:
+    """Device bytes the engine allocates itself, matching ``FusedEngine``.
+
+    Mirrors ``FusedEngine.resident_bytes`` term for term. Tensors named in
+    ``shared`` are borrowed from the standard index and cost nothing here: with
+    codes and residuals both shared, the per-token cost falls from the whole
+    packed layout to the two-byte reconstruction norm. The per-document and
     per-centroid arrays are small beside the per-token ones but not nothing:
     on a corpus of millions of documents they run to hundreds of megabytes,
     and leaving them out understated exactly the indexes closest to declining.
     """
+    per_token = _NORM_BYTES
+    if "doc_codes" not in shared:
+        per_token += _CODE_BYTES
+    if "doc_residuals" not in shared:
+        per_token += (dim * nbits) // 8
+    total = n_tokens * per_token
+    if "centroids" not in shared:
+        total += n_centroids * dim * 2
+    if "ivf" not in shared:
+        total += n_ivf * 4
     return (
-        n_tokens * bytes_per_token(dim=dim, nbits=nbits)
-        # centroids, fp16
-        + n_centroids * dim * 2
-        # ivf int32, ivf_lengths int64, ivf_offsets int64 (one longer)
-        + n_ivf * 4
+        total
+        # ivf_lengths int64, ivf_offsets int64 (one longer)
         + n_centroids * 8
         + (n_centroids + 1) * 8
         # per document: token offsets int64, lengths int32
@@ -108,6 +140,7 @@ def check(  # noqa: PLR0911 - one branch per precondition, each with its reason
     n_tokens: int | None = None,
     free_bytes: int | None = None,
     memory_fraction: float = DEFAULT_MEMORY_FRACTION,
+    shared: frozenset[str] = frozenset(),
 ) -> str | None:
     """Return a reason the fused path cannot run, or ``None`` if it can.
 
@@ -128,6 +161,9 @@ def check(  # noqa: PLR0911 - one branch per precondition, each with its reason
         Share of free memory the staged copy may occupy. See
         :data:`DEFAULT_MEMORY_FRACTION` for why this is not the index's
         ``index_memory_fraction``.
+    shared:
+        Index tensors already resident on the device, borrowed rather than
+        staged. See :func:`shared_keys`.
 
     """
     if os.environ.get(DISABLE_ENV, "") not in ("", "0"):
@@ -177,6 +213,7 @@ def check(  # noqa: PLR0911 - one branch per precondition, each with its reason
         n_ivf=int(data["ivf"].numel()),
         dim=dim,
         nbits=nbits,
+        shared=shared,
     )
 
     # Staging has to survive its own peak, not just its steady state: the norm

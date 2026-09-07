@@ -1072,6 +1072,24 @@ class FastPlaid:
 
         from .fused import build_engine
 
+        # The loader attaches the tensors the standard index was constructed
+        # from to the index object itself. They describe exactly the loaded
+        # generation, whatever the placement tier left on the device is shared
+        # storage the kernels can read in place, and nothing here touches the
+        # index directory -- so neither a second copy nor the file lock below
+        # is needed.
+        device = self.devices[0]
+        with self._index_swap_lock:
+            loaded = self.indices.get(device)
+        attached = getattr(loaded, "_device_tensors", None)
+        if attached is not None:
+            engine, reason = build_engine(
+                data=attached,
+                device=device,
+                search_memory_fraction=self.search_memory_fraction,
+            )
+            return self._publish_fused(generation, engine, reason)
+
         # ``_load_index_tensors_cpu`` memory-maps the merged files and can pad
         # them in place, so reading them while another process is mid-update
         # yields tensors that never described any single state of the index.
@@ -1187,7 +1205,9 @@ class FastPlaid:
         -------
         A mapping with ``active`` (the engine is staged and serving),
         ``reason`` (why it is not, or None), and — once active — the device,
-        resident bytes, token and document counts.
+        the bytes the engine allocated (``resident_bytes``), the bytes it reads
+        in place from the standard index (``shared_bytes``), and the token and
+        document counts.
 
         """
         with self._index_swap_lock:
@@ -1207,6 +1227,7 @@ class FastPlaid:
             "reason": None,
             "device": engine.device,
             "resident_bytes": engine.resident_bytes(),
+            "shared_bytes": engine.shared_bytes(),
             "n_tokens": engine.n_tokens,
             "n_docs": engine.n_docs,
         }

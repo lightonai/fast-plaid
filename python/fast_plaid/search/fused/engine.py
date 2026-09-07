@@ -123,6 +123,10 @@ class FusedEngine:
 
         self.norms = self._precompute_norms()
         self.token_tile = token_tile(self.arch)
+        # Fixed once staged; the admission ceiling caps each launch's
+        # transients at this footprint so the process never holds more
+        # scratch than index.
+        self._resident_bytes = self.resident_bytes()
 
         # The candidate bound depends only on the index and the padded query
         # length, so it is computed once per shape rather than per search.
@@ -215,9 +219,18 @@ class FusedEngine:
     ) -> tuple[torch.Tensor, ...]:
         """Probe the IVF lists and build a dense candidate matrix."""
         batch, max_q, _ = queries.shape
-        qct = torch.einsum("bqd,cd->bcq", queries, self.centroids)
+        # Built once, directly in the [batch, centroid, query] layout the
+        # approximate kernel reads. The einsum form materialised it in
+        # [batch, query, centroid] order, and both the top-k over centroids
+        # and the contiguous copy that followed doubled the largest transient
+        # of the call. A batched GEMM against the broadcast centroids (stride
+        # 0, nothing copied) yields the same values bit for bit, and top-k on
+        # this layout runs without an intermediate.
+        qct = torch.bmm(
+            self.centroids.unsqueeze(0).expand(batch, -1, -1),
+            queries.transpose(1, 2),
+        )
         cells = qct.topk(n_probe, dim=1).indices.permute(0, 2, 1).reshape(batch, -1)
-        qct = qct.contiguous()
 
         flat_cells = cells.reshape(-1)
         segment_lengths = self.ivf_lengths[flat_cells]
@@ -416,6 +429,7 @@ class FusedEngine:
             candidates_per_query=candidates_per_query,
             device=self.device,
             budget_fraction=self.budget_fraction,
+            resident_bytes=self._resident_bytes,
         )
         if max_batch is not None:
             chunk = max(1, min(chunk, max_batch))

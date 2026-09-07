@@ -46,11 +46,13 @@ _NORM_BYTES = 2
 # Deliberately small. At 2,000,000 the precompute peaked near 4 GiB on a
 # 96-dimension index, which was enough to refuse MS MARCO on an 80GB card --
 # 31.9 GiB resident plus 3.9 GiB to stage against a 35.0 GiB cap -- for an
-# index that had already been shown to stage and serve. The chunk is a pure
-# scheduling knob: shrinking it costs a few hundred extra iterations of a
-# bandwidth-bound loop that runs once per staging, and buys back capacity that
-# the gate would otherwise decline.
-NORM_CHUNK = 500_000
+# index that had already been shown to stage and serve. At 500,000 it still
+# peaked at 1 GiB on a 74 MB index, and since the caching allocator keeps what
+# staging touched, that gigabyte stayed reserved for the life of the process.
+# The chunk is a pure scheduling knob: shrinking it costs extra iterations of a
+# bandwidth-bound loop that runs once per staging (about 9,000 on MS MARCO,
+# a few seconds), and buys back both admission and steady-state footprint.
+NORM_CHUNK = 65_536
 
 # Device bytes the norm precompute holds per token of its chunk: the unpacked
 # codes and the per-byte partials at int64 (8 each), then the gathered

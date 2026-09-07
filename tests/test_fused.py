@@ -240,6 +240,53 @@ def test_max_batch_scales_with_budget() -> None:
     assert small >= 1
 
 
+def test_max_batch_is_capped_by_the_index_footprint() -> None:
+    """Free VRAM alone no longer sizes the launch.
+
+    One launch may allocate at most the staged index's own footprint in
+    transients, with a floor for small indexes. Without the cap a 74 MB index
+    on an empty 80GB card was admitted 10,000 queries per launch and the
+    process peaked at 53 GiB.
+    """
+    kwargs = {
+        "n_centroids": 16_384,
+        "max_query_tokens": 64,
+        "n_docs": 5_183,
+        "candidates_per_query": 5_183,
+        "device": "cpu",
+        "free_bytes": 75 * GIB,
+    }
+    per_query = ceiling.bytes_per_query(
+        n_centroids=16_384,
+        max_query_tokens=64,
+        n_docs=5_183,
+        candidates_per_query=5_183,
+    )
+    uncapped = ceiling.max_batch(**kwargs)
+
+    # A small index is held to the floor.
+    small = ceiling.max_batch(**kwargs, resident_bytes=69 * 2**20)
+    assert small < uncapped
+    assert small == (ceiling.TRANSIENT_FLOOR_BYTES - ceiling.FIXED_BYTES) // per_query
+    assert small >= 64, "the floor must still admit launches wide enough to be fast"
+
+    # A large index may spend up to its own footprint.
+    big = ceiling.max_batch(**kwargs, resident_bytes=8 * GIB)
+    assert (
+        big
+        == (int(ceiling.TRANSIENT_RESIDENT_RATIO * 8 * GIB) - ceiling.FIXED_BYTES)
+        // per_query
+    )
+
+    # The free-memory budget still applies when it is the tighter bound.
+    tight = {**kwargs, "free_bytes": GIB}
+    assert ceiling.max_batch(**tight, resident_bytes=8 * GIB) == ceiling.max_batch(
+        **tight
+    )
+
+    assert ceiling.max_batch(**kwargs, resident_bytes=1) >= 1
+
+
 def test_max_batch_never_returns_zero() -> None:
     """A batch of one is always attempted, even under a hopeless budget."""
     assert (
@@ -971,6 +1018,59 @@ def test_fused_matches_standard_pipeline_on_empty_input(tmp_path, monkeypatch) -
     actual = engine.search(queries_embeddings=[], top_k=5, show_progress=False)
 
     assert actual == expected
+
+
+@requires_fused
+def test_fused_transients_do_not_grow_with_the_batch(tmp_path) -> None:
+    """Peak device memory of one search() is bounded by the launch cap.
+
+    The same call with 128 times as many queries must not allocate more than
+    the floor plus the packed query staging; before the cap it scaled linearly
+    with the batch and was held by the allocator afterwards.
+    """
+    torch.manual_seed(0)
+    dim = 96
+    documents = [
+        torch.nn.functional.normalize(torch.randn(48, dim), p=2, dim=-1)
+        for _ in range(2_000)
+    ]
+    queries = torch.nn.functional.normalize(torch.randn(32, 32, dim), p=2, dim=-1)
+
+    engine = FastPlaid(index=str(tmp_path / "index"), device="cuda:0")
+    engine.create(documents_embeddings=documents, nbits=4)
+    assert engine.prepare_fused()["active"], "fused path should be eligible here"
+    reference = engine.search(queries_embeddings=queries, top_k=10, show_progress=False)
+
+    def peak(repeats: int) -> tuple[int, list]:
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        got = engine.search(
+            queries_embeddings=queries.repeat(repeats, 1, 1),
+            top_k=10,
+            show_progress=False,
+        )
+        torch.cuda.synchronize()
+        return torch.cuda.max_memory_allocated() - base, got
+
+    half, _ = peak(64)
+    large, results = peak(128)
+
+    assert len(results) == 128 * len(queries)
+    for i, row in enumerate(results):
+        assert {doc for doc, _ in row} == {
+            doc for doc, _ in reference[i % len(queries)]
+        }
+    slack = 128 * 2**20
+    assert large <= ceiling.TRANSIENT_FLOOR_BYTES + slack, (
+        f"{large / 2**20:.0f} MiB transient for 4096 queries exceeds the cap"
+    )
+    # Past the cap the peak is flat: doubling the queries doubles the launches,
+    # not the scratch.
+    assert abs(large - half) <= 64 * 2**20, (
+        f"transient moved from {half / 2**20:.0f} to {large / 2**20:.0f} MiB "
+        f"when the batch doubled"
+    )
 
 
 def test_zz_report_observed_score_deltas() -> None:

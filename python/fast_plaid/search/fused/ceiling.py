@@ -19,9 +19,9 @@ from __future__ import annotations
 
 import torch
 
-# The query-by-centroid table is materialised by the einsum and again by the
-# contiguous copy that feeds the approximate kernel.
-QCT_COPIES = 2
+# The query-by-centroid table is built once, directly in the layout the
+# approximate kernel reads, so a single copy is live at a time.
+QCT_COPIES = 1
 
 # One byte of candidate bitmap per (query, document).
 BITMAP_BYTES_PER_DOC = 1
@@ -40,6 +40,19 @@ BUDGET_FRACTION = 0.6
 # term alone, so a constant is carried rather than pretending the fit passes
 # through the origin.
 FIXED_BYTES = 128 * 2**20
+
+# Ceiling on the transients of one launch, independent of how much of the card
+# happens to be free. Without it the admitted batch scales with free VRAM rather
+# than with the workload: on a 74 MB SciFact index an 80GB card admitted 10,000
+# queries in one launch, the process peaked at 53 GiB, and the caching
+# allocator held that for the rest of its life. The cap is the staged index's
+# own footprint, so the process never holds more transient than index, with a
+# floor so that small indexes still get launches wide enough to keep the
+# kernels busy. Measured on SciFact (16k centroids, 64 padded query tokens),
+# throughput reaches ~90% of its uncapped value at 64 queries per launch and
+# ~95% at 128; the floor admits roughly 100 there.
+TRANSIENT_FLOOR_BYTES = 384 * 2**20
+TRANSIENT_RESIDENT_RATIO = 1.0
 
 
 def estimate_candidates(
@@ -139,6 +152,7 @@ def max_batch(
     device: str,
     free_bytes: int | None = None,
     budget_fraction: float = BUDGET_FRACTION,
+    resident_bytes: int | None = None,
 ) -> int:
     """Largest query batch whose transients fit the memory budget.
 
@@ -160,6 +174,11 @@ def max_batch(
         Share of free memory the transients may occupy. Callers pass the
         index's own ``search_memory_fraction``, so a deployment that lowered it
         to share the GPU is honoured here rather than overridden.
+    resident_bytes:
+        Device bytes held by the staged index. When given, one launch may not
+        allocate more transient than :data:`TRANSIENT_RESIDENT_RATIO` times
+        this, or :data:`TRANSIENT_FLOOR_BYTES`, whichever is larger -- so the
+        footprint follows the workload rather than the card.
 
     """
     if free_bytes is None:
@@ -175,6 +194,9 @@ def max_batch(
         return 1
 
     budget = int(budget_fraction * free_bytes) - FIXED_BYTES
+    if resident_bytes is not None:
+        cap = max(TRANSIENT_FLOOR_BYTES, int(TRANSIENT_RESIDENT_RATIO * resident_bytes))
+        budget = min(budget, cap - FIXED_BYTES)
     if budget <= 0:
         return 1
     return max(1, budget // per_query)

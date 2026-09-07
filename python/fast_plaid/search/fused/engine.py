@@ -79,8 +79,11 @@ class FusedEngine:
             Keys of ``data`` already resident on ``device`` and owned by the
             standard index. Those tensors are used in place -- the kernels only
             need a pointer into them -- so the engine allocates nothing for
-            them. Codes are read at their stored int64 width rather than
-            narrowed to int32, which is the price of not copying.
+            them. ``doc_codes`` and ``doc_residuals`` must be among them: the
+            engine never stages its own copy of the index, which ``build_engine``
+            guarantees before constructing it. Codes are read at their stored
+            int64 width rather than narrowed to int32, which is the price of
+            not copying.
 
         """
         self.device = device
@@ -101,18 +104,18 @@ class FusedEngine:
         self.doc_lengths = lengths.to(torch.int32).contiguous()
 
         packed_bytes = (self.dim * self.nbits) // 8
+        if not {"doc_codes", "doc_residuals"} <= self.shared:
+            error = (
+                "FusedEngine reads codes and residuals in place from the standard "
+                "index; both must be resident on the device"
+            )
+            raise ValueError(error)
         # Slicing a contiguous tensor along its first dimension is a view, so
-        # the shared branches allocate nothing.
-        if "doc_codes" in self.shared:
-            self.codes = data["doc_codes"].reshape(-1)[: self.n_tokens]
-        else:
-            codes = data["doc_codes"].to(torch.int64).reshape(-1)[: self.n_tokens]
-            self.codes = codes.to(torch.int32).to(device).contiguous()
-        residuals = data["doc_residuals"].reshape(-1, packed_bytes)[: self.n_tokens]
-        if "doc_residuals" in self.shared:
-            self.residuals = residuals
-        else:
-            self.residuals = residuals.to(device).contiguous()
+        # neither line allocates.
+        self.codes = data["doc_codes"].reshape(-1)[: self.n_tokens]
+        self.residuals = data["doc_residuals"].reshape(-1, packed_bytes)[
+            : self.n_tokens
+        ]
 
         if "centroids" in self.shared:
             self.centroids = data["centroids"]

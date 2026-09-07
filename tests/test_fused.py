@@ -325,7 +325,7 @@ def test_fused_matches_standard_pipeline(tmp_path, monkeypatch, nbits: int) -> N
     queries = torch.nn.functional.normalize(torch.randn(16, 32, dim), p=2, dim=-1)
 
     index_path = str(tmp_path / f"index-nbits{nbits}")
-    engine = FastPlaid(index=index_path, device="cuda:0")
+    engine = FastPlaid(index=index_path, device="cuda:0", index_gpu_memory="high")
     engine.create(documents_embeddings=documents, nbits=nbits)
 
     monkeypatch.setenv(gate.DISABLE_ENV, "1")
@@ -368,7 +368,7 @@ def test_fused_starves_without_inventing_documents(tmp_path, monkeypatch) -> Non
     ]
 
     index_path = str(tmp_path / "index")
-    engine = FastPlaid(index=index_path, device="cuda:0")
+    engine = FastPlaid(index=index_path, device="cuda:0", index_gpu_memory="high")
     engine.create(documents_embeddings=documents, nbits=4)
 
     kwargs = {"top_k": 200, "n_ivf_probe": 1, "show_progress": False}
@@ -410,7 +410,7 @@ def test_fused_serves_documents_added_by_update(tmp_path) -> None:
     ]
 
     index_path = str(tmp_path / "index")
-    engine = FastPlaid(index=index_path, device="cuda:0")
+    engine = FastPlaid(index=index_path, device="cuda:0", index_gpu_memory="high")
     engine.create(documents_embeddings=original, nbits=4)
 
     # A document that is about to be added, used as its own query.
@@ -582,7 +582,9 @@ def test_fused_falls_back_when_a_single_query_cannot_fit(tmp_path, monkeypatch) 
     ]
     queries = torch.nn.functional.normalize(torch.randn(4, 32, 96), p=2, dim=-1)
 
-    engine = FastPlaid(index=str(tmp_path / "index"), device="cuda:0")
+    engine = FastPlaid(
+        index=str(tmp_path / "index"), device="cuda:0", index_gpu_memory="high"
+    )
     engine.create(documents_embeddings=documents, nbits=4)
 
     monkeypatch.setenv(gate.DISABLE_ENV, "1")
@@ -684,7 +686,7 @@ def test_fused_status_reports_activation(tmp_path) -> None:
     ]
 
     index_path = str(tmp_path / "index")
-    engine = FastPlaid(index=index_path, device="cuda:0")
+    engine = FastPlaid(index=index_path, device="cuda:0", index_gpu_memory="high")
     engine.create(documents_embeddings=documents, nbits=4)
 
     # Reporting never stages, so the question has to be asked explicitly.
@@ -753,7 +755,7 @@ def test_fused_handles_variable_length_queries(
     ]
 
     index_path = str(tmp_path / "index")
-    engine = FastPlaid(index=index_path, device="cuda:0")
+    engine = FastPlaid(index=index_path, device="cuda:0", index_gpu_memory="high")
     engine.create(documents_embeddings=documents, nbits=4)
 
     monkeypatch.setenv(gate.DISABLE_ENV, "1")
@@ -790,7 +792,7 @@ def test_fused_splits_batches_without_misaligning_queries(
     ]
 
     index_path = str(tmp_path / "index")
-    engine = FastPlaid(index=index_path, device="cuda:0")
+    engine = FastPlaid(index=index_path, device="cuda:0", index_gpu_memory="high")
     engine.create(documents_embeddings=documents, nbits=4)
 
     monkeypatch.setenv(gate.DISABLE_ENV, "1")
@@ -860,34 +862,33 @@ def test_fused_can_be_disabled_per_instance(tmp_path) -> None:
     assert engine._maybe_fused() is None
 
 
-def test_staging_declines_while_a_writer_holds_the_lock(tmp_path) -> None:
-    """Staging reads a coherent snapshot or none at all.
+@requires_fused
+def test_staging_does_not_take_the_index_lock(tmp_path) -> None:
+    """Staging reads nothing from disk, so a busy writer cannot block it.
 
-    ``_load_index_tensors_cpu`` memory-maps the merged files and can pad them
-    in place, so reading them while another process is mid-update yields
-    tensors that never described any one state of the index. The generation
-    counter cannot see that -- it is in-process bookkeeping -- so the file lock
-    is what makes the read coherent.
-
-    Declining must also leave the attempt *unmarked*, or one unlucky overlap
-    with a writer would strand the index on the standard pipeline forever.
+    The engine is built from the tensors attached to the loaded index -- the
+    very ones the standard pipeline searches -- so there is no memory-mapped
+    read to keep coherent and no reason to wait on ``plaid.lock``.
     """
     torch.manual_seed(0)
     documents = [
         torch.nn.functional.normalize(torch.randn(8, 96), p=2, dim=-1)
         for _ in range(64)
     ]
+    queries = torch.nn.functional.normalize(torch.randn(2, 16, 96), p=2, dim=-1)
 
-    engine = FastPlaid(index=str(tmp_path / "index"), device="cpu")
+    engine = FastPlaid(
+        index=str(tmp_path / "index"), device="cuda:0", index_gpu_memory="high"
+    )
     engine.create(documents_embeddings=documents)
+    engine._check_and_reload_index()
     engine._invalidate_fused()
 
     writer = FileLock(engine.lock_path)
     with writer:
-        assert engine._maybe_fused() is None
-        assert engine._fused_attempted is False, (
-            "a busy writer must not be remembered as a permanent decline"
-        )
+        assert engine._maybe_fused() is not None
+        assert engine.fused_status()["active"]
+        assert engine.search(queries_embeddings=queries, top_k=5, show_progress=False)
 
 
 def test_invalid_batch_size_raises_rather_than_falling_back(tmp_path) -> None:
@@ -928,7 +929,9 @@ def test_explicit_batch_size_is_served_by_the_standard_pipeline(
     ]
     queries = torch.nn.functional.normalize(torch.randn(4, 32, 96), p=2, dim=-1)
 
-    engine = FastPlaid(index=str(tmp_path / "index"), device="cuda:0")
+    engine = FastPlaid(
+        index=str(tmp_path / "index"), device="cuda:0", index_gpu_memory="high"
+    )
     engine.create(documents_embeddings=documents, nbits=4)
 
     fused = engine._maybe_fused()
@@ -961,7 +964,9 @@ def test_compilation_failure_retires_the_staged_copy(tmp_path, monkeypatch) -> N
     ]
     queries = torch.nn.functional.normalize(torch.randn(4, 32, 96), p=2, dim=-1)
 
-    engine = FastPlaid(index=str(tmp_path / "index"), device="cuda:0")
+    engine = FastPlaid(
+        index=str(tmp_path / "index"), device="cuda:0", index_gpu_memory="high"
+    )
     engine.create(documents_embeddings=documents, nbits=4)
 
     monkeypatch.setenv(gate.DISABLE_ENV, "1")
@@ -1005,7 +1010,9 @@ def test_fused_matches_standard_pipeline_on_empty_input(tmp_path, monkeypatch) -
         for _ in range(64)
     ]
 
-    engine = FastPlaid(index=str(tmp_path / "index"), device="cuda:0")
+    engine = FastPlaid(
+        index=str(tmp_path / "index"), device="cuda:0", index_gpu_memory="high"
+    )
     engine.create(documents_embeddings=documents, nbits=4)
 
     monkeypatch.setenv(gate.DISABLE_ENV, "1")
@@ -1036,7 +1043,9 @@ def test_fused_transients_do_not_grow_with_the_batch(tmp_path) -> None:
     ]
     queries = torch.nn.functional.normalize(torch.randn(32, 32, dim), p=2, dim=-1)
 
-    engine = FastPlaid(index=str(tmp_path / "index"), device="cuda:0")
+    engine = FastPlaid(
+        index=str(tmp_path / "index"), device="cuda:0", index_gpu_memory="high"
+    )
     engine.create(documents_embeddings=documents, nbits=4)
     assert engine.prepare_fused()["active"], "fused path should be eligible here"
     reference = engine.search(queries_embeddings=queries, top_k=10, show_progress=False)
@@ -1122,13 +1131,14 @@ def test_fused_borrows_the_standard_index_tensors(tmp_path) -> None:
 
 
 @requires_fused
-def test_fused_stages_its_own_copy_when_the_tier_keeps_the_index_on_cpu(
-    tmp_path,
+@pytest.mark.parametrize("tier", ["low", "medium"])
+def test_fused_declines_when_the_tier_keeps_the_index_on_cpu(
+    tmp_path, tier: str
 ) -> None:
-    """A 'low' tier leaves codes and residuals on the host; the engine copies them.
+    """A 'low' or 'medium' tier was chosen to keep bytes off the device.
 
-    Sharing is opportunistic, so the fused path must still serve -- and still
-    match -- when there is nothing on the device to borrow.
+    The fused path never stages its own copy, so it declines under those tiers
+    and says why; the standard pipeline serves unchanged.
     """
     torch.manual_seed(0)
     dim = 96
@@ -1139,31 +1149,19 @@ def test_fused_stages_its_own_copy_when_the_tier_keeps_the_index_on_cpu(
     queries = torch.nn.functional.normalize(torch.randn(8, 32, dim), p=2, dim=-1)
 
     engine = FastPlaid(
-        index=str(tmp_path / "index"), device="cuda:0", index_gpu_memory="low"
+        index=str(tmp_path / "index"), device="cuda:0", index_gpu_memory=tier
     )
     engine.create(documents_embeddings=documents, nbits=4)
-    actual_fused = engine.search(
-        queries_embeddings=queries, top_k=10, show_progress=False
-    )
+    results = engine.search(queries_embeddings=queries, top_k=10, show_progress=False)
 
     status = engine.fused_status()
-    assert status["active"], status
-    fused = engine._fused_engine
+    assert status["active"] is False
+    assert tier in status["reason"]
+    assert "high" in status["reason"]
+    assert len(results) == len(queries)
+    # Nothing was staged: the device holds exactly what the tier placed there.
     attached = engine.indices["cuda:0"]._device_tensors
-    # The tier left codes and residuals on the host, so the engine copied them;
-    # only the small tensors the tier always places on the device are borrowed.
     assert attached["doc_residuals"].device.type == "cpu"
-    assert "doc_residuals" not in fused.shared
-    assert "doc_codes" not in fused.shared
-    assert fused.residuals.device.type == "cuda"
-    assert fused.codes.dtype == torch.int32
-    assert status["shared_bytes"] < attached["doc_residuals"].numel()
-    assert status["resident_bytes"] >= attached["doc_residuals"].numel()
-
-    expected_standard = engine.search(
-        queries_embeddings=queries, top_k=10, show_progress=False, batch_size=64
-    )
-    assert_same_ranking(actual_fused, expected_standard)
 
 
 def test_gate_charges_only_what_is_not_shared() -> None:

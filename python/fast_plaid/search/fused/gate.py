@@ -133,6 +133,11 @@ def is_debug() -> bool:
     return os.environ.get(DEBUG_ENV, "") not in ("", "0")
 
 
+def is_disabled() -> bool:
+    """Whether the process-wide kill switch is set."""
+    return os.environ.get(DISABLE_ENV, "") not in ("", "0")
+
+
 def check(  # noqa: PLR0911 - one branch per precondition, each with its reason
     data: dict[str, Any],
     device: str,
@@ -166,7 +171,7 @@ def check(  # noqa: PLR0911 - one branch per precondition, each with its reason
         staged. See :func:`shared_keys`.
 
     """
-    if os.environ.get(DISABLE_ENV, "") not in ("", "0"):
+    if is_disabled():
         return f"disabled by {DISABLE_ENV}"
 
     if not device.startswith("cuda"):

@@ -445,9 +445,11 @@ class FastPlaid:
             is 'auto'.
         fused:
             Whether the fused CUDA fast path may serve eligible searches. It
-            stages a second, device-resident copy of the index, so it trades
-            VRAM for latency; pass False to keep this instance on the standard
-            pipeline regardless of what the hardware supports. The
+            runs only on top of a 'high' index placement (codes and residuals
+            resident on the device), reading those tensors in place and adding
+            two bytes per token of precomputed norms; under 'low' or 'medium'
+            it declines and the standard pipeline serves. Pass False to keep
+            this instance on the standard pipeline regardless. The
             FAST_PLAID_DISABLE_FUSED environment variable disables it for
             every instance in the process.
         kwargs:
@@ -1053,15 +1055,25 @@ class FastPlaid:
     def _stage_fused(self) -> Any:
         """Build the fused engine and publish it if the index has not moved.
 
-        Two different races have to be closed here, and they need different
-        instruments. Within this process, ``update`` can replace the loaded
-        index while staging runs: recording the generation first is what makes
-        that safe, since a copy finished after the swap is dropped rather than
-        published over its successor. Across processes, a writer can be part
-        way through rewriting the very files being read, and no in-process
-        counter can see that -- hence the file lock.
+        The engine is built from the tensors the loader attached to the loaded
+        index object: they describe exactly the generation recorded below, and
+        the ones the placement tier put on the device are read in place. Nothing
+        here touches the index directory, so no file lock is needed; the only
+        race left is in-process -- ``update`` replacing the loaded index while
+        staging runs -- and recording the generation first closes it, since an
+        engine finished after the swap is dropped rather than published over its
+        successor.
         """
         generation = self._fused_generation
+
+        from .fused import build_engine, gate
+
+        # The kill switch is answered before anything is loaded or inspected,
+        # so its reason is the one reported.
+        if gate.is_disabled():
+            return self._publish_fused(
+                generation, None, f"disabled by {gate.DISABLE_ENV}"
+            )
 
         # Multi-device search fans out across devices; the fused engine is
         # single-device and declines rather than owning that scheduling.
@@ -1070,67 +1082,36 @@ class FastPlaid:
                 generation, None, "fused search requires a single device"
             )
 
-        from .fused import build_engine
-
-        # The loader attaches the tensors the standard index was constructed
-        # from to the index object itself. They describe exactly the loaded
-        # generation, whatever the placement tier left on the device is shared
-        # storage the kernels can read in place, and nothing here touches the
-        # index directory -- so neither a second copy nor the file lock below
-        # is needed.
+        # The engine borrows the standard index's tensors, so that index has to
+        # be loaded first. ``search`` always has it loaded by the time it gets
+        # here; ``prepare_fused`` right after ``create`` does not.
         device = self.devices[0]
         with self._index_swap_lock:
             loaded = self.indices.get(device)
+        if loaded is None:
+            self._check_and_reload_index(blocking=True)
+            # The reload swapped the index in and retired the generation read
+            # above; the engine is built from what is loaded now, so it is
+            # published under the generation that describes it.
+            with self._index_swap_lock:
+                loaded = self.indices.get(device)
+                generation = self._fused_generation
+        if loaded is None:
+            return self._publish_fused(generation, None, "no index is loaded")
+
         attached = getattr(loaded, "_device_tensors", None)
-        if attached is not None:
-            engine, reason = build_engine(
-                data=attached,
-                device=device,
-                search_memory_fraction=self.search_memory_fraction,
+        if attached is None:
+            return self._publish_fused(
+                generation,
+                None,
+                "the loaded index carries no device tensors to borrow",
             )
-            return self._publish_fused(generation, engine, reason)
 
-        # ``_load_index_tensors_cpu`` memory-maps the merged files and can pad
-        # them in place, so reading them while another process is mid-update
-        # yields tensors that never described any single state of the index.
-        #
-        # A writer holding this lock is performing an update that would retire
-        # the copy as soon as it landed, so waiting would buy a copy with no
-        # future. Decline instead, and leave the attempt unmarked so the next
-        # search stages against whatever the writer leaves behind.
-        try:
-            self.lock.acquire(timeout=0)
-        except FileLockTimeout:
-            return None
-
-        try:
-            data = _load_index_tensors_cpu(index_path=self.index)
-            if data is None:
-                return self._publish_fused(
-                    generation, None, "index tensors could not be loaded"
-                )
-
-            # The device copy is built with the lock still held. Releasing it
-            # first and copying from the mmap afterwards would reintroduce the
-            # incoherence the lock exists to prevent. Searches in this process
-            # are unaffected -- they take ``_index_swap_lock``, not this one --
-            # so the cost falls on a concurrent writer, which waits for one
-            # staging pass rather than racing it.
-            #
-            # Only the transient budget takes the caller's setting. Residency
-            # deliberately keeps the gate's own default: while the fused copy is
-            # staged alongside the standard index rather than replacing it,
-            # `index_memory_fraction` has already been spent once, and charging
-            # the second copy against the remainder declines exactly the large
-            # indexes the fast path exists for. Revisit when residency is single.
-            engine, reason = build_engine(
-                data=data,
-                device=self.devices[0],
-                search_memory_fraction=self.search_memory_fraction,
-            )
-        finally:
-            self.lock.release()
-
+        engine, reason = build_engine(
+            data=attached,
+            device=device,
+            search_memory_fraction=self.search_memory_fraction,
+        )
         return self._publish_fused(generation, engine, reason)
 
     def _publish_fused(self, generation: int, engine: Any, reason: str | None) -> Any:

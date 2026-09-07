@@ -85,11 +85,32 @@ def build_engine(
     # need no index at all. Reading ``data`` here instead would make a decline
     # depend on the tensors being well formed -- the same ordering mistake as
     # importing the kernels before deciding whether they can run.
-    # Whatever the standard index already holds on this device is borrowed,
-    # not copied: the gate budgets only what the engine has to allocate itself.
+    # The kill switch short-circuits every other check, including the one below.
+    if gate.is_disabled():
+        reason = f"disabled by {gate.DISABLE_ENV}"
+        if gate.is_debug():
+            print(f"[fast-plaid] fused path unavailable: {reason}", file=sys.stderr)
+        return None, reason
+
+    # The fused path serves only a 'high' placement: the standard index must
+    # already hold codes and residuals on this device, and the engine borrows
+    # them. It never stages a copy of its own, so a tier chosen to keep those
+    # bytes off the card is honoured rather than silently undone, and the gate
+    # budgets only the norms and bookkeeping the engine allocates itself.
     shared = (
         gate.shared_keys(data, device) if device.startswith("cuda") else frozenset()
     )
+    if device.startswith("cuda"):
+        missing = [key for key in ("doc_codes", "doc_residuals") if key not in shared]
+        if missing:
+            tier = data.get("index_gpu_memory", "unknown")
+            reason = (
+                f"index_gpu_memory='{tier}' keeps {' and '.join(missing)} off the "
+                "device; the fused path serves only a 'high' placement"
+            )
+            if gate.is_debug():
+                print(f"[fast-plaid] fused path unavailable: {reason}", file=sys.stderr)
+            return None, reason
     reason = gate.check(
         data=data,
         device=device,

@@ -422,7 +422,7 @@ class FastPlaid:
         index_gpu_memory: Literal["auto", "low", "medium", "high"] = "auto",
         index_memory_fraction: float = 0.7,
         search_memory_fraction: float = 0.5,
-        fused: bool = True,
+        fused: bool = False,
         **kwargs: Any,
     ) -> None:
         """Initialize the FastPlaid instance.
@@ -444,12 +444,14 @@ class FastPlaid:
             Fraction of free VRAM the scoring stages may use when batch_size
             is 'auto'.
         fused:
-            Whether the fused CUDA fast path may serve eligible searches. It
-            runs only on top of a 'high' index placement (codes and residuals
+            Opt in to the fused CUDA fast path for eligible searches. It runs
+            only on top of a 'high' index placement (codes and residuals
             resident on the device), reading those tensors in place and adding
-            two bytes per token of precomputed norms; under 'low' or 'medium'
-            it declines and the standard pipeline serves. Pass False to keep
-            this instance on the standard pipeline regardless. The
+            two bytes per token of precomputed norms. If the placement resolves
+            to 'low' or 'medium' -- because 'auto' found too little free VRAM,
+            or because that tier was requested -- a UserWarning is issued once
+            per instance and the standard pipeline serves; the decision is
+            revisited whenever the index is reloaded. Off by default. The
             FAST_PLAID_DISABLE_FUSED environment variable disables it for
             every instance in the process.
         kwargs:
@@ -521,6 +523,8 @@ class FastPlaid:
         self._fused_engine: Any = None
         self._fused_attempted = False
         self._fused_reason: str | None = None
+        # One warning per instance when fused=True cannot be honoured.
+        self._fused_warned = False
         # Bumped whenever the loaded index is replaced. Staging records the
         # generation it read, so a copy built while the index was changing is
         # discarded rather than published over its successor.
@@ -531,6 +535,14 @@ class FastPlaid:
 
         # Initial Load
         self._check_and_reload_index()
+
+        # When the fast path is requested and an index is already on disk,
+        # stage it now rather than on the first query: the caller learns at
+        # construction whether the placement allows it (a warning if not), and
+        # the device copy of the norms is paid for before serving starts. With
+        # no index yet, staging happens on the first search after ``create``.
+        if self.fused and any(idx is not None for idx in self.indices.values()):
+            self._prepare_fused()
 
     def close(self) -> None:
         """Release all resources held by the index.
@@ -1084,7 +1096,7 @@ class FastPlaid:
 
         # The engine borrows the standard index's tensors, so that index has to
         # be loaded first. ``search`` always has it loaded by the time it gets
-        # here; ``prepare_fused`` right after ``create`` does not.
+        # here; ``_prepare_fused`` right after ``create`` does not.
         device = self.devices[0]
         with self._index_swap_lock:
             loaded = self.indices.get(device)
@@ -1106,6 +1118,31 @@ class FastPlaid:
                 None,
                 "the loaded index carries no device tensors to borrow",
             )
+
+        # The fused path serves only a 'high' placement. Anything else is not
+        # an error -- the standard pipeline answers every call -- but the
+        # caller asked for the fast path, so they are told once why they are
+        # not getting it. The decline is recorded for this loaded index and
+        # revisited on the next reload, when the placement may differ.
+        tier = attached.get("index_gpu_memory")
+        if device.startswith("cuda") and tier in ("low", "medium"):
+            on_host = "codes and residuals" if tier == "low" else "residuals"
+            if self.index_gpu_memory == "auto":
+                cause = (
+                    f"index_gpu_memory='auto' resolved to '{tier}' on {device}, "
+                    f"which keeps the {on_host} on the host,"
+                )
+            else:
+                cause = f"index_gpu_memory='{tier}' keeps the {on_host} on the host,"
+            message = (
+                f"{cause} so the fused search path is disabled for this instance: "
+                "it serves only a 'high' placement. Pass index_gpu_memory='high' "
+                "to enable it, or fused=False to silence this warning."
+            )
+            if not self._fused_warned:
+                warnings.warn(message, UserWarning, stacklevel=3)
+                self._fused_warned = True
+            return self._publish_fused(generation, None, message)
 
         engine, reason = build_engine(
             data=attached,
@@ -1157,12 +1194,13 @@ class FastPlaid:
             self._fused_attempted = True
             self._fused_reason = reason
 
-    def prepare_fused(self) -> dict[str, Any]:
+    def _prepare_fused(self) -> dict[str, Any]:
         """Stage the fused fast path now rather than on the first search.
 
-        Returns the same mapping as :meth:`fused_status`. Staging copies the
-        index to the device, which takes seconds on a large corpus, so calling
-        this at startup moves that cost off the first user query.
+        Called from ``__init__`` when ``fused=True`` and an index is loaded, so
+        the cost of staging -- the norm precompute over the whole index -- is
+        paid at construction rather than by the first user query. Returns the
+        same mapping as :meth:`fused_status`.
 
         This is a warm start rather than a fully warmed one: Triton specialises
         its kernels per query shape, so the first search at each padded query
@@ -1180,7 +1218,8 @@ class FastPlaid:
         inferring it from latency.
 
         Reporting is pure -- it never stages, so asking the question cannot
-        change the answer. Call :meth:`prepare_fused` to stage explicitly.
+        change the answer. Staging happens at construction when ``fused=True``
+        and an index is loaded, otherwise on the first search.
 
         Returns
         -------
@@ -1197,10 +1236,11 @@ class FastPlaid:
             attempted = self._fused_attempted
 
         if engine is None:
-            if not self.fused:
-                reason = "disabled by fused=False"
-            elif not attempted and reason is None:
-                reason = "not staged yet: call prepare_fused() or run a search"
+            if reason is None:
+                if not self.fused:
+                    reason = "disabled by fused=False"
+                elif not attempted:
+                    reason = "not staged yet: run a search"
             return {"active": False, "reason": reason}
 
         return {

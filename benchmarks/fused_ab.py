@@ -84,7 +84,7 @@ def run_arm(
     # assertion below reflects this arm rather than a leftover decision.
     # Reporting is pure, so staging has to be asked for explicitly.
     engine._invalidate_fused()  # noqa: SLF001
-    status = engine.prepare_fused()
+    status = engine._prepare_fused()  # noqa: SLF001
     if status["active"] is not fused:
         raise RuntimeError(
             f"wanted fused={fused} but the gate reports {status}; "
@@ -245,7 +245,7 @@ def main() -> None:
     queries = load_queries(args.queries)
     print(f"{len(queries)} queries | index {args.index}")
 
-    engine = FastPlaid(index=args.index, device=args.device)
+    engine = FastPlaid(index=args.index, device=args.device, fused=True)
     shared = {
         "top_k": args.top_k,
         "n_full_scores": args.n_full_scores,

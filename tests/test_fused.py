@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import warnings
 
 import numpy as np
 import pytest
@@ -325,7 +326,9 @@ def test_fused_matches_standard_pipeline(tmp_path, monkeypatch, nbits: int) -> N
     queries = torch.nn.functional.normalize(torch.randn(16, 32, dim), p=2, dim=-1)
 
     index_path = str(tmp_path / f"index-nbits{nbits}")
-    engine = FastPlaid(index=index_path, device="cuda:0", index_gpu_memory="high")
+    engine = FastPlaid(
+        index=index_path, device="cuda:0", index_gpu_memory="high", fused=True
+    )
     engine.create(documents_embeddings=documents, nbits=nbits)
 
     monkeypatch.setenv(gate.DISABLE_ENV, "1")
@@ -368,7 +371,9 @@ def test_fused_starves_without_inventing_documents(tmp_path, monkeypatch) -> Non
     ]
 
     index_path = str(tmp_path / "index")
-    engine = FastPlaid(index=index_path, device="cuda:0", index_gpu_memory="high")
+    engine = FastPlaid(
+        index=index_path, device="cuda:0", index_gpu_memory="high", fused=True
+    )
     engine.create(documents_embeddings=documents, nbits=4)
 
     kwargs = {"top_k": 200, "n_ivf_probe": 1, "show_progress": False}
@@ -410,7 +415,9 @@ def test_fused_serves_documents_added_by_update(tmp_path) -> None:
     ]
 
     index_path = str(tmp_path / "index")
-    engine = FastPlaid(index=index_path, device="cuda:0", index_gpu_memory="high")
+    engine = FastPlaid(
+        index=index_path, device="cuda:0", index_gpu_memory="high", fused=True
+    )
     engine.create(documents_embeddings=original, nbits=4)
 
     # A document that is about to be added, used as its own query.
@@ -583,7 +590,10 @@ def test_fused_falls_back_when_a_single_query_cannot_fit(tmp_path, monkeypatch) 
     queries = torch.nn.functional.normalize(torch.randn(4, 32, 96), p=2, dim=-1)
 
     engine = FastPlaid(
-        index=str(tmp_path / "index"), device="cuda:0", index_gpu_memory="high"
+        index=str(tmp_path / "index"),
+        device="cuda:0",
+        index_gpu_memory="high",
+        fused=True,
     )
     engine.create(documents_embeddings=documents, nbits=4)
 
@@ -619,7 +629,7 @@ def test_stale_staging_is_not_published(tmp_path) -> None:
     the generation and publishing the result. Needs no GPU: the generation
     handshake is plain bookkeeping.
     """
-    engine = FastPlaid(index=str(tmp_path / "index"), device="cpu")
+    engine = FastPlaid(index=str(tmp_path / "index"), device="cpu", fused=True)
     stale_generation = engine._fused_generation
 
     with engine._index_swap_lock:
@@ -654,7 +664,7 @@ def test_index_mutations_retire_the_staged_copy(tmp_path, mutation: str) -> None
         for _ in range(64)
     ]
 
-    engine = FastPlaid(index=str(tmp_path / "index"), device="cpu")
+    engine = FastPlaid(index=str(tmp_path / "index"), device="cpu", fused=True)
     engine.create(documents_embeddings=documents)
 
     sentinel = object()
@@ -686,13 +696,15 @@ def test_fused_status_reports_activation(tmp_path) -> None:
     ]
 
     index_path = str(tmp_path / "index")
-    engine = FastPlaid(index=index_path, device="cuda:0", index_gpu_memory="high")
+    engine = FastPlaid(
+        index=index_path, device="cuda:0", index_gpu_memory="high", fused=True
+    )
     engine.create(documents_embeddings=documents, nbits=4)
 
     # Reporting never stages, so the question has to be asked explicitly.
     assert engine.fused_status()["active"] is False
 
-    status = engine.prepare_fused()
+    status = engine._prepare_fused()
     assert status["active"] is True
     assert status["reason"] is None
     assert status["n_docs"] == 512
@@ -713,11 +725,13 @@ def test_fused_status_explains_unavailability(tmp_path, monkeypatch) -> None:
 
     index_path = str(tmp_path / "index")
     engine = FastPlaid(
-        index=index_path, device="cuda:0" if torch.cuda.is_available() else "cpu"
+        index=index_path,
+        device="cuda:0" if torch.cuda.is_available() else "cpu",
+        fused=True,
     )
     engine.create(documents_embeddings=documents, nbits=4)
 
-    status = engine.prepare_fused()
+    status = engine._prepare_fused()
     assert status["active"] is False
     assert status["reason"]
     assert gate.DISABLE_ENV in status["reason"]
@@ -755,7 +769,9 @@ def test_fused_handles_variable_length_queries(
     ]
 
     index_path = str(tmp_path / "index")
-    engine = FastPlaid(index=index_path, device="cuda:0", index_gpu_memory="high")
+    engine = FastPlaid(
+        index=index_path, device="cuda:0", index_gpu_memory="high", fused=True
+    )
     engine.create(documents_embeddings=documents, nbits=4)
 
     monkeypatch.setenv(gate.DISABLE_ENV, "1")
@@ -792,7 +808,9 @@ def test_fused_splits_batches_without_misaligning_queries(
     ]
 
     index_path = str(tmp_path / "index")
-    engine = FastPlaid(index=index_path, device="cuda:0", index_gpu_memory="high")
+    engine = FastPlaid(
+        index=index_path, device="cuda:0", index_gpu_memory="high", fused=True
+    )
     engine.create(documents_embeddings=documents, nbits=4)
 
     monkeypatch.setenv(gate.DISABLE_ENV, "1")
@@ -856,7 +874,7 @@ def test_fused_can_be_disabled_per_instance(tmp_path) -> None:
     engine = FastPlaid(index=str(tmp_path / "index"), device="cpu", fused=False)
     engine.create(documents_embeddings=documents)
 
-    status = engine.prepare_fused()
+    status = engine._prepare_fused()
     assert status["active"] is False
     assert "fused=False" in status["reason"]
     assert engine._maybe_fused() is None
@@ -878,7 +896,10 @@ def test_staging_does_not_take_the_index_lock(tmp_path) -> None:
     queries = torch.nn.functional.normalize(torch.randn(2, 16, 96), p=2, dim=-1)
 
     engine = FastPlaid(
-        index=str(tmp_path / "index"), device="cuda:0", index_gpu_memory="high"
+        index=str(tmp_path / "index"),
+        device="cuda:0",
+        index_gpu_memory="high",
+        fused=True,
     )
     engine.create(documents_embeddings=documents)
     engine._check_and_reload_index()
@@ -905,7 +926,7 @@ def test_invalid_batch_size_raises_rather_than_falling_back(tmp_path) -> None:
     ]
     queries = torch.nn.functional.normalize(torch.randn(2, 8, 96), p=2, dim=-1)
 
-    engine = FastPlaid(index=str(tmp_path / "index"), device="cpu")
+    engine = FastPlaid(index=str(tmp_path / "index"), device="cpu", fused=True)
     engine.create(documents_embeddings=documents)
 
     with pytest.raises(ValueError, match="batch_size"):
@@ -930,7 +951,10 @@ def test_explicit_batch_size_is_served_by_the_standard_pipeline(
     queries = torch.nn.functional.normalize(torch.randn(4, 32, 96), p=2, dim=-1)
 
     engine = FastPlaid(
-        index=str(tmp_path / "index"), device="cuda:0", index_gpu_memory="high"
+        index=str(tmp_path / "index"),
+        device="cuda:0",
+        index_gpu_memory="high",
+        fused=True,
     )
     engine.create(documents_embeddings=documents, nbits=4)
 
@@ -965,7 +989,10 @@ def test_compilation_failure_retires_the_staged_copy(tmp_path, monkeypatch) -> N
     queries = torch.nn.functional.normalize(torch.randn(4, 32, 96), p=2, dim=-1)
 
     engine = FastPlaid(
-        index=str(tmp_path / "index"), device="cuda:0", index_gpu_memory="high"
+        index=str(tmp_path / "index"),
+        device="cuda:0",
+        index_gpu_memory="high",
+        fused=True,
     )
     engine.create(documents_embeddings=documents, nbits=4)
 
@@ -1011,7 +1038,10 @@ def test_fused_matches_standard_pipeline_on_empty_input(tmp_path, monkeypatch) -
     ]
 
     engine = FastPlaid(
-        index=str(tmp_path / "index"), device="cuda:0", index_gpu_memory="high"
+        index=str(tmp_path / "index"),
+        device="cuda:0",
+        index_gpu_memory="high",
+        fused=True,
     )
     engine.create(documents_embeddings=documents, nbits=4)
 
@@ -1044,10 +1074,13 @@ def test_fused_transients_do_not_grow_with_the_batch(tmp_path) -> None:
     queries = torch.nn.functional.normalize(torch.randn(32, 32, dim), p=2, dim=-1)
 
     engine = FastPlaid(
-        index=str(tmp_path / "index"), device="cuda:0", index_gpu_memory="high"
+        index=str(tmp_path / "index"),
+        device="cuda:0",
+        index_gpu_memory="high",
+        fused=True,
     )
     engine.create(documents_embeddings=documents, nbits=4)
-    assert engine.prepare_fused()["active"], "fused path should be eligible here"
+    assert engine._prepare_fused()["active"], "fused path should be eligible here"
     reference = engine.search(queries_embeddings=queries, top_k=10, show_progress=False)
 
     def peak(repeats: int) -> tuple[int, list]:
@@ -1099,7 +1132,10 @@ def test_fused_borrows_the_standard_index_tensors(tmp_path) -> None:
     queries = torch.nn.functional.normalize(torch.randn(8, 32, dim), p=2, dim=-1)
 
     engine = FastPlaid(
-        index=str(tmp_path / "index"), device="cuda:0", index_gpu_memory="high"
+        index=str(tmp_path / "index"),
+        device="cuda:0",
+        index_gpu_memory="high",
+        fused=True,
     )
     engine.create(documents_embeddings=documents, nbits=4)
     # Loads the standard index, then stages the fused path from its tensors.
@@ -1149,19 +1185,117 @@ def test_fused_declines_when_the_tier_keeps_the_index_on_cpu(
     queries = torch.nn.functional.normalize(torch.randn(8, 32, dim), p=2, dim=-1)
 
     engine = FastPlaid(
-        index=str(tmp_path / "index"), device="cuda:0", index_gpu_memory=tier
+        index=str(tmp_path / "index"),
+        device="cuda:0",
+        index_gpu_memory=tier,
+        fused=True,
     )
     engine.create(documents_embeddings=documents, nbits=4)
-    results = engine.search(queries_embeddings=queries, top_k=10, show_progress=False)
+    with pytest.warns(UserWarning, match="fused search path is disabled"):
+        results = engine.search(
+            queries_embeddings=queries, top_k=10, show_progress=False
+        )
 
+    # The caller's flag is left alone; the decline is recorded for this index.
+    assert engine.fused is True
+    assert engine._fused_warned is True
     status = engine.fused_status()
     assert status["active"] is False
-    assert tier in status["reason"]
+    assert f"index_gpu_memory='{tier}'" in status["reason"]
     assert "high" in status["reason"]
     assert len(results) == len(queries)
+
+    # No second warning: the question was settled.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        engine.search(queries_embeddings=queries, top_k=10, show_progress=False)
     # Nothing was staged: the device holds exactly what the tier placed there.
     attached = engine.indices["cuda:0"]._device_tensors
     assert attached["doc_residuals"].device.type == "cpu"
+
+
+@requires_fused
+def test_auto_placement_below_high_warns_and_switches_fused_off(
+    tmp_path, monkeypatch
+) -> None:
+    """'auto' landing on 'low' is reported as such, then the fast path is off.
+
+    On a busy card the automatic placement may keep the index on the host. The
+    default fused=True must not fail there, nor vanish silently: one warning
+    names both the requested and the resolved tier, and the instance continues
+    on the standard pipeline with fused=False.
+    """
+    from fast_plaid.search import load
+
+    monkeypatch.setattr(
+        load, "_resolve_index_gpu_memory", lambda *_args, **_kwargs: "low"
+    )
+
+    torch.manual_seed(0)
+    documents = [
+        torch.nn.functional.normalize(torch.randn(8, 96), p=2, dim=-1)
+        for _ in range(64)
+    ]
+    queries = torch.nn.functional.normalize(torch.randn(2, 16, 96), p=2, dim=-1)
+
+    engine = FastPlaid(index=str(tmp_path / "index"), device="cuda:0", fused=True)
+    assert engine.fused is True
+    engine.create(documents_embeddings=documents)
+
+    with pytest.warns(UserWarning, match="'auto' resolved to 'low'") as record:
+        results = engine.search(
+            queries_embeddings=queries, top_k=5, show_progress=False
+        )
+    assert len(results) == len(queries)
+    assert engine.fused is True
+    assert engine._fused_warned is True
+    assert any("index_gpu_memory='high'" in str(w.message) for w in record)
+    assert engine.fused_status()["active"] is False
+
+
+def test_fused_is_opt_in(tmp_path) -> None:
+    """The fast path is off unless asked for, and says so."""
+    engine = FastPlaid(index=str(tmp_path / "index"), device="cpu")
+    assert engine.fused is False
+    assert engine.fused_status() == {
+        "active": False,
+        "reason": "disabled by fused=False",
+    }
+
+
+@requires_fused
+def test_fused_is_staged_at_construction(tmp_path) -> None:
+    """Opening an existing index with fused=True stages the fast path at once.
+
+    A second instance on the same directory must not wait for its first query:
+    the norms are precomputed in ``__init__`` and ``fused_status`` reports the
+    engine active before any search.
+    """
+    torch.manual_seed(0)
+    documents = [
+        torch.nn.functional.normalize(torch.randn(8, 96), p=2, dim=-1)
+        for _ in range(64)
+    ]
+    builder = FastPlaid(index=str(tmp_path / "index"), device="cpu")
+    builder.create(documents_embeddings=documents)
+    builder.close()
+
+    engine = FastPlaid(
+        index=str(tmp_path / "index"),
+        device="cuda:0",
+        index_gpu_memory="high",
+        fused=True,
+    )
+    assert engine.fused_status()["active"] is True
+
+    # Without the flag, construction stages nothing.
+    plain = FastPlaid(
+        index=str(tmp_path / "index"), device="cuda:0", index_gpu_memory="high"
+    )
+    assert plain.fused_status() == {
+        "active": False,
+        "reason": "disabled by fused=False",
+    }
 
 
 def test_gate_charges_only_what_is_not_shared() -> None:

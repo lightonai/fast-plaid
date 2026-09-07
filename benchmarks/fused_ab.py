@@ -1,7 +1,7 @@
 """A/B the fused CUDA search path against the standard pipeline.
 
 Both arms go through the public ``FastPlaid.search`` API on one index in one
-process; ``FAST_PLAID_DISABLE_FUSED`` selects which path serves the call, so
+process; the engine's ``fused`` flag selects which path serves the call, so
 query staging, host-to-device transfer, kernel time and top-k extraction are
 counted identically on both sides.
 
@@ -37,14 +37,11 @@ from __future__ import annotations
 
 import argparse
 import itertools
-import os
 import statistics
 import time
 
 import torch
 from fast_plaid.search import FastPlaid
-
-DISABLE_ENV = "FAST_PLAID_DISABLE_FUSED"
 
 
 def load_queries(path: str) -> list[torch.Tensor]:
@@ -75,12 +72,9 @@ def run_arm(
     batch1_queries: int,
 ) -> dict:
     """Measure one engine, asserting it is the one that actually served."""
-    if fused:
-        os.environ.pop(DISABLE_ENV, None)
-    else:
-        os.environ[DISABLE_ENV] = "1"
+    engine.fused = fused
 
-    # Drop any copy staged by a previous arm and re-evaluate the gate, so the
+    # Drop any engine built for a previous arm and re-evaluate the gate, so the
     # assertion below reflects this arm rather than a leftover decision.
     # Reporting is pure, so staging has to be asked for explicitly.
     engine._invalidate_fused()  # noqa: SLF001

@@ -35,6 +35,6 @@ class FusedCompilationError(FusedUnavailableError):
     """Triton could not compile or launch a kernel for this shape.
 
     Deterministic where :class:`FusedOutOfMemoryError` is transient: the same
-    shape fails the same way every time, so the caller retires the staged copy
+    shape fails the same way every time, so the caller retires the engine
     rather than paying a doomed compilation on every subsequent search.
     """

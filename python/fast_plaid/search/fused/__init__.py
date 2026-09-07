@@ -1,8 +1,11 @@
 """Fused CUDA search path.
 
-An optional fast path that reads the standard index format unmodified and
-follows the standard scoring chain rounding step for rounding step. When any
-precondition is unmet the caller runs the standard pipeline instead.
+An opt-in fast path that reads the loaded index's device tensors in place and
+follows the standard scoring chain rounding step for rounding step. It runs
+only on top of a ``'high'`` index placement -- codes and residuals resident on
+the device -- and allocates nothing of its own beyond the per-token
+reconstruction norms. When any precondition is unmet the caller runs the
+standard pipeline instead.
 
 It returns the same documents, and scores them to within a measured tolerance
 rather than to the bit: the Half GEMM accumulates in a different order here
@@ -56,6 +59,12 @@ def __getattr__(name: str) -> Any:
     raise AttributeError(error)
 
 
+def _declined(reason: str) -> tuple[None, str]:
+    if gate.is_debug():
+        print(f"[fast-plaid] fused path unavailable: {reason}", file=sys.stderr)
+    return None, reason
+
+
 def build_engine(
     data: dict[str, Any],
     device: str,
@@ -63,7 +72,7 @@ def build_engine(
     index_memory_fraction: float = gate.DEFAULT_MEMORY_FRACTION,
     search_memory_fraction: float = ceiling.BUDGET_FRACTION,
 ) -> tuple[Any | None, str | None]:
-    """Stage a fused engine, or explain why the fast path cannot run.
+    """Build a fused engine over the loaded index, or explain why it cannot run.
 
     Returns ``(engine, None)`` when the fast path is available and
     ``(None, reason)`` otherwise. The reason is kept rather than discarded so
@@ -72,55 +81,20 @@ def build_engine(
     Args:
     ----
     data:
-        Index tensors from ``_load_index_tensors_cpu``.
+        The tensors the standard index was constructed from, as attached to
+        the loaded index by the loader.
     device:
         Target CUDA device.
     index_memory_fraction:
-        Share of free memory the resident copy may occupy.
+        Share of free memory the engine's allocation and staging transient may
+        occupy.
     search_memory_fraction:
         Share of free memory this engine's per-search transients may occupy.
 
     """
-    # The gate derives the token count itself, and only after the checks that
-    # need no index at all. Reading ``data`` here instead would make a decline
-    # depend on the tensors being well formed -- the same ordering mistake as
-    # importing the kernels before deciding whether they can run.
-    # The kill switch short-circuits every other check, including the one below.
-    if gate.is_disabled():
-        reason = f"disabled by {gate.DISABLE_ENV}"
-        if gate.is_debug():
-            print(f"[fast-plaid] fused path unavailable: {reason}", file=sys.stderr)
-        return None, reason
-
-    # The fused path serves only a 'high' placement: the standard index must
-    # already hold codes and residuals on this device, and the engine borrows
-    # them. It never stages a copy of its own, so a tier chosen to keep those
-    # bytes off the card is honoured rather than silently undone, and the gate
-    # budgets only the norms and bookkeeping the engine allocates itself.
-    shared = (
-        gate.shared_keys(data, device) if device.startswith("cuda") else frozenset()
-    )
-    if device.startswith("cuda"):
-        missing = [key for key in ("doc_codes", "doc_residuals") if key not in shared]
-        if missing:
-            tier = data.get("index_gpu_memory", "unknown")
-            reason = (
-                f"index_gpu_memory='{tier}' keeps {' and '.join(missing)} off the "
-                "device; the fused path serves only a 'high' placement"
-            )
-            if gate.is_debug():
-                print(f"[fast-plaid] fused path unavailable: {reason}", file=sys.stderr)
-            return None, reason
-    reason = gate.check(
-        data=data,
-        device=device,
-        memory_fraction=index_memory_fraction,
-        shared=shared,
-    )
+    reason = gate.check(data=data, device=device, memory_fraction=index_memory_fraction)
     if reason is not None:
-        if gate.is_debug():
-            print(f"[fast-plaid] fused path unavailable: {reason}", file=sys.stderr)
-        return None, reason
+        return _declined(reason)
 
     # Only reached once the gate has confirmed a CUDA device with Triton
     # installed, so importing the kernels here cannot raise for want of it.
@@ -128,25 +102,19 @@ def build_engine(
 
     try:
         engine = FusedEngine(
-            data=data,
-            device=device,
-            budget_fraction=search_memory_fraction,
-            shared=shared,
+            data=data, device=device, budget_fraction=search_memory_fraction
         )
     except RuntimeError as error:  # pragma: no cover - device dependent
         # torch.cuda.OutOfMemoryError derives from RuntimeError; staging that
-        # cannot complete is a fallback, not a failure.
-        reason = f"staging failed: {error}"
-        if gate.is_debug():
-            print(f"[fast-plaid] fused {reason}", file=sys.stderr)
-        return None, reason
+        # cannot complete is a decline, not a failure.
+        return _declined(f"staging failed: {error}")
 
     if gate.is_debug():
         print(
             f"[fast-plaid] fused path active on {device}: "
             f"{engine.n_tokens} tokens, {engine.n_docs} docs, "
-            f"{engine.resident_bytes() / 2**30:.2f} GiB allocated, "
-            f"{engine.shared_bytes() / 2**30:.2f} GiB shared with the standard index",
+            f"{engine.resident_bytes() / 2**20:.0f} MiB allocated, "
+            f"{engine.shared_bytes() / 2**20:.0f} MiB read in place",
             file=sys.stderr,
         )
     return engine, None

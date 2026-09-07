@@ -451,9 +451,7 @@ class FastPlaid:
             to 'low' or 'medium' -- because 'auto' found too little free VRAM,
             or because that tier was requested -- a UserWarning is issued once
             per instance and the standard pipeline serves; the decision is
-            revisited whenever the index is reloaded. Off by default. The
-            FAST_PLAID_DISABLE_FUSED environment variable disables it for
-            every instance in the process.
+            revisited whenever the index is reloaded. Off by default.
         kwargs:
             Additional keyword arguments. Unknown keywords are ignored, so call
             sites written against older versions keep working.
@@ -518,7 +516,8 @@ class FastPlaid:
         # Load an index object for each device.
         self.indices: dict[str, Any] = {}
 
-        # Fused CUDA fast path, staged lazily on first eligible search.
+        # Fused CUDA fast path (opt-in). Built at construction when an index is
+        # already on disk, otherwise on the first search after ``create``.
         self.fused = fused
         self._fused_engine: Any = None
         self._fused_attempted = False
@@ -553,8 +552,8 @@ class FastPlaid:
         """
         with self._index_swap_lock:
             self.indices.clear()
-            # The staged fused copy is device memory this call promised to
-            # release, and it maps the directory the caller is about to delete.
+            # The fused engine holds views into the index tensors this call
+            # releases, and its norms are device memory this call promised back.
             self._invalidate_fused()
         gc.collect()
 
@@ -616,7 +615,7 @@ class FastPlaid:
             with self._index_swap_lock:
                 for device in self.devices:
                     self.indices[device] = None
-                # The index went away underneath a staged copy of it.
+                # The index went away underneath the engine built on it.
                 self._invalidate_fused()
             return True
 
@@ -676,7 +675,7 @@ class FastPlaid:
         with self._index_swap_lock:
             self.indices = new_indices
             self._last_known_mtime = current_mtime
-            # The staged fused copy describes the previous index contents.
+            # The fused engine describes the previous index contents.
             self._invalidate_fused()
 
         return True
@@ -1078,20 +1077,13 @@ class FastPlaid:
         """
         generation = self._fused_generation
 
-        from .fused import build_engine, gate
-
-        # The kill switch is answered before anything is loaded or inspected,
-        # so its reason is the one reported.
-        if gate.is_disabled():
-            return self._publish_fused(
-                generation, None, f"disabled by {gate.DISABLE_ENV}"
-            )
+        from .fused import build_engine
 
         # Multi-device search fans out across devices; the fused engine is
         # single-device and declines rather than owning that scheduling.
         if len(self.devices) != 1:
-            return self._publish_fused(
-                generation, None, "fused search requires a single device"
+            return self._decline_fused(
+                generation, "fused search requires a single device"
             )
 
         # The engine borrows the standard index's tensors, so that index has to
@@ -1109,54 +1101,68 @@ class FastPlaid:
                 loaded = self.indices.get(device)
                 generation = self._fused_generation
         if loaded is None:
-            return self._publish_fused(generation, None, "no index is loaded")
+            return self._decline_fused(generation, "no index is loaded")
 
         attached = getattr(loaded, "_device_tensors", None)
         if attached is None:
-            return self._publish_fused(
-                generation,
-                None,
-                "the loaded index carries no device tensors to borrow",
+            return self._decline_fused(
+                generation, "the loaded index carries no device tensors to borrow"
             )
 
-        # The fused path serves only a 'high' placement. Anything else is not
-        # an error -- the standard pipeline answers every call -- but the
-        # caller asked for the fast path, so they are told once why they are
-        # not getting it. The decline is recorded for this loaded index and
-        # revisited on the next reload, when the placement may differ.
+        # The fused path serves only a 'high' placement. A lower tier is the
+        # most common reason to decline, and the one where the caller most
+        # needs to know *why* the tier came out that way, so it gets its own
+        # message; every other reason comes from the gate.
         tier = attached.get("index_gpu_memory")
         if device.startswith("cuda") and tier in ("low", "medium"):
             on_host = "codes and residuals" if tier == "low" else "residuals"
             if self.index_gpu_memory == "auto":
                 cause = (
                     f"index_gpu_memory='auto' resolved to '{tier}' on {device}, "
-                    f"which keeps the {on_host} on the host,"
+                    f"which keeps the {on_host} on the host"
                 )
             else:
-                cause = f"index_gpu_memory='{tier}' keeps the {on_host} on the host,"
-            message = (
-                f"{cause} so the fused search path is disabled for this instance: "
-                "it serves only a 'high' placement. Pass index_gpu_memory='high' "
-                "to enable it, or fused=False to silence this warning."
+                cause = f"index_gpu_memory='{tier}' keeps the {on_host} on the host"
+            return self._decline_fused(
+                generation,
+                f"{cause}; the fused path serves only a 'high' placement "
+                "(pass index_gpu_memory='high')",
             )
-            if not self._fused_warned:
-                warnings.warn(message, UserWarning, stacklevel=3)
-                self._fused_warned = True
-            return self._publish_fused(generation, None, message)
 
         engine, reason = build_engine(
             data=attached,
             device=device,
             search_memory_fraction=self.search_memory_fraction,
         )
-        return self._publish_fused(generation, engine, reason)
+        if engine is None:
+            return self._decline_fused(generation, reason)
+        return self._publish_fused(generation, engine, None)
+
+    def _decline_fused(self, generation: int, reason: str) -> None:
+        """Record a decline, and tell the caller once.
+
+        Declining is never an error -- the standard pipeline answers every call
+        -- but ``fused=True`` was asked for, so the first decline per instance
+        is surfaced as a warning rather than left to ``fused_status``. The
+        decline is recorded for this loaded index and revisited on the next
+        reload, when the placement or the free memory may differ.
+        """
+        if not self._fused_warned:
+            warnings.warn(
+                f"fused=True cannot be honoured: {reason}. The standard pipeline "
+                "serves this instance; pass fused=False to silence this warning.",
+                UserWarning,
+                stacklevel=4,
+            )
+            self._fused_warned = True
+        return self._publish_fused(generation, None, reason)
 
     def _publish_fused(self, generation: int, engine: Any, reason: str | None) -> Any:
         """Record a staging outcome, unless the index moved while it ran.
 
         A stale outcome is discarded without marking the attempt, so the next
         search stages again against the index that is actually loaded. Dropping
-        the last reference here also returns the copy's device memory.
+        the last reference here also returns the engine's device memory.
         """
         with self._index_swap_lock:
             if generation != self._fused_generation:
@@ -1179,10 +1185,10 @@ class FastPlaid:
         self._fused_generation += 1
 
     def _retire_fused(self, reason: str) -> None:
-        """Stop using the staged copy without waiting for the index to change.
+        """Stop using the engine without waiting for the index to change.
 
         For failures that will recur. A kernel that cannot compile for this
-        index's shapes fails identically on every later search, so the copy is
+        index's shapes fails identically on every later search, so the engine is
         dropped and the attempt left *marked*, which keeps the standard
         pipeline serving without paying the same failure again. Transient
         failures -- memory pressure from another process on the device --

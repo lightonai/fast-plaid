@@ -41,18 +41,32 @@ requires_fused = pytest.mark.skipif(
 )
 
 
-@pytest.mark.parametrize(
-    ("dim", "nbits", "expected"),
-    [
-        (96, 4, 4 + 48 + 2),
-        (128, 4, 4 + 64 + 2),
-        (96, 2, 4 + 24 + 2),
-        (96, 1, 4 + 12 + 2),
-    ],
-)
-def test_bytes_per_token_matches_layout(dim: int, nbits: int, expected: int) -> None:
-    """Per-token residency is codes plus packed residuals plus the norm."""
-    assert gate.bytes_per_token(dim=dim, nbits=nbits) == expected
+def _device_index(
+    *, n_docs: int, n_tokens: int, n_centroids: int, n_ivf: int, dim: int, nbits: int
+) -> dict:
+    """Build an index-shaped dict of (tiny) device tensors for exercising the gate."""
+    device = "cuda:0"
+    return {
+        "nbits": nbits,
+        "index_gpu_memory": "high",
+        "centroids": torch.zeros(n_centroids, dim, dtype=torch.float16, device=device),
+        "ivf": torch.zeros(n_ivf, dtype=torch.int64, device=device),
+        "ivf_lengths": torch.zeros(n_centroids, dtype=torch.int32, device=device),
+        "doc_lengths": torch.full((n_docs,), n_tokens // n_docs, dtype=torch.int64),
+        "doc_codes": torch.zeros(1, dtype=torch.int64, device=device),
+        "doc_residuals": torch.zeros(
+            1, (dim * nbits) // 8, dtype=torch.uint8, device=device
+        ),
+    }
+
+
+def test_resident_bytes_is_norms_plus_bookkeeping() -> None:
+    """The engine allocates two bytes per token and the small arrays, nothing else."""
+    n_tokens, n_docs, n_centroids = 1_000_000, 10_000, 8_192
+    assert (
+        gate.resident_bytes(n_tokens=n_tokens, n_docs=n_docs, n_centroids=n_centroids)
+        == n_tokens * 2 + n_centroids * 8 + (n_centroids + 1) * 8 + n_docs * 12
+    )
 
 
 # The two engines are not bit-identical. Both round the same way through
@@ -145,14 +159,6 @@ def test_gate_declines_unsupported_nbits() -> None:
     reason = gate.check(data=data, device="cuda:0", n_tokens=64, free_bytes=GIB)
     assert reason is not None
     assert "nbits" in reason
-
-
-def test_gate_respects_the_kill_switch(monkeypatch) -> None:
-    """The disable switch short-circuits every other check."""
-    monkeypatch.setenv(gate.DISABLE_ENV, "1")
-    reason = gate.check(data={}, device="cuda:0", n_tokens=1, free_bytes=GIB)
-    assert reason is not None
-    assert gate.DISABLE_ENV in reason
 
 
 def test_estimate_candidates_bounds_the_probed_cells() -> None:
@@ -305,7 +311,7 @@ def test_max_batch_never_returns_zero() -> None:
 
 @requires_fused
 @pytest.mark.parametrize("nbits", [4, 2, 1])
-def test_fused_matches_standard_pipeline(tmp_path, monkeypatch, nbits: int) -> None:
+def test_fused_matches_standard_pipeline(tmp_path, nbits: int) -> None:
     """Fused search returns the standard pipeline's documents and scores.
 
     Both arms go through the public API on one index; the kill switch selects
@@ -331,13 +337,12 @@ def test_fused_matches_standard_pipeline(tmp_path, monkeypatch, nbits: int) -> N
     )
     engine.create(documents_embeddings=documents, nbits=nbits)
 
-    monkeypatch.setenv(gate.DISABLE_ENV, "1")
-    engine._invalidate_fused()
+    engine.fused = False
     expected = engine.search(
         queries_embeddings=queries, top_k=10, n_full_scores=4096, show_progress=False
     )
 
-    monkeypatch.delenv(gate.DISABLE_ENV)
+    engine.fused = True
     engine._invalidate_fused()
     assert engine._maybe_fused() is not None, "fused path should be eligible here"
     actual = engine.search(
@@ -348,7 +353,7 @@ def test_fused_matches_standard_pipeline(tmp_path, monkeypatch, nbits: int) -> N
 
 
 @requires_fused
-def test_fused_starves_without_inventing_documents(tmp_path, monkeypatch) -> None:
+def test_fused_starves_without_inventing_documents(tmp_path) -> None:
     """A query with fewer candidates than ``top_k`` returns fewer results.
 
     Candidates are held in a rectangle as wide as the batch's largest set, and
@@ -378,11 +383,10 @@ def test_fused_starves_without_inventing_documents(tmp_path, monkeypatch) -> Non
 
     kwargs = {"top_k": 200, "n_ivf_probe": 1, "show_progress": False}
 
-    monkeypatch.setenv(gate.DISABLE_ENV, "1")
-    engine._invalidate_fused()
+    engine.fused = False
     expected = engine.search(queries_embeddings=queries, **kwargs)
 
-    monkeypatch.delenv(gate.DISABLE_ENV)
+    engine.fused = True
     engine._invalidate_fused()
     assert engine._maybe_fused() is not None, "fused path should be eligible here"
     actual = engine.search(queries_embeddings=queries, **kwargs)
@@ -461,22 +465,18 @@ def test_max_batch_honours_the_search_memory_fraction() -> None:
 def test_gate_honours_its_memory_fraction() -> None:
     """Residency is judged against the fraction the caller passes."""
     dim, nbits, n_tokens = 96, 4, 100_000
-    data = {
-        "nbits": nbits,
-        "centroids": torch.zeros(1024, dim, dtype=torch.float16),
-        "ivf": torch.zeros(4096, dtype=torch.int32),
-        "ivf_lengths": torch.zeros(1024, dtype=torch.int64),
-        "doc_lengths": torch.full((1_000,), n_tokens // 1_000, dtype=torch.int64),
-    }
-    # Sized from the gate's own accounting rather than a hand-tuned constant,
-    # so that changing what staging costs cannot silently make this vacuous.
-    required = gate.resident_bytes(
-        n_tokens=n_tokens,
+    data = _device_index(
         n_docs=1_000,
+        n_tokens=n_tokens,
         n_centroids=1024,
         n_ivf=4096,
         dim=dim,
         nbits=nbits,
+    )
+    # Sized from the gate's own accounting rather than a hand-tuned constant,
+    # so that changing what staging costs cannot silently make this vacuous.
+    required = gate.resident_bytes(
+        n_tokens=n_tokens, n_docs=1_000, n_centroids=1024
     ) + gate.staging_bytes(n_tokens=n_tokens, dim=dim)
     free_bytes = int(required / 0.5)
     shared = {"data": data, "device": "cuda:0", "n_tokens": n_tokens}
@@ -487,49 +487,40 @@ def test_gate_honours_its_memory_fraction() -> None:
     assert "capped at 0.2" in restricted
 
 
-def test_resident_bytes_counts_more_than_the_per_token_arrays() -> None:
-    """Residency includes the per-document and per-centroid arrays.
+def test_resident_bytes_counts_more_than_the_norms() -> None:
+    """The allocation includes the per-document and per-centroid arrays.
 
-    They are small beside the per-token ones but not nothing: on millions of
-    documents they run to hundreds of megabytes, and an estimate that omitted
-    them understated exactly the indexes closest to declining.
+    They are small beside the norms but not nothing: on millions of documents
+    they run to hundreds of megabytes, and an estimate that omitted them would
+    understate exactly the indexes closest to declining.
     """
-    dim, nbits, n_tokens, n_docs, n_centroids = 128, 4, 4_000_000, 100_000, 8_192
+    n_tokens, n_docs, n_centroids = 4_000_000, 100_000, 8_192
     resident = gate.resident_bytes(
-        n_tokens=n_tokens,
-        n_docs=n_docs,
-        n_centroids=n_centroids,
-        n_ivf=1_000_000,
-        dim=dim,
-        nbits=nbits,
+        n_tokens=n_tokens, n_docs=n_docs, n_centroids=n_centroids
     )
-    per_token_only = n_tokens * gate.bytes_per_token(dim=dim, nbits=nbits)
+    norms_only = n_tokens * 2
 
-    assert resident > per_token_only
-    # The per-document arrays alone are worth counting at this corpus size.
-    assert resident - per_token_only > n_docs * 12
+    assert resident > norms_only
+    assert resident - norms_only > n_docs * 12
 
 
 def test_gate_admits_the_msmarco_index_that_was_measured() -> None:
-    """The staging transient must not refuse an index already shown to serve.
+    """MS MARCO's norms and precompute fit the free memory measured for it.
 
-    Measured on an 80GB H100 with the standard index resident: 43.7 GiB free,
-    31.9 GiB staged, and the fused path answered the whole dev split. Counting
-    the precompute transient is right -- an index that fits resident but not
-    while being built should decline rather than fail inside the constructor --
-    but at NORM_CHUNK = 2,000,000 that transient came to 3.9 GiB, which pushed
-    resident + staging past the 0.8 cap and declined the flagship corpus by
-    0.8 GiB. The chunk is a scheduling knob, so it was shrunk rather than the
-    accounting loosened.
+    Measured on an 80GB H100 with the standard index resident: 43.7 GiB free.
+    With codes and residuals read in place, the engine's own allocation is the
+    norms plus bookkeeping -- about 1.2 GiB for 598M tokens -- and the
+    precompute transient sits well under a gigabyte at NORM_CHUNK.
     """
-    resident = int(31.9 * GIB)  # measured, not modelled
-    transient = gate.staging_bytes(n_tokens=597_909_930, dim=96)
+    n_tokens = 597_909_930
+    resident = gate.resident_bytes(
+        n_tokens=n_tokens, n_docs=8_841_823, n_centroids=262_144
+    )
+    transient = gate.staging_bytes(n_tokens=n_tokens, dim=96)
     free = int(43.7 * GIB)
 
-    assert resident + transient <= gate.DEFAULT_MEMORY_FRACTION * free, (
-        f"staging transient of {transient / GIB:.2f} GiB refuses an index "
-        f"measured to stage and serve"
-    )
+    assert resident < 2 * GIB
+    assert resident + transient <= gate.DEFAULT_MEMORY_FRACTION * free
 
 
 @requires_fused
@@ -543,30 +534,26 @@ def test_gate_counts_the_staging_transient() -> None:
     dim, nbits, n_tokens = 128, 4, 4_000_000
     n_docs, n_centroids, n_ivf = 100_000, 8_192, 1_000_000
     resident = gate.resident_bytes(
-        n_tokens=n_tokens,
+        n_tokens=n_tokens, n_docs=n_docs, n_centroids=n_centroids
+    )
+    transient = gate.staging_bytes(n_tokens=n_tokens, dim=dim)
+    assert transient > 0, "no transient means this test proves nothing"
+
+    data = _device_index(
         n_docs=n_docs,
+        n_tokens=n_tokens,
         n_centroids=n_centroids,
         n_ivf=n_ivf,
         dim=dim,
         nbits=nbits,
     )
-    transient = gate.staging_bytes(n_tokens=n_tokens, dim=dim)
-    assert transient > 0, "no transient means this test proves nothing"
-
-    data = {
-        "nbits": nbits,
-        "centroids": torch.zeros(n_centroids, dim, dtype=torch.float16),
-        "ivf": torch.zeros(n_ivf, dtype=torch.int32),
-        "ivf_lengths": torch.zeros(n_centroids, dtype=torch.int64),
-        "doc_lengths": torch.full((n_docs,), n_tokens // n_docs, dtype=torch.int64),
-    }
     shared = {"data": data, "device": "cuda:0", "n_tokens": n_tokens}
 
     # Free memory that covers residency but only half the staging peak.
     tight = int((resident + transient / 2) / 0.8)
     reason = gate.check(**shared, free_bytes=tight, memory_fraction=0.8)
     assert reason is not None
-    assert "to stage" in reason
+    assert "while staging" in reason
 
     # The same index passes once the peak is covered.
     ample = int((resident + transient) / 0.8) + 1
@@ -597,11 +584,10 @@ def test_fused_falls_back_when_a_single_query_cannot_fit(tmp_path, monkeypatch) 
     )
     engine.create(documents_embeddings=documents, nbits=4)
 
-    monkeypatch.setenv(gate.DISABLE_ENV, "1")
-    engine._invalidate_fused()
+    engine.fused = False
     expected = engine.search(queries_embeddings=queries, top_k=5, show_progress=False)
 
-    monkeypatch.delenv(gate.DISABLE_ENV)
+    engine.fused = True
     engine._invalidate_fused()
     fused = engine._maybe_fused()
     assert fused is not None
@@ -714,27 +700,26 @@ def test_fused_status_reports_activation(tmp_path) -> None:
     assert engine.fused_status() == status
 
 
-def test_fused_status_explains_unavailability(tmp_path, monkeypatch) -> None:
-    """When the fast path declines, the reason is reported rather than hidden."""
-    monkeypatch.setenv(gate.DISABLE_ENV, "1")
+def test_fused_status_explains_unavailability(tmp_path) -> None:
+    """When the fast path declines, the reason is reported and warned once."""
     torch.manual_seed(0)
     documents = [
         torch.nn.functional.normalize(torch.randn(16, 96), p=2, dim=-1)
         for _ in range(64)
     ]
 
-    index_path = str(tmp_path / "index")
-    engine = FastPlaid(
-        index=index_path,
-        device="cuda:0" if torch.cuda.is_available() else "cpu",
-        fused=True,
-    )
+    engine = FastPlaid(index=str(tmp_path / "index"), device="cpu", fused=True)
     engine.create(documents_embeddings=documents, nbits=4)
 
-    status = engine._prepare_fused()
+    with pytest.warns(UserWarning, match="is not CUDA"):
+        status = engine._prepare_fused()
     assert status["active"] is False
-    assert status["reason"]
-    assert gate.DISABLE_ENV in status["reason"]
+    assert "is not CUDA" in status["reason"]
+
+    # The question was settled; asking again is silent.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert engine.fused_status() == status
 
 
 @requires_fused
@@ -747,7 +732,7 @@ def test_fused_status_explains_unavailability(tmp_path, monkeypatch) -> None:
     ],
 )
 def test_fused_handles_variable_length_queries(
-    tmp_path, monkeypatch, lengths: tuple[int, ...], label: str
+    tmp_path, lengths: tuple[int, ...], label: str
 ) -> None:
     """Padded query rows must not influence results.
 
@@ -774,11 +759,10 @@ def test_fused_handles_variable_length_queries(
     )
     engine.create(documents_embeddings=documents, nbits=4)
 
-    monkeypatch.setenv(gate.DISABLE_ENV, "1")
-    engine._invalidate_fused()
+    engine.fused = False
     expected = engine.search(queries_embeddings=queries, top_k=5, show_progress=False)
 
-    monkeypatch.delenv(gate.DISABLE_ENV)
+    engine.fused = True
     engine._invalidate_fused()
     assert engine._maybe_fused() is not None, label
     actual = engine.search(queries_embeddings=queries, top_k=5, show_progress=False)
@@ -813,13 +797,12 @@ def test_fused_splits_batches_without_misaligning_queries(
     )
     engine.create(documents_embeddings=documents, nbits=4)
 
-    monkeypatch.setenv(gate.DISABLE_ENV, "1")
-    engine._invalidate_fused()
+    engine.fused = False
     expected = engine.search(queries_embeddings=queries, top_k=5, show_progress=False)
 
     # Force the ceiling to admit two queries at a time so the split path runs.
     monkeypatch.setattr("fast_plaid.search.fused.ceiling.max_batch", lambda **_: 2)
-    monkeypatch.delenv(gate.DISABLE_ENV)
+    engine.fused = True
     engine._invalidate_fused()
     assert engine._maybe_fused() is not None
     actual = engine.search(queries_embeddings=queries, top_k=5, show_progress=False)
@@ -996,11 +979,10 @@ def test_compilation_failure_retires_the_staged_copy(tmp_path, monkeypatch) -> N
     )
     engine.create(documents_embeddings=documents, nbits=4)
 
-    monkeypatch.setenv(gate.DISABLE_ENV, "1")
-    engine._invalidate_fused()
+    engine.fused = False
     expected = engine.search(queries_embeddings=queries, top_k=5, show_progress=False)
 
-    monkeypatch.delenv(gate.DISABLE_ENV)
+    engine.fused = True
     engine._invalidate_fused()
     fused = engine._maybe_fused()
     assert fused is not None
@@ -1025,7 +1007,7 @@ def test_compilation_failure_retires_the_staged_copy(tmp_path, monkeypatch) -> N
 
 
 @requires_fused
-def test_fused_matches_standard_pipeline_on_empty_input(tmp_path, monkeypatch) -> None:
+def test_fused_matches_standard_pipeline_on_empty_input(tmp_path) -> None:
     """An empty request is answered, not raised on.
 
     Padding took the maximum of the query lengths, which is undefined for an
@@ -1045,11 +1027,10 @@ def test_fused_matches_standard_pipeline_on_empty_input(tmp_path, monkeypatch) -
     )
     engine.create(documents_embeddings=documents, nbits=4)
 
-    monkeypatch.setenv(gate.DISABLE_ENV, "1")
-    engine._invalidate_fused()
+    engine.fused = False
     expected = engine.search(queries_embeddings=[], top_k=5, show_progress=False)
 
-    monkeypatch.delenv(gate.DISABLE_ENV)
+    engine.fused = True
     engine._invalidate_fused()
     assert engine._maybe_fused() is not None
     actual = engine.search(queries_embeddings=[], top_k=5, show_progress=False)
@@ -1191,7 +1172,7 @@ def test_fused_declines_when_the_tier_keeps_the_index_on_cpu(
         fused=True,
     )
     engine.create(documents_embeddings=documents, nbits=4)
-    with pytest.warns(UserWarning, match="fused search path is disabled"):
+    with pytest.warns(UserWarning, match="cannot be honoured"):
         results = engine.search(
             queries_embeddings=queries, top_k=10, show_progress=False
         )
@@ -1298,21 +1279,70 @@ def test_fused_is_staged_at_construction(tmp_path) -> None:
     }
 
 
-def test_gate_charges_only_what_is_not_shared() -> None:
-    """Borrowed codes and residuals cost the gate nothing but the norms."""
-    kwargs = {
-        "n_tokens": 1_000_000,
-        "n_docs": 10_000,
-        "n_centroids": 8_192,
-        "n_ivf": 1_000_000,
-        "dim": 96,
-        "nbits": 4,
-    }
-    alone = gate.resident_bytes(**kwargs)
-    borrowed = gate.resident_bytes(**kwargs, shared=frozenset(gate.SHAREABLE))
-    assert borrowed < alone
-    # Two bytes per token of norms plus the per-centroid and per-document arrays.
-    assert borrowed == 1_000_000 * 2 + 8_192 * 8 + (8_192 + 1) * 8 + 10_000 * 12
+def test_gate_declines_when_the_index_is_not_on_the_device() -> None:
+    """Host-resident codes or residuals mean a lower tier, and a decline."""
+    data = _device_index(
+        n_docs=10, n_tokens=100, n_centroids=8, n_ivf=100, dim=96, nbits=4
+    )
+    data["doc_residuals"] = data["doc_residuals"].cpu()
+    data["index_gpu_memory"] = "medium"
+    reason = gate.check(data=data, device="cuda:0", free_bytes=GIB)
+    assert reason is not None
+    assert "index_gpu_memory='medium'" in reason
+    assert "doc_residuals" in reason
+
+
+@requires_fused
+def test_oom_halving_reassembles_the_batch_correctly(tmp_path) -> None:
+    """A launch that fails for memory is retried narrower, and nothing is lost.
+
+    The retry loop re-issues the same query range at half the width; the
+    results it collects must be exactly what one wide launch would have
+    returned, for every query, in order.
+    """
+    torch.manual_seed(0)
+    dim = 96
+    documents = [
+        torch.nn.functional.normalize(torch.randn(24, dim), p=2, dim=-1)
+        for _ in range(1_000)
+    ]
+    queries = torch.nn.functional.normalize(torch.randn(64, 32, dim), p=2, dim=-1)
+
+    engine = FastPlaid(
+        index=str(tmp_path / "index"),
+        device="cuda:0",
+        index_gpu_memory="high",
+        fused=True,
+    )
+    engine.create(documents_embeddings=documents, nbits=4)
+    expected = engine.search(queries_embeddings=queries, top_k=10, show_progress=False)
+    fused = engine._fused_engine
+    assert fused is not None, "fused path should be eligible here"
+
+    real = fused._search_batch
+    raised = {"count": 0}
+
+    def flaky(padded, lengths, **kwargs):
+        if padded.shape[0] > 5:
+            raised["count"] += 1
+            raise torch.cuda.OutOfMemoryError("synthetic")
+        return real(padded, lengths, **kwargs)
+
+    fused._search_batch = flaky
+    try:
+        actual = engine.search(
+            queries_embeddings=queries, top_k=10, show_progress=False
+        )
+    finally:
+        fused._search_batch = real
+
+    assert raised["count"] > 0, "the halving path was never exercised"
+    assert engine.fused_status()["active"], (
+        "a recoverable OOM must not retire the engine"
+    )
+    assert [[d for d, _ in row] for row in actual] == [
+        [d for d, _ in row] for row in expected
+    ]
 
 
 def test_zz_report_observed_score_deltas() -> None:

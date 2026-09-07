@@ -1,8 +1,8 @@
-"""Resident fused-search engine.
+"""Fused-search engine over the loaded index's device tensors.
 
-Stages an index onto the device once, then answers query batches entirely in
-kernels. The staged layout is derived from the index files as loaded by
-``_load_index_tensors_cpu`` -- no index format change, and no re-indexing.
+Reads the standard index's codes, residuals, centroids and IVF lists in place,
+precomputes one fp16 reconstruction norm per token, and answers query batches
+entirely in kernels. No index format change, no re-indexing, no second copy.
 """
 
 from __future__ import annotations
@@ -48,12 +48,20 @@ def _compile_error_types() -> tuple[type[BaseException], ...]:
 
 
 # Compilation and resource failures are deterministic for a given shape, so
-# they retire the staged copy where an out-of-memory error does not.
+# they retire the engine where an out-of-memory error does not.
 _COMPILE_ERRORS = _compile_error_types()
 
 
 class FusedEngine:
-    """Device-resident index served by fused Triton kernels."""
+    """Fused Triton kernels over the standard index's device tensors."""
+
+    # Engine attribute -> the key of ``data`` it is read from, in place.
+    _BORROWED: ClassVar[dict[str, str]] = {
+        "codes": "doc_codes",
+        "residuals": "doc_residuals",
+        "centroids": "centroids",
+        "ivf": "ivf",
+    }
 
     def __init__(
         self,
@@ -61,37 +69,40 @@ class FusedEngine:
         device: str,
         *,
         budget_fraction: float = ceiling.BUDGET_FRACTION,
-        shared: frozenset[str] = frozenset(),
     ) -> None:
-        """Stage index tensors onto the device, borrowing what is already there.
+        """Wrap the loaded index's tensors and precompute the norms.
 
         Args:
         ----
         data:
-            Index tensors from ``_load_index_tensors_cpu``, or the device
-            tensors the standard index was constructed from.
+            The tensors the standard index was constructed from, as attached
+            to the loaded index by the loader. Codes, residuals, centroids and
+            IVF lists must already be resident on ``device``: they are read in
+            place -- the kernels only need a pointer into them -- so the engine
+            allocates nothing for them. Codes are read at their stored int64
+            width rather than narrowed to int32, which is the price of not
+            copying.
         device:
             Target CUDA device.
         budget_fraction:
-            Share of free memory this engine's transients may occupy, taken
-            from the index's ``search_memory_fraction``.
-        shared:
-            Keys of ``data`` already resident on ``device`` and owned by the
-            standard index. Those tensors are used in place -- the kernels only
-            need a pointer into them -- so the engine allocates nothing for
-            them. ``doc_codes`` and ``doc_residuals`` must be among them: the
-            engine never stages its own copy of the index, which ``build_engine``
-            guarantees before constructing it. Codes are read at their stored
-            int64 width rather than narrowed to int32, which is the price of
-            not copying.
+            Share of free memory this engine's per-search transients may
+            occupy, taken from the index's ``search_memory_fraction``.
 
         """
         self.device = device
         self.budget_fraction = budget_fraction
-        self.shared = frozenset(shared)
         self.nbits = int(data["nbits"])
         self.dim = int(data["centroids"].shape[1])
         self.arch = torch.cuda.get_device_capability(device)
+
+        target = torch.device(device)
+        for key in self._BORROWED.values():
+            if data[key].device != target:
+                error = (
+                    f"FusedEngine reads {key} in place from the standard index; "
+                    f"it is on {data[key].device}, not {device}"
+                )
+                raise ValueError(error)
 
         doc_lengths = data["doc_lengths"].to(torch.int64).reshape(-1)
         self.n_docs = int(doc_lengths.numel())
@@ -103,25 +114,16 @@ class FusedEngine:
         self.offsets[1:] = lengths.cumsum(0)[:-1]
         self.doc_lengths = lengths.to(torch.int32).contiguous()
 
-        packed_bytes = (self.dim * self.nbits) // 8
-        if not {"doc_codes", "doc_residuals"} <= self.shared:
-            error = (
-                "FusedEngine reads codes and residuals in place from the standard "
-                "index; both must be resident on the device"
-            )
-            raise ValueError(error)
         # Slicing a contiguous tensor along its first dimension is a view, so
-        # neither line allocates.
+        # none of these four lines allocates.
+        packed_bytes = (self.dim * self.nbits) // 8
         self.codes = data["doc_codes"].reshape(-1)[: self.n_tokens]
         self.residuals = data["doc_residuals"].reshape(-1, packed_bytes)[
             : self.n_tokens
         ]
-
-        if "centroids" in self.shared:
-            self.centroids = data["centroids"]
-        else:
-            self.centroids = data["centroids"].to(device).to(torch.float16).contiguous()
+        self.centroids = data["centroids"]
         self.n_centroids = int(self.centroids.shape[0])
+        self.ivf = data["ivf"].reshape(-1)
 
         # The indexer stores bucket weights in natural code order while the
         # packed nibbles address them bit-reversed.
@@ -137,10 +139,6 @@ class FusedEngine:
             weights[permutation].to(torch.float16).to(device).contiguous()
         )
 
-        if "ivf" in self.shared:
-            self.ivf = data["ivf"].reshape(-1)
-        else:
-            self.ivf = data["ivf"].to(torch.int32).reshape(-1).to(device)
         self.ivf_lengths = data["ivf_lengths"].to(torch.int64).reshape(-1).to(device)
         self.ivf_offsets = torch.zeros(
             self.ivf_lengths.numel() + 1, dtype=torch.int64, device=device
@@ -149,9 +147,9 @@ class FusedEngine:
 
         self.norms = self._precompute_norms()
         self.token_tile = token_tile(self.arch)
-        # Fixed once staged; the admission ceiling caps each launch's
-        # transients at the footprint the kernels read -- borrowed tensors
-        # included -- so the process never holds more scratch than index.
+        # Fixed once built; the admission ceiling caps each launch's transients
+        # at the footprint the kernels read -- borrowed tensors included -- so
+        # the process never holds more scratch than index.
         self._footprint_bytes = self.resident_bytes() + self.shared_bytes()
 
         # The candidate bound depends only on the index and the padded query
@@ -187,14 +185,6 @@ class FusedEngine:
             del packed, parts, codes, centroids, embeddings
         return norms
 
-    # Engine attribute -> the ``data`` key it may have been borrowed under.
-    _BORROWABLE: ClassVar[dict[str, str]] = {
-        "codes": "doc_codes",
-        "residuals": "doc_residuals",
-        "centroids": "centroids",
-        "ivf": "ivf",
-    }
-
     def _device_tensors(self) -> dict[str, torch.Tensor]:
         return {
             "codes": self.codes,
@@ -213,7 +203,7 @@ class FusedEngine:
         return sum(
             t.numel() * t.element_size()
             for name, t in self._device_tensors().items()
-            if self._BORROWABLE.get(name) not in self.shared
+            if name not in self._BORROWED
         )
 
     def shared_bytes(self) -> int:
@@ -221,7 +211,7 @@ class FusedEngine:
         return sum(
             t.numel() * t.element_size()
             for name, t in self._device_tensors().items()
-            if self._BORROWABLE.get(name) in self.shared
+            if name in self._BORROWED
         )
 
     def _pad_queries(
@@ -524,7 +514,7 @@ class FusedEngine:
                 continue
             except _COMPILE_ERRORS as error:
                 # Deterministic for this shape, so retrying or shrinking the
-                # batch cannot help. The caller retires the staged copy rather
+                # batch cannot help. The caller retires the engine rather
                 # than paying the same failed compilation on every search.
                 raise FusedCompilationError(
                     f"fused kernels could not run for this shape: {error}"

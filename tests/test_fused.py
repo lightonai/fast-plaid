@@ -1279,6 +1279,7 @@ def test_fused_is_staged_at_construction(tmp_path) -> None:
     }
 
 
+@requires_fused
 def test_gate_declines_when_the_index_is_not_on_the_device() -> None:
     """Host-resident codes or residuals mean a lower tier, and a decline."""
     data = _device_index(

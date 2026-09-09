@@ -445,13 +445,7 @@ def _construct_index_from_tensors(
         data, device, index_gpu_memory, index_memory_fraction
     )
 
-    # Placement mirrors the Rust side: 'high' puts codes and residuals on the
-    # device, 'medium' only the codes, 'low' neither. Doing the move here rather
-    # than in Rust changes nothing about where the bytes end up -- Rust's
-    # ensure_tensor finds them already on the right device and aliases them --
-    # but it leaves Python holding a reference to the very same storage, which
-    # is what lets the fused search path read the index in place instead of
-    # staging a second copy of it.
+    # Moving them here, not in Rust, keeps a Python handle to the same device storage.
     on_device = device.startswith("cuda")
     codes_on_device = on_device and index_gpu_memory in ("medium", "high")
     residuals_on_device = on_device and index_gpu_memory == "high"
@@ -462,18 +456,14 @@ def _construct_index_from_tensors(
             gpu_data[key] = None
         elif isinstance(val, torch.Tensor):
             if key == "doc_lengths":
-                # Rust moves the lengths itself; the CPU copy is what callers need.
+                # Lengths stay on CPU here; Rust moves its own copy.
                 gpu_data[key] = val
             elif key == "doc_codes":
                 gpu_data[key] = val.to(device) if codes_on_device else val
             elif key == "doc_residuals":
                 gpu_data[key] = val.to(device) if residuals_on_device else val
             elif key == "ivf" and on_device and data.get("ivf_lengths") is not None:
-                # Rust pads every strided tensor to hold one maximal element past
-                # the last offset, and allocates a fresh copy to do so unless the
-                # padding is already there. The merged codes and residuals are
-                # written padded; the IVF is not, so pad it here and Rust aliases
-                # this tensor instead of duplicating it.
+                # Pre-padded so Rust reuses it instead of allocating a padded copy.
                 lengths = data["ivf_lengths"]
                 pad = int(lengths.max()) if lengths.numel() else 0
                 ivf = val.to(device)
@@ -500,9 +490,7 @@ def _construct_index_from_tensors(
         index_gpu_memory=index_gpu_memory,
     )
 
-    # The tensors Rust now holds, attached to the object that owns them so they
-    # live exactly as long as the index does. Whatever the tier left on the
-    # device is shared storage; the rest are the memory-mapped CPU tensors.
+    # Attach the tensors to the index so they live exactly as long as it does.
     try:
         index._device_tensors = {  # noqa: SLF001
             key: gpu_data[key]
@@ -519,8 +507,7 @@ def _construct_index_from_tensors(
         }
         index._device_tensors["index_gpu_memory"] = index_gpu_memory  # noqa: SLF001
     except AttributeError:
-        # An extension built without an instance dict cannot carry the tensors;
-        # the fused path then declines with a reason rather than copying.
+        # Older extension without an instance dict: the fused path will simply decline.
         pass
 
     return index

@@ -61,7 +61,7 @@ def _device_index(
 
 
 def test_resident_bytes_is_norms_plus_bookkeeping() -> None:
-    """The engine allocates two bytes per token and the small arrays, nothing else."""
+    """The engine allocates two bytes per token plus the small arrays, nothing else."""
     n_tokens, n_docs, n_centroids = 1_000_000, 10_000, 8_192
     assert (
         gate.resident_bytes(n_tokens=n_tokens, n_docs=n_docs, n_centroids=n_centroids)
@@ -248,13 +248,7 @@ def test_max_batch_scales_with_budget() -> None:
 
 
 def test_max_batch_is_capped_by_the_index_footprint() -> None:
-    """Free VRAM alone no longer sizes the launch.
-
-    One launch may allocate at most the staged index's own footprint in
-    transients, with a floor for small indexes. Without the cap a 74 MB index
-    on an empty 80GB card was admitted 10,000 queries per launch and the
-    process peaked at 53 GiB.
-    """
+    """One launch may not use more scratch than the index footprint, with a floor."""
     kwargs = {
         "n_centroids": 16_384,
         "max_query_tokens": 64,
@@ -488,12 +482,7 @@ def test_gate_honours_its_memory_fraction() -> None:
 
 
 def test_resident_bytes_counts_more_than_the_norms() -> None:
-    """The allocation includes the per-document and per-centroid arrays.
-
-    They are small beside the norms but not nothing: on millions of documents
-    they run to hundreds of megabytes, and an estimate that omitted them would
-    understate exactly the indexes closest to declining.
-    """
+    """The per-document and per-centroid arrays are counted, not only the norms."""
     n_tokens, n_docs, n_centroids = 4_000_000, 100_000, 8_192
     resident = gate.resident_bytes(
         n_tokens=n_tokens, n_docs=n_docs, n_centroids=n_centroids
@@ -505,13 +494,7 @@ def test_resident_bytes_counts_more_than_the_norms() -> None:
 
 
 def test_gate_admits_the_msmarco_index_that_was_measured() -> None:
-    """MS MARCO's norms and precompute fit the free memory measured for it.
-
-    Measured on an 80GB H100 with the standard index resident: 43.7 GiB free.
-    With codes and residuals read in place, the engine's own allocation is the
-    norms plus bookkeeping -- about 1.2 GiB for 598M tokens -- and the
-    precompute transient sits well under a gigabyte at NORM_CHUNK.
-    """
+    """MS MARCO's norms and precompute fit the 43.7 GiB measured free on an H100."""
     n_tokens = 597_909_930
     resident = gate.resident_bytes(
         n_tokens=n_tokens, n_docs=8_841_823, n_centroids=262_144
@@ -701,7 +684,7 @@ def test_fused_status_reports_activation(tmp_path) -> None:
 
 
 def test_fused_status_explains_unavailability(tmp_path) -> None:
-    """When the fast path declines, the reason is reported and warned once."""
+    """A decline is reported with its reason and warned exactly once."""
     torch.manual_seed(0)
     documents = [
         torch.nn.functional.normalize(torch.randn(16, 96), p=2, dim=-1)
@@ -865,12 +848,7 @@ def test_fused_can_be_disabled_per_instance(tmp_path) -> None:
 
 @requires_fused
 def test_staging_does_not_take_the_index_lock(tmp_path) -> None:
-    """Staging reads nothing from disk, so a busy writer cannot block it.
-
-    The engine is built from the tensors attached to the loaded index -- the
-    very ones the standard pipeline searches -- so there is no memory-mapped
-    read to keep coherent and no reason to wait on ``plaid.lock``.
-    """
+    """Staging reads nothing from disk, so a writer holding the lock cannot block it."""
     torch.manual_seed(0)
     documents = [
         torch.nn.functional.normalize(torch.randn(8, 96), p=2, dim=-1)
@@ -1040,12 +1018,7 @@ def test_fused_matches_standard_pipeline_on_empty_input(tmp_path) -> None:
 
 @requires_fused
 def test_fused_transients_do_not_grow_with_the_batch(tmp_path) -> None:
-    """Peak device memory of one search() is bounded by the launch cap.
-
-    The same call with 128 times as many queries must not allocate more than
-    the floor plus the packed query staging; before the cap it scaled linearly
-    with the batch and was held by the allocator afterwards.
-    """
+    """Peak device memory of one search() is bounded by the cap, whatever the batch."""
     torch.manual_seed(0)
     dim = 96
     documents = [
@@ -1098,12 +1071,7 @@ def test_fused_transients_do_not_grow_with_the_batch(tmp_path) -> None:
 
 @requires_fused
 def test_fused_borrows_the_standard_index_tensors(tmp_path) -> None:
-    """With codes and residuals on the device, the engine reads them in place.
-
-    The loader hands Rust the very tensors it moved to the device and keeps a
-    reference on the index object, so the fused engine needs no second copy of
-    the index: it allocates the reconstruction norms and bookkeeping only.
-    """
+    """The engine reads the standard index in place and allocates only the norms."""
     torch.manual_seed(0)
     dim = 96
     documents = [
@@ -1152,11 +1120,7 @@ def test_fused_borrows_the_standard_index_tensors(tmp_path) -> None:
 def test_fused_declines_when_the_tier_keeps_the_index_on_cpu(
     tmp_path, tier: str
 ) -> None:
-    """A 'low' or 'medium' tier was chosen to keep bytes off the device.
-
-    The fused path never stages its own copy, so it declines under those tiers
-    and says why; the standard pipeline serves unchanged.
-    """
+    """A 'low' or 'medium' tier declines with a warning; the standard path serves."""
     torch.manual_seed(0)
     dim = 96
     documents = [
@@ -1199,13 +1163,7 @@ def test_fused_declines_when_the_tier_keeps_the_index_on_cpu(
 def test_auto_placement_below_high_warns_and_switches_fused_off(
     tmp_path, monkeypatch
 ) -> None:
-    """'auto' landing on 'low' is reported as such, then the fast path is off.
-
-    On a busy card the automatic placement may keep the index on the host. The
-    default fused=True must not fail there, nor vanish silently: one warning
-    names both the requested and the resolved tier, and the instance continues
-    on the standard pipeline with fused=False.
-    """
+    """'auto' landing on 'low' names both tiers in one warning; the flag is kept."""
     from fast_plaid.search import load
 
     monkeypatch.setattr(
@@ -1246,12 +1204,7 @@ def test_fused_is_opt_in(tmp_path) -> None:
 
 @requires_fused
 def test_fused_is_staged_at_construction(tmp_path) -> None:
-    """Opening an existing index with fused=True stages the fast path at once.
-
-    A second instance on the same directory must not wait for its first query:
-    the norms are precomputed in ``__init__`` and ``fused_status`` reports the
-    engine active before any search.
-    """
+    """Opening an existing index with fused=True stages the engine before any search."""
     torch.manual_seed(0)
     documents = [
         torch.nn.functional.normalize(torch.randn(8, 96), p=2, dim=-1)
@@ -1281,7 +1234,7 @@ def test_fused_is_staged_at_construction(tmp_path) -> None:
 
 @requires_fused
 def test_gate_declines_when_the_index_is_not_on_the_device() -> None:
-    """Host-resident codes or residuals mean a lower tier, and a decline."""
+    """Host-resident codes or residuals mean a lower tier and a decline naming it."""
     data = _device_index(
         n_docs=10, n_tokens=100, n_centroids=8, n_ivf=100, dim=96, nbits=4
     )
@@ -1295,12 +1248,7 @@ def test_gate_declines_when_the_index_is_not_on_the_device() -> None:
 
 @requires_fused
 def test_oom_halving_reassembles_the_batch_correctly(tmp_path) -> None:
-    """A launch that fails for memory is retried narrower, and nothing is lost.
-
-    The retry loop re-issues the same query range at half the width; the
-    results it collects must be exactly what one wide launch would have
-    returned, for every query, in order.
-    """
+    """A launch retried narrower after OOM returns what the wide launch would have."""
     torch.manual_seed(0)
     dim = 96
     documents = [
@@ -1347,12 +1295,7 @@ def test_oom_halving_reassembles_the_batch_correctly(tmp_path) -> None:
 
 
 def test_defaults_never_import_the_fused_package() -> None:
-    """Upgrading must change nothing for a caller who did not opt in.
-
-    With ``fused`` left at its default the fused package -- and with it any
-    Triton dependency -- must never be imported, whatever the caller does with
-    the index. Run in a subprocess so the check sees a fresh interpreter.
-    """
+    """A caller who leaves fused at its default never imports the fused package."""
     script = (
         "import sys, tempfile, torch;"
         "from fast_plaid import search as fp;"
@@ -1381,14 +1324,7 @@ def test_defaults_never_import_the_fused_package() -> None:
 
 @requires_fused
 def test_launcher_build_failure_retires_the_engine(tmp_path) -> None:
-    """A machine that cannot build Triton's launcher falls back, once, with a warning.
-
-    Triton compiles its kernel launcher with the system C compiler and writes
-    to a cache directory at first launch; a slim container has neither. Those
-    surface as OSError from inside the kernel launch, which must be treated as
-    a deterministic compilation failure: retire the engine, answer from the
-    standard pipeline, and never raise to the caller.
-    """
+    """No compiler or writable cache: the engine retires and falls back, warning once."""
     torch.manual_seed(0)
     documents = [
         torch.nn.functional.normalize(torch.randn(24, 96), p=2, dim=-1)

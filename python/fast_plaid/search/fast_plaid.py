@@ -5,7 +5,6 @@ import glob
 import json
 import math
 import os
-import sys
 import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -444,14 +443,11 @@ class FastPlaid:
             Fraction of free VRAM the scoring stages may use when batch_size
             is 'auto'.
         fused:
-            Opt in to the fused CUDA fast path for eligible searches. It runs
-            only on top of a 'high' index placement (codes and residuals
-            resident on the device), reading those tensors in place and adding
-            two bytes per token of precomputed norms. If the placement resolves
-            to 'low' or 'medium' -- because 'auto' found too little free VRAM,
-            or because that tier was requested -- a UserWarning is issued once
-            per instance and the standard pipeline serves; the decision is
-            revisited whenever the index is reloaded. Off by default.
+            Opt in to the fused CUDA fast path. Set index_gpu_memory='high'
+            alongside it: 'auto' may resolve lower depending on free VRAM, and
+            the fast path serves only a 'high' placement. It adds two bytes per
+            token of norms; when it cannot run, a UserWarning is issued once and
+            the standard pipeline serves. Off by default.
         kwargs:
             Additional keyword arguments. Unknown keywords are ignored, so call
             sites written against older versions keep working.
@@ -516,30 +512,22 @@ class FastPlaid:
         # Load an index object for each device.
         self.indices: dict[str, Any] = {}
 
-        # Fused CUDA fast path (opt-in). Built at construction when an index is
-        # already on disk, otherwise on the first search after ``create``.
+        # Opt-in fused CUDA fast path; see _stage_fused.
         self.fused = fused
         self._fused_engine: Any = None
         self._fused_attempted = False
         self._fused_reason: str | None = None
-        # One warning per instance when fused=True cannot be honoured.
+        # Warn once per instance when fused=True cannot be served.
         self._fused_warned = False
-        # Bumped whenever the loaded index is replaced. Staging records the
-        # generation it read, so a copy built while the index was changing is
-        # discarded rather than published over its successor.
+        # Bumped on every index swap so an engine built on the old index is dropped.
         self._fused_generation = 0
-        # Serializes staging so a burst of concurrent first searches builds
-        # one copy rather than one per thread.
+        # One staging at a time, so concurrent first searches build a single engine.
         self._fused_stage_lock = threading.Lock()
 
         # Initial Load
         self._check_and_reload_index()
 
-        # When the fast path is requested and an index is already on disk,
-        # stage it now rather than on the first query: the caller learns at
-        # construction whether the placement allows it (a warning if not), and
-        # the device copy of the norms is paid for before serving starts. With
-        # no index yet, staging happens on the first search after ``create``.
+        # Stage now if an index already exists, so the first query does not pay for it.
         if self.fused and any(idx is not None for idx in self.indices.values()):
             self._prepare_fused()
 
@@ -552,8 +540,7 @@ class FastPlaid:
         """
         with self._index_swap_lock:
             self.indices.clear()
-            # The fused engine holds views into the index tensors this call
-            # releases, and its norms are device memory this call promised back.
+            # The engine holds views into tensors this call releases.
             self._invalidate_fused()
         gc.collect()
 
@@ -1064,39 +1051,28 @@ class FastPlaid:
             return self._stage_fused()
 
     def _stage_fused(self) -> Any:
-        """Build the fused engine and publish it if the index has not moved.
+        """Build the fused engine from the loaded index's tensors and publish it.
 
-        The engine is built from the tensors the loader attached to the loaded
-        index object: they describe exactly the generation recorded below, and
-        the ones the placement tier put on the device are read in place. Nothing
-        here touches the index directory, so no file lock is needed; the only
-        race left is in-process -- ``update`` replacing the loaded index while
-        staging runs -- and recording the generation first closes it, since an
-        engine finished after the swap is dropped rather than published over its
-        successor.
+        The generation is read first so that an ``update`` swapping the index
+        while we build makes the result be dropped instead of published.
         """
         generation = self._fused_generation
 
         from .fused import build_engine
 
-        # Multi-device search fans out across devices; the fused engine is
-        # single-device and declines rather than owning that scheduling.
+        # The engine is single-device; multi-device search stays on the standard path.
         if len(self.devices) != 1:
             return self._decline_fused(
                 generation, "fused search requires a single device"
             )
 
-        # The engine borrows the standard index's tensors, so that index has to
-        # be loaded first. ``search`` always has it loaded by the time it gets
-        # here; ``_prepare_fused`` right after ``create`` does not.
+        # _prepare_fused() right after create() arrives before any index is loaded.
         device = self.devices[0]
         with self._index_swap_lock:
             loaded = self.indices.get(device)
         if loaded is None:
             self._check_and_reload_index(blocking=True)
-            # The reload swapped the index in and retired the generation read
-            # above; the engine is built from what is loaded now, so it is
-            # published under the generation that describes it.
+            # The reload bumped the generation; use the one matching what is now loaded.
             with self._index_swap_lock:
                 loaded = self.indices.get(device)
                 generation = self._fused_generation
@@ -1109,10 +1085,7 @@ class FastPlaid:
                 generation, "the loaded index carries no device tensors to borrow"
             )
 
-        # The fused path serves only a 'high' placement. A lower tier is the
-        # most common reason to decline, and the one where the caller most
-        # needs to know *why* the tier came out that way, so it gets its own
-        # message; every other reason comes from the gate.
+        # Lower tiers get their own message: say what 'auto' resolved to.
         tier = attached.get("index_gpu_memory")
         if device.startswith("cuda") and tier in ("low", "medium"):
             on_host = "codes and residuals" if tier == "low" else "residuals"
@@ -1139,14 +1112,7 @@ class FastPlaid:
         return self._publish_fused(generation, engine, None)
 
     def _decline_fused(self, generation: int, reason: str) -> None:
-        """Record a decline, and tell the caller once.
-
-        Declining is never an error -- the standard pipeline answers every call
-        -- but ``fused=True`` was asked for, so the first decline per instance
-        is surfaced as a warning rather than left to ``fused_status``. The
-        decline is recorded for this loaded index and revisited on the next
-        reload, when the placement or the free memory may differ.
-        """
+        """Record a decline for this loaded index and warn the caller once."""
         self._warn_fused_once(reason)
         return self._publish_fused(generation, None, reason)
 
@@ -1206,16 +1172,10 @@ class FastPlaid:
             self._fused_reason = reason
 
     def _prepare_fused(self) -> dict[str, Any]:
-        """Stage the fused fast path now rather than on the first search.
+        """Stage the fused path now; called from ``__init__`` when an index exists.
 
-        Called from ``__init__`` when ``fused=True`` and an index is loaded, so
-        the cost of staging -- the norm precompute over the whole index -- is
-        paid at construction rather than by the first user query. Returns the
-        same mapping as :meth:`fused_status`.
-
-        This is a warm start rather than a fully warmed one: Triton specialises
-        its kernels per query shape, so the first search at each padded query
-        length still pays a compilation.
+        Triton still compiles per query shape, so the first search of a new
+        shape pays that compilation. Returns :meth:`fused_status`.
         """
         self._maybe_fused()
         return self.fused_status()
@@ -1469,20 +1429,14 @@ class FastPlaid:
             queries_embeddings, subset
         )
 
-        # Validated here rather than inside the attempt below, so that a
-        # malformed argument raises for every caller instead of being
-        # swallowed by the fallback and answered by the standard pipeline.
+        # Validate first: a bad batch_size must raise, not silently fall back.
         _resolve_batch_size(batch_size)
 
-        # Subset filtering is served by the standard pipeline; the fused path
-        # scores whole IVF candidate sets. An explicit batch_size is declined
-        # rather than ignored: it budgets documents per scoring chunk, and the
-        # fused path chunks by queries, so there is no honest translation --
-        # whoever serves the call should be the one that can honour it.
+        # Subsets and explicit batch sizes are the standard pipeline's job.
         if subset is None and batch_size == "auto":
             fused = self._maybe_fused()
             if fused is not None:
-                from .fused import FusedCompilationError, FusedUnavailableError, gate
+                from .fused import FusedCompilationError, FusedUnavailableError
 
                 try:
                     return fused.search(
@@ -1493,21 +1447,10 @@ class FastPlaid:
                         n_probe=n_ivf_probe,
                     )
                 except FusedUnavailableError as error:
-                    # Declining costs latency; raising would fail a call the
-                    # standard pipeline can still serve. Only failures named by
-                    # this hierarchy are recoverable. Anything else -- a bug in
-                    # the kernels, or a device-side assert that leaves the CUDA
-                    # context unusable for the rest of the process -- is left to
-                    # propagate, since falling back would either hide a defect
-                    # or fail a second time on the same broken context.
+                    # Only these named failures fall back; anything else must surface.
                     if isinstance(error, FusedCompilationError):
                         self._retire_fused(str(error))
                         self._warn_fused_once(str(error))
-                    if gate.is_debug():
-                        print(
-                            f"[fast-plaid] fused path fell back: {error}",
-                            file=sys.stderr,
-                        )
 
         return self._dispatch_search(
             search_on_device,

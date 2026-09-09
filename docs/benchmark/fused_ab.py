@@ -27,10 +27,15 @@ since the high-water mark of the process would otherwise report the first
 arm's footprint alongside the second's.
 
 Usage:
-    python benchmarks/fused_ab.py --index path/to/index --queries queries.pt
+    make evaluate-fused
+    python docs/benchmark/fused_ab.py --dataset scifact
+    python docs/benchmark/fused_ab.py --index path/to/index --queries queries.pt
 
-``--queries`` is a torch file holding either a list of ``[tokens, dim]``
-tensors or one ``[n_queries, tokens, dim]`` tensor.
+With ``--dataset`` the BEIR corpus is encoded with pylate and indexed at
+``index_gpu_memory='high'`` on first use. ``--queries`` is a torch file holding
+either a list of ``[tokens, dim]`` tensors or one ``[n_queries, tokens, dim]``
+tensor. Both arms run at ``index_gpu_memory='high'``, the placement the fused
+path requires.
 """
 
 from __future__ import annotations
@@ -42,6 +47,43 @@ import time
 
 import torch
 from fast_plaid.search import FastPlaid
+
+
+def build_beir_index(dataset: str, index_dir: str, device: str) -> str:
+    """Encode a BEIR corpus with pylate and index it; returns the queries file path."""
+    import os
+
+    from fast_plaid import evaluation
+
+    queries_path = os.path.join(index_dir, "queries.pt")
+    if os.path.exists(os.path.join(index_dir, "metadata.json")) and os.path.exists(
+        queries_path
+    ):
+        return queries_path
+
+    from pylate import models  # dev dependency, as for docs/benchmark/benchmark.py
+
+    query_length = {"scifact": 48, "arguana": 64, "scidocs": 48, "trec-covid": 48}
+    model = models.ColBERT(
+        model_name_or_path="answerdotai/answerai-colbert-small-v1",
+        query_length=query_length.get(dataset, 32),
+        document_length=300,
+    )
+    documents, queries, _, _ = evaluation.load_beir(dataset_name=dataset, split="test")
+    documents_embeddings = [
+        torch.tensor(e)
+        for e in model.encode([d["text"] for d in documents], is_query=False)
+    ]
+    queries_embeddings = torch.tensor(
+        model.encode(list(queries.values()), is_query=True)
+    )
+
+    os.makedirs(index_dir, exist_ok=True)
+    FastPlaid(index=index_dir, device=device, index_gpu_memory="high").create(
+        documents_embeddings=documents_embeddings
+    )
+    torch.save(queries_embeddings, queries_path)
+    return queries_path
 
 
 def load_queries(path: str) -> list[torch.Tensor]:
@@ -208,8 +250,18 @@ def agreement(fused: list, standard: list, top_k: int) -> dict:
 def main() -> None:
     """Run both arms and print the comparison."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--index", required=True, help="path to a fast-plaid index")
-    parser.add_argument("--queries", required=True, help="torch file of query tokens")
+    parser.add_argument("--index", help="path to a fast-plaid index")
+    parser.add_argument("--queries", help="torch file of query tokens")
+    parser.add_argument(
+        "--dataset",
+        default="scifact",
+        help="BEIR dataset to encode and index when --index is not given",
+    )
+    parser.add_argument(
+        "--index-dir",
+        default=None,
+        help="where --dataset is indexed (default: ./fused_ab_<dataset>)",
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--top-k", type=int, default=10)
     parser.add_argument("--n-full-scores", type=int, default=4096)
@@ -236,10 +288,19 @@ def main() -> None:
     except ImportError:
         print("triton not installed -- the fused arm cannot run")
 
+    if args.index is None:
+        args.index = args.index_dir or f"fused_ab_{args.dataset}"
+        args.queries = build_beir_index(args.dataset, args.index, args.device)
+    elif args.queries is None:
+        raise SystemExit("--queries is required with --index")
+
     queries = load_queries(args.queries)
     print(f"{len(queries)} queries | index {args.index}")
 
-    engine = FastPlaid(index=args.index, device=args.device, fused=True)
+    # 'high' is the placement the fused path needs; both arms run on it.
+    engine = FastPlaid(
+        index=args.index, device=args.device, index_gpu_memory="high", fused=True
+    )
     shared = {
         "top_k": args.top_k,
         "n_full_scores": args.n_full_scores,

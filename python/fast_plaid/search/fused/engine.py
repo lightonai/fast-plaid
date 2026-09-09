@@ -17,8 +17,7 @@ from .errors import FusedCompilationError, FusedOutOfMemoryError
 from .gate import NORM_CHUNK
 from .kernels import approx_maxsim, exact_maxsim, pad_pow2, token_tile
 
-# The standard pipeline exact-scores the top quarter of the approximate
-# ranking and draws its final top-k from that set alone (rust/search/search.rs).
+# The standard pipeline exact-scores the top quarter of the approximate ranking.
 _EXACT_FRACTION = 4
 
 # Smallest block dimension tl.dot accepts.
@@ -47,18 +46,14 @@ def _compile_error_types() -> tuple[type[BaseException], ...]:
     return tuple(found)
 
 
-# Compilation and resource failures are deterministic for a given shape, so
-# they retire the engine where an out-of-memory error does not. OSError is in
-# the same class: Triton builds its kernel launcher with the system C compiler
-# and writes compiled kernels to a cache directory, and a machine without a
-# compiler or without a writable cache fails the same way on every launch.
+# Deterministic failures retire the engine; OSError covers a missing compiler or cache.
 _COMPILE_ERRORS = (*_compile_error_types(), OSError)
 
 
 class FusedEngine:
     """Fused Triton kernels over the standard index's device tensors."""
 
-    # Engine attribute -> the key of ``data`` it is read from, in place.
+    # Engine attribute -> key of ``data`` it reads in place.
     _BORROWED: ClassVar[dict[str, str]] = {
         "codes": "doc_codes",
         "residuals": "doc_residuals",
@@ -78,18 +73,14 @@ class FusedEngine:
         Args:
         ----
         data:
-            The tensors the standard index was constructed from, as attached
-            to the loaded index by the loader. Codes, residuals, centroids and
-            IVF lists must already be resident on ``device``: they are read in
-            place -- the kernels only need a pointer into them -- so the engine
-            allocates nothing for them. Codes are read at their stored int64
-            width rather than narrowed to int32, which is the price of not
-            copying.
+            The tensors the standard index was built from. Codes, residuals,
+            centroids and IVF lists must already be on ``device``; they are
+            read in place, codes at their stored int64 width.
         device:
             Target CUDA device.
         budget_fraction:
-            Share of free memory this engine's per-search transients may
-            occupy, taken from the index's ``search_memory_fraction``.
+            Share of free memory per-search transients may occupy, from the
+            index's ``search_memory_fraction``.
 
         """
         self.device = device
@@ -117,8 +108,7 @@ class FusedEngine:
         self.offsets[1:] = lengths.cumsum(0)[:-1]
         self.doc_lengths = lengths.to(torch.int32).contiguous()
 
-        # Slicing a contiguous tensor along its first dimension is a view, so
-        # none of these four lines allocates.
+        # Slices of a contiguous tensor are views: nothing here allocates.
         packed_bytes = (self.dim * self.nbits) // 8
         self.codes = data["doc_codes"].reshape(-1)[: self.n_tokens]
         self.residuals = data["doc_residuals"].reshape(-1, packed_bytes)[
@@ -128,8 +118,7 @@ class FusedEngine:
         self.n_centroids = int(self.centroids.shape[0])
         self.ivf = data["ivf"].reshape(-1)
 
-        # The indexer stores bucket weights in natural code order while the
-        # packed nibbles address them bit-reversed.
+        # Weights are stored in code order but addressed bit-reversed by the nibbles.
         weights = data["bucket_weights"].to(torch.float32).reshape(-1)
         permutation = torch.tensor(
             [
@@ -150,27 +139,17 @@ class FusedEngine:
 
         self.norms = self._precompute_norms()
         self.token_tile = token_tile(self.arch)
-        # Fixed once built; the admission ceiling caps each launch's transients
-        # at the footprint the kernels read -- borrowed tensors included -- so
-        # the process never holds more scratch than index.
+        # The ceiling caps each launch's scratch at this footprint.
         self._footprint_bytes = self.resident_bytes() + self.shared_bytes()
 
-        # The candidate bound depends only on the index and the padded query
-        # length, so it is computed once per shape rather than per search.
+        # Depends only on the index and the padded query length, so cached per shape.
         self._candidate_bound: dict[tuple[int, int], int] = {}
 
     def _precompute_norms(self) -> torch.Tensor:
-        """Reconstruction norms in Half, matching the standard chain's divisor.
-
-        The standard pipeline normalises the Half reconstruction by its own Half
-        norm. Precomputing it costs two bytes per token and removes a
-        reduction from the inner loop.
-        """
+        """Per-token Half reconstruction norms, the standard chain's divisor."""
         norms = torch.empty(self.n_tokens, dtype=torch.float16, device=self.device)
 
-        # Codes sit MSB-first within each packed byte, matching the kernel's
-        # shift schedule; the bucket-weight permutation absorbs the bit
-        # reversal the standard decompressor applies to the whole byte.
+        # Codes are MSB-first in a byte; the permuted weights absorb the bit reversal.
         codes_per_byte = 8 // self.nbits
         code_mask = (1 << self.nbits) - 1
         shifts = [(codes_per_byte - 1 - i) * self.nbits for i in range(codes_per_byte)]
@@ -224,23 +203,15 @@ class FusedEngine:
         *,
         max_tokens: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Pack per-query tokens into a padded ``[B, max_tokens, dim]`` tensor.
+        """Pack per-query tokens into a zero-padded ``[B, max_tokens, dim]`` tensor.
 
-        Padded rows are zero, so their MaxSim contribution is exactly zero and
-        the sum runs over true query tokens only. The true lengths are returned
-        alongside because the IVF probe must ignore padded rows entirely.
-
-        ``max_tokens`` is the width the whole call was admitted against, not
-        this chunk's own maximum. Sizing it per chunk would give the kernels a
-        new shape whenever a chunk happened to hold only short queries, which
-        both re-triggers Triton specialisation and invalidates the ceiling that
-        admitted the chunk.
+        Padded rows contribute nothing to MaxSim; the true lengths are returned
+        so the IVF probe can ignore them. ``max_tokens`` is fixed for the whole
+        call so every chunk compiles to the same kernel shape.
         """
         batch = len(query_lengths)
 
-        # One host-to-device transfer and one scatter, rather than a copy per
-        # query: at large batches the per-query transfers dominate the kernels
-        # they feed.
+        # One transfer and one scatter for the whole chunk, not one copy per query.
         lengths = torch.tensor(query_lengths, dtype=torch.int64, device=self.device)
         starts = torch.zeros(batch, dtype=torch.int64, device=self.device)
         starts[1:] = lengths.cumsum(0)[:-1]
@@ -260,13 +231,7 @@ class FusedEngine:
     ) -> tuple[torch.Tensor, ...]:
         """Probe the IVF lists and build a dense candidate matrix."""
         batch, max_q, _ = queries.shape
-        # Built once, directly in the [batch, centroid, query] layout the
-        # approximate kernel reads. The einsum form materialised it in
-        # [batch, query, centroid] order, and both the top-k over centroids
-        # and the contiguous copy that followed doubled the largest transient
-        # of the call. A batched GEMM against the broadcast centroids (stride
-        # 0, nothing copied) yields the same values bit for bit, and top-k on
-        # this layout runs without an intermediate.
+        # Built directly in the layout the kernel reads, so only one copy is ever live.
         qct = torch.bmm(
             self.centroids.unsqueeze(0).expand(batch, -1, -1),
             queries.transpose(1, 2),
@@ -276,10 +241,7 @@ class FusedEngine:
         flat_cells = cells.reshape(-1)
         segment_lengths = self.ivf_lengths[flat_cells]
 
-        # A padded query row scores every centroid at zero, so its top-k is an
-        # arbitrary set of tied cells. Letting those through would probe cells
-        # the standard pipeline never visits and admit candidates it never
-        # scores, so padded rows are given empty posting lists.
+        # Padded query rows tie every centroid; give them empty posting lists.
         row_of_cell = torch.arange(max_q, device=self.device).repeat_interleave(n_probe)
         keep = (row_of_cell[None, :] < lengths[:, None]).reshape(-1)
         segment_lengths = torch.where(
@@ -303,9 +265,7 @@ class FusedEngine:
         bitmap = torch.zeros(batch, self.n_docs, dtype=torch.bool, device=self.device)
         bitmap[segment_id // cells.shape[1], docs] = True
         n_cand = bitmap.sum(1).to(torch.int32)
-        # Both bounds come back in one transfer. The minimum decides whether
-        # any query can select padding at all, which keeps the batch-1 path
-        # free of a second device-to-host round trip per call.
+        # One transfer for both bounds keeps the batch-1 path to a single sync.
         bounds = torch.stack((n_cand.min(), n_cand.max())).cpu()
         min_cand, max_cand = int(bounds[0]), int(bounds[1])
 
@@ -355,17 +315,10 @@ class FusedEngine:
         approx_top, approx_slots = approx.topk(n_sel, dim=1)
         selected = torch.gather(cand, 1, approx_slots).contiguous()
 
-        # The candidate matrix is a rectangle as wide as the batch's largest
-        # candidate set, so a query holding fewer keeps a zero-filled tail --
-        # which reads as document 0. Selection is sorted descending and those
-        # slots score -inf, so they land at the end and are marked here. They
-        # must not reach the output: document 0's IVF cells were never probed
-        # for this query, and the standard pipeline would never return it.
+        # Padding slots read as document 0 and score -inf; mark them to drop them.
         filled = torch.isfinite(approx_top)
 
-        # The kernel skips padded slots rather than scoring documents whose
-        # results are discarded, so this fill is their result: those entries
-        # are never written.
+        # The kernel skips padded slots, so -inf is their final value.
         exact = torch.full((batch, n_sel), float("-inf"), device=self.device)
         exact_maxsim[(n_sel, batch)](
             selected,
@@ -399,8 +352,7 @@ class FusedEngine:
                 for row_ids, row_scores in zip(ids_cpu, scores_cpu)
             ]
 
-        # A query with fewer than top_k candidates returns fewer than top_k
-        # results, which is what the standard pipeline does too.
+        # Fewer candidates than top_k means fewer results, as in the standard pipeline.
         keep_cpu = torch.gather(filled, 1, order).cpu().tolist()
         return [
             [
@@ -442,16 +394,10 @@ class FusedEngine:
 
         """
         if not query_lengths:
-            # The standard pipeline answers an empty request with an empty
-            # list. Padding would take the maximum of nothing.
+            # An empty request returns an empty list, as in the standard pipeline.
             return []
 
-        # Derived from the host-side lengths so that admission is decided
-        # before anything is allocated. The padded batch is the largest
-        # transient in the call, and an earlier version built it up front --
-        # outside the retry, and uncounted by the ceiling that was supposed to
-        # admit it -- so an out-of-memory error there escaped instead of
-        # falling back, and halving the chunk could not release it.
+        # Decided from host-side lengths so admission happens before any allocation.
         max_q = max(_MIN_DOT_DIM, pad_pow2(max(query_lengths)))
 
         key = (n_probe, max_q)
@@ -475,17 +421,12 @@ class FusedEngine:
         if max_batch is not None:
             chunk = max(1, min(chunk, max_batch))
 
-        # Token boundaries of each query within the packed input, so a chunk
-        # can transfer its own slice rather than the whole batch.
+        # Per-query token boundaries so each chunk transfers only its own slice.
         token_offsets = [0]
         for length in query_lengths:
             token_offsets.append(token_offsets[-1] + length)
 
-        # The ceiling is a fitted model, not a proof, so it can be optimistic on
-        # an index whose posting lists are shaped unlike the ones it was fitted
-        # to. Halving is the cheapest correction: the retry costs one failed
-        # attempt, where propagating the error would fail a call the standard
-        # pipeline can serve.
+        # The ceiling is a fitted model: on OOM, halve the chunk and retry the range.
         results: list[list[tuple[int, float]]] = []
         start = 0
         n_queries = len(query_lengths)
@@ -516,9 +457,7 @@ class FusedEngine:
                 chunk = max(1, chunk // 2)
                 continue
             except _COMPILE_ERRORS as error:
-                # Deterministic for this shape and this machine, so retrying or
-                # shrinking the batch cannot help. The caller retires the engine
-                # rather than paying the same failure on every search.
+                # Recurs on every launch, so the caller retires the engine.
                 raise FusedCompilationError(
                     f"fused kernels could not be compiled or launched: {error!r}"
                 ) from error

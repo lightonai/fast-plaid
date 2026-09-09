@@ -1,56 +1,30 @@
 """Closed-form batch admission for the fused search path.
 
-Fused search allocates no data-dependent scratch: every transient buffer is a
-linear function of the query batch size, so the largest admissible batch can be
-computed in arithmetic rather than discovered by catching out-of-memory errors.
-This module owns that arithmetic.
-
-The coefficients below are fitted to measured peaks, not derived from a single
-tensor. An earlier version modelled only the query-by-centroid table and
-underestimated the true transient by ~8x on a 262k-centroid index, because the
-candidate-proportional buffers (the bitmap dump, the candidate matrix, the
-approximate scores and the two top-k workspaces) dominate once posting lists are
-long. Measured transients on MS MARCO v1 (8.84M documents, 262,144 centroids,
-32 query tokens) were 0.2 / 1.2 / 8.8 / 33.5 GiB at batch 1 / 8 / 64 / 250 --
-clean linearity in batch, which is what makes the closed form viable at all.
+Every transient is linear in the query batch, so the largest admissible batch
+is arithmetic rather than trial and error. The coefficients are fitted to
+measured peaks on MS MARCO (0.2 / 1.2 / 8.8 / 33.5 GiB at batch 1 / 8 / 64 / 250).
 """
 
 from __future__ import annotations
 
 import torch
 
-# The query-by-centroid table is built once, directly in the layout the
-# approximate kernel reads, so a single copy is live at a time.
+# The query-by-centroid table is built once, in the layout the kernel reads.
 QCT_COPIES = 1
 
 # One byte of candidate bitmap per (query, document).
 BITMAP_BYTES_PER_DOC = 1
 
-# Per-candidate transient: the nonzero() index pair (16 B), the candidate id
-# matrix (8 B), approximate scores (4 B), the selection gather and the two
-# top-k workspaces. Measured ~75 B/candidate; rounded up for headroom.
+# Per candidate: nonzero() pair, id, approximate score, top-k workspaces (~75 B).
 BYTES_PER_CANDIDATE = 96
 
-# Fraction of free device memory the fused path is willing to occupy with
-# transients. The remainder absorbs allocator fragmentation.
+# Share of free VRAM transients may take; the rest absorbs fragmentation.
 BUDGET_FRACTION = 0.6
 
-# Batch-independent floor: allocator block granularity and the workspaces that
-# do not scale with batch. Measured transient at batch 1 exceeds the linear
-# term alone, so a constant is carried rather than pretending the fit passes
-# through the origin.
+# Batch-independent floor: allocator granularity and workspaces that do not scale.
 FIXED_BYTES = 128 * 2**20
 
-# Ceiling on the transients of one launch, independent of how much of the card
-# happens to be free. Without it the admitted batch scales with free VRAM rather
-# than with the workload: on a 74 MB SciFact index an 80GB card admitted 10,000
-# queries in one launch, the process peaked at 53 GiB, and the caching
-# allocator held that for the rest of its life. The cap is the staged index's
-# own footprint, so the process never holds more transient than index, with a
-# floor so that small indexes still get launches wide enough to keep the
-# kernels busy. Measured on SciFact (16k centroids, 64 padded query tokens),
-# throughput reaches ~90% of its uncapped value at 64 queries per launch and
-# ~95% at 128; the floor admits roughly 100 there.
+# Per-launch cap: scratch never exceeds the index footprint, floored for small indexes.
 TRANSIENT_FLOOR_BYTES = 384 * 2**20
 TRANSIENT_RESIDENT_RATIO = 1.0
 
@@ -64,16 +38,8 @@ def estimate_candidates(
 ) -> int:
     """Upper-bound the candidates a single query can produce.
 
-    A query probes ``n_probe`` cells per query token. The largest number of
-    postings those cells can hold is the sum of the largest
-    ``n_probe * max_query_tokens`` posting lists, which bounds the candidate
-    count before de-duplication.
-
-    Averaging instead of bounding is not safe here: query tokens preferentially
-    select dense centroids, so the cells actually probed are far longer than the
-    mean cell. On MS MARCO the mean cell holds ~2.3k postings while a query's
-    probed cells yielded ~1.33M candidates after de-duplication -- well above
-    the ~584k a mean-based estimate predicts.
+    The sum of the largest ``n_probe * max_query_tokens`` posting lists. A mean
+    would not do: query tokens preferentially pick dense centroids.
 
     Args:
     ----
@@ -127,15 +93,7 @@ def transient_bytes(
 
 
 def usable_bytes(device: str) -> int:
-    """Device memory available to this process, including reusable cache.
-
-    ``mem_get_info`` reports what the driver considers free, which excludes
-    blocks the caching allocator is holding but not using. Those blocks are
-    available without a round trip to the driver, so they count. Adding them
-    back is exact and costs nothing, where releasing them with
-    ``empty_cache()`` would synchronize the device and throw away warm blocks
-    that the next allocation is about to want.
-    """
+    """Free device memory plus the allocator's cached-but-unused blocks."""
     free, _ = torch.cuda.mem_get_info(device)
     cached_unused = torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(
         device
@@ -175,10 +133,8 @@ def max_batch(
         index's own ``search_memory_fraction``, so a deployment that lowered it
         to share the GPU is honoured here rather than overridden.
     resident_bytes:
-        Device bytes held by the staged index. When given, one launch may not
-        allocate more transient than :data:`TRANSIENT_RESIDENT_RATIO` times
-        this, or :data:`TRANSIENT_FLOOR_BYTES`, whichever is larger -- so the
-        footprint follows the workload rather than the card.
+        Device footprint of the index. When given, one launch may not use more
+        scratch than max(:data:`TRANSIENT_FLOOR_BYTES`, ratio * footprint).
 
     """
     if free_bytes is None:

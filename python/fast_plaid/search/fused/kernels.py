@@ -15,21 +15,9 @@ Both follow the standard chain rounding step for rounding step: Half
 reconstruction, Half normalise, Half GEMM output, fp32 sum. The annotations in
 ``exact_maxsim`` mark each of those steps.
 
-What that does *not* buy is a bit-identical result. fp16 multiply with fp32
-accumulate is non-associative, so the order the K dimension is summed in
-decides the last bits, and the two implementations pick that order
-independently: mainline reaches cuBLAS, which selects a kernel by heuristic on
-architecture *and* shape, while ``tl.dot`` lowers to a schedule Triton's
-compiler chose. Where the true dot product sits near an fp16 rounding boundary
-the two round apart, and a per-token maximum lands an ulp or two away.
-
-Because both sides choose independently, the deviation is a property of the
-(card, shape) pair rather than of either alone: nil on sm_90 for the shapes in
-the parity suite, 1.22e-4 on sm_80, 2.44e-4 on sm_86 and sm_89 -- and on a real
-corpus the same index deviates by 0.0 on an H100 and 4.9e-4 on an L4. It does
-not amplify: an ulp can change *which* token wins a maximum, but two candidates
-within an ulp give a maximum within an ulp either way. The parity suite
-measures and reports it rather than asserting it here.
+Results are not bit-identical: cuBLAS and ``tl.dot`` accumulate the fp16 GEMM
+in different orders, so a per-token maximum can land an fp16 ulp or two away
+(zero on sm_90, up to 2.44e-4 on sm_80/86/89). The parity suite measures it.
 """
 
 from __future__ import annotations
@@ -37,8 +25,7 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 
-# Shared-memory ceilings differ by architecture: sm_89 exposes ~100 KB per
-# block against sm_90's ~227 KB, so the token tile is gated rather than assumed.
+# Shared memory per block differs by architecture, so the token tile is gated.
 _TOKEN_TILE_BY_ARCH = {(8, 9): 64, (9, 0): 128}
 _DEFAULT_TOKEN_TILE = 64
 
@@ -122,18 +109,12 @@ def exact_maxsim(
     One program per (selected document, query). The reconstructed embeddings
     live in registers only.
 
-    Queries in a batch rarely hold the same number of candidates, and the
-    selection is a rectangle ``n_sel`` wide, so a query with fewer candidates
-    than that carries padding in its tail. Those slots address document 0 and
-    their scores are discarded, so the guard below skips them rather than
-    decompressing a document whose result cannot be used. Without it a query
-    holding 300 candidates against a selection depth of 1024 would spend 70%
-    of this kernel on work that is thrown away.
+    Padding slots in the selection address document 0 and are skipped rather
+    than scored: their results are discarded anyway.
     """
     slot = tl.program_id(0)
     b = tl.program_id(1)
-    # Selection is sorted descending and padded slots score -inf, so the real
-    # candidates occupy the first min(n_sel, n_cand) positions.
+    # Real candidates come first: selection is sorted and padded slots score -inf.
     n_valid = tl.load(ncand_ptr + b)
     if slot < n_valid:
         doc = tl.load(sel_ptr + b.to(tl.int64) * n_sel + slot)
@@ -185,20 +166,16 @@ def exact_maxsim(
 
                 # Reconstruction rounds to Half, matching the standard chain.
                 emb = (centroid + residual).to(tl.float16)
-                # Dividing by a precomputed Half norm reproduces the ATen Half
-                # divide, which rounds a single fp32 quotient (CUDA has no fp16
-                # divide instruction).
+                # Same as ATen's Half divide: one fp32 quotient, rounded once.
                 norm = tl.load(norm_ptr + global_tok, mask=mask, other=1.0).to(
                     tl.float32
                 )
                 emb = (emb.to(tl.float32) / norm[:, None]).to(tl.float16)
 
                 scores = tl.dot(emb, tl.trans(query))
-                # Rounding the fp32 accumulator to Half reproduces the Half
-                # output of the standard HGEMM.
+                # Round the fp32 accumulator to Half like the standard HGEMM output.
                 scores = scores.to(tl.float16).to(tl.float32)
-                # Masking with -inf mirrors the padded-token masking of the
-                # standard reducer; the maximum is deliberately left unclamped.
+                # -inf masking mirrors the standard reducer; the maximum is not clamped.
                 scores = tl.where(mask[:, None], scores, float("-inf"))
                 acc = tl.maximum(acc, tl.max(scores, axis=0))
 

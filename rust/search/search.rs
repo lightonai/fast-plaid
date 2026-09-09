@@ -6,6 +6,7 @@ use tch::{Device, IndexOp, Kind, Tensor};
 
 use pyo3_tch::PyTensor;
 
+use crate::search::asym::AsymIndex;
 use crate::search::load::LoadedIndex;
 use crate::search::padding::direct_pad_sequences;
 use crate::search::tensor::StridedTensor;
@@ -275,6 +276,47 @@ pub fn decompress_residuals(
     embedding_dimension: i64,
     nbits: i64,
 ) -> Tensor {
+    let embeddings = reconstruct_residuals(
+        packed_residuals,
+        bucket_weights,
+        byte_reversed_bits_map,
+        bucket_weight_indices_lookup,
+        codes,
+        centroids,
+        embedding_dimension,
+        nbits,
+    );
+    let norms = reconstruction_norms(&embeddings);
+    embeddings / norms
+}
+
+/// Euclidean norm of each reconstructed embedding, clamped away from zero.
+///
+/// Kept beside the reconstruction because the two are always used together:
+/// the float path divides by these, and the asymmetric path caches their
+/// reciprocals per index.
+pub fn reconstruction_norms(embeddings: &Tensor) -> Tensor {
+    embeddings
+        .norm_scalaropt_dim(2.0, &[-1], true)
+        .clamp_min(1e-12)
+}
+
+/// Reconstructs embeddings from their codes and packed residuals, without
+/// normalizing them.
+///
+/// This is [`decompress_residuals`] minus the final division, split out so the
+/// norms can be taken by callers that need them separately.
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct_residuals(
+    packed_residuals: &Tensor,
+    bucket_weights: &Tensor,
+    byte_reversed_bits_map: &Tensor,
+    bucket_weight_indices_lookup: &Tensor,
+    codes: &Tensor,
+    centroids: &Tensor,
+    embedding_dimension: i64,
+    nbits: i64,
+) -> Tensor {
     let num_embeddings = codes.size()[0];
 
     const BITS_PER_PACKED_UNIT: i64 = 8;
@@ -308,17 +350,9 @@ pub fn decompress_residuals(
     let reshaped_gathered_weights =
         flat_gathered_weights.view([num_embeddings, packed_dim, codes_per_packed_unit]);
 
-    // Reconstruct and normalize
+    // Reconstruct
     let output_contributions_sum = reshaped_gathered_weights + reshaped_centroids;
-    let decompressed_embeddings =
-        output_contributions_sum.view([num_embeddings, embedding_dimension]);
-
-    let norms = decompressed_embeddings
-        .norm_scalaropt_dim(2.0, &[-1], true)
-        .clamp_min(1e-12);
-
-    let normalized_embeddings = decompressed_embeddings / norms;
-    normalized_embeddings
+    output_contributions_sum.view([num_embeddings, embedding_dimension])
 }
 
 /// Represents the results of a single search query.
@@ -401,19 +435,35 @@ pub struct SearchParameters {
     /// Per-device scoring workspace budget in bytes. 0 = a conservative default.
     #[pyo3(get, set)]
     pub memory_budget_bytes: usize,
+    /// Score exact candidates from their stored codes with the asymmetric
+    /// int8-query kernels instead of reconstructing them to floats.
+    ///
+    /// Only honoured where the codes and residuals are already in host
+    /// memory: the CPU device, and the `low` placement tier. Scores are
+    /// quantized rather than equal to the float path's.
+    #[pyo3(get, set)]
+    pub residual_asym: bool,
 }
 
 #[pymethods]
 impl SearchParameters {
     /// Creates a new `SearchParameters` instance from Python.
     #[new]
-    #[pyo3(signature = (batch_size, n_full_scores, top_k, n_ivf_probe, memory_budget_bytes=0))]
+    #[pyo3(signature = (
+        batch_size,
+        n_full_scores,
+        top_k,
+        n_ivf_probe,
+        memory_budget_bytes=0,
+        residual_asym=false,
+    ))]
     fn new(
         batch_size: usize,
         n_full_scores: usize,
         top_k: usize,
         n_ivf_probe: usize,
         memory_budget_bytes: usize,
+        residual_asym: bool,
     ) -> Self {
         Self {
             batch_size,
@@ -421,6 +471,7 @@ impl SearchParameters {
             top_k,
             n_ivf_probe,
             memory_budget_bytes,
+            residual_asym,
         }
     }
 }
@@ -510,6 +561,7 @@ pub fn search_many(
             false,
             params.batch_size as i64,
             resolve_memory_budget(params),
+            params.residual_asym.then(|| index.asym()).flatten(),
         )?;
 
         Ok(QueryResult {
@@ -614,6 +666,11 @@ pub fn search_many_with_token_scores(
             true,
             params.batch_size as i64,
             resolve_memory_budget(params),
+            // Never asymmetric: the token matrices returned alongside the
+            // scores are the reconstructed embeddings scored against the
+            // query, so taking the scores from the LUT kernels would return a
+            // score and a breakdown of it that do not add up.
+            None,
         )?;
 
         Ok(QueryResultWithTokenScores {
@@ -757,6 +814,7 @@ pub fn search(
     return_token_scores: bool,
     batch_size: i64,
     memory_budget_bytes: i64,
+    asym: Option<&AsymIndex>,
 ) -> anyhow::Result<(Vec<i64>, Vec<f32>, Option<Vec<Tensor>>)> {
     let (passage_ids, scores, token_matrices) = tch::no_grad(|| {
         let q_tokens = query_embeddings.size()[0];
@@ -950,17 +1008,30 @@ pub fn search(
             Ok(colbert_score_reduce(token_scores_3d, &mask))
         };
 
-        let reduced_scores = run_scoring_stage_with_oom_retry(
-            &passage_ids_to_rerank,
-            &rerank_lengths_cpu,
-            exact_bytes_per_cell(q_tokens),
-            stage_budget,
-            batch_size,
-            doc_codes_strided,
-            device,
-            sort_enabled,
-            &mut exact_chunk_fn,
-        )?;
+        // The asymmetric kernels read the stored codes in place, so they need
+        // neither the chunk planner nor its out-of-memory retries: the only
+        // allocation is the score vector itself.
+        let reduced_scores = match asym {
+            Some(asym) => asym.score(
+                &passage_ids_to_rerank,
+                query_embeddings,
+                &query_centroid_scores,
+                doc_residuals_strided,
+                doc_codes_strided,
+                device,
+            )?,
+            None => run_scoring_stage_with_oom_retry(
+                &passage_ids_to_rerank,
+                &rerank_lengths_cpu,
+                exact_bytes_per_cell(q_tokens),
+                stage_budget,
+                batch_size,
+                doc_codes_strided,
+                device,
+                sort_enabled,
+                &mut exact_chunk_fn,
+            )?,
+        };
 
         // Final top-k sort
         let (reduced_scores, sorted_indices) = reduced_scores.sort(0, true);

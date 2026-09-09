@@ -24,6 +24,9 @@ pyo3-tch = "0.20.0"
 rand = "0.9.1"
 regex = "1.11.1"
 rayon = "1.11.0"
+# Asymmetric int8-query x fused-LUT MaxSim over packed residual codes.
+# std-only and dependency-free, so it adds nothing to the tree.
+maxsim-lut = "0.1.0"
 
 # Windows-specific dependencies
 [target.'cfg(windows)'.dependencies]

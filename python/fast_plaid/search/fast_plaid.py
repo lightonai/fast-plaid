@@ -269,6 +269,7 @@ def search_on_device(
     show_progress: bool,
     query_lengths: list[int],
     subset: list[list[int]] | None = None,
+    residual_asym: bool = False,
 ) -> list[list[tuple[int, float]]]:
     """Perform a search on a single specified device using the passed object.
 
@@ -297,6 +298,9 @@ def search_on_device(
         True token count per query in the packed tensor.
     subset:
         Optional subset of document IDs to search within.
+    residual_asym:
+        Score exact candidates from their stored codes instead of
+        reconstructing them to floats.
 
     """
     # Guard clause to prevent the TypeError in Rust binding
@@ -313,6 +317,7 @@ def search_on_device(
         top_k=top_k,
         n_ivf_probe=n_ivf_probe,
         memory_budget_bytes=device_memory_budget(device, search_memory_fraction),
+        residual_asym=residual_asym,
     )
 
     scores = fast_plaid_rust.pysearch(
@@ -346,6 +351,7 @@ def search_on_device_with_token_scores(
     show_progress: bool,
     query_lengths: list[int],
     subset: list[list[int]] | None = None,
+    residual_asym: bool = False,  # noqa: ARG001
 ) -> list[list[tuple[int, float, torch.Tensor]]]:
     """Perform a search on a single device, returning token-level similarity matrices.
 
@@ -373,6 +379,11 @@ def search_on_device_with_token_scores(
         True token count per query in the packed tensor.
     subset:
         Optional subset of document IDs to search within.
+    residual_asym:
+        Accepted so that every per-device search shares one signature, and
+        ignored: the token-score matrices are the reconstructed embeddings
+        scored against the query, which is exactly what the asymmetric path
+        does not compute.
 
     """
     if index_object is None:
@@ -1014,6 +1025,7 @@ class FastPlaid:
         n_ivf_probe: int,
         show_progress: bool,
         n_processes: int | None = None,
+        residual_asym: bool = False,
     ) -> list:
         """Dispatch search across devices, including joblib CPU parallelism.
 
@@ -1043,6 +1055,9 @@ class FastPlaid:
         n_processes:
             Number of jobs for CPU parallelism via joblib.
             Ignored on GPU. Defaults to 1.
+        residual_asym:
+            Score exact candidates from their stored codes instead of
+            reconstructing them to floats.
 
         """
         num_queries = len(query_lengths)
@@ -1098,6 +1113,7 @@ class FastPlaid:
                     show_progress=(show_progress and i == 0),
                     subset=sub_chunk,
                     query_lengths=query_slice(start, end)[1],
+                    residual_asym=residual_asym,
                 )
                 for i, ((start, end), sub_chunk) in enumerate(
                     zip(bounds, subset_chunks)
@@ -1118,6 +1134,7 @@ class FastPlaid:
                 show_progress=show_progress,
                 subset=subset,
                 query_lengths=query_lengths,
+                residual_asym=residual_asym,
             )
 
         # Multi-GPU split
@@ -1153,6 +1170,7 @@ class FastPlaid:
                         show_progress=show_progress and (i == 0),
                         subset=subset_chunks_gpu[i],
                         query_lengths=chunk_lengths,
+                        residual_asym=residual_asym,
                     )
                 )
 
@@ -1173,6 +1191,7 @@ class FastPlaid:
         show_progress: bool = True,
         subset: list[list[int]] | list[int] | None = None,
         n_processes: int | None = None,
+        residual_asym: bool = False,
     ) -> list[list[tuple[int, float]]]:
         """Search the index for the given query embeddings.
 
@@ -1199,6 +1218,14 @@ class FastPlaid:
         n_processes:
             Number of jobs to use for CPU search via joblib.
             Ignored if running on GPU(s). Defaults to 1.
+        residual_asym:
+            Score the exact-reranking candidates straight from their stored
+            codes, with asymmetric int8-query kernels, instead of
+            reconstructing them to floats. Honoured only where the codes and
+            residuals already live in host memory -- the CPU device and
+            `index_gpu_memory="low"` -- and ignored elsewhere.
+            Scores are quantized rather than equal to the float path's, so
+            rankings agree closely rather than exactly.
 
         """
         search_indices, packed_queries, query_lengths, subset = self._prepare_search(
@@ -1217,6 +1244,7 @@ class FastPlaid:
             n_ivf_probe=n_ivf_probe,
             show_progress=show_progress,
             n_processes=n_processes,
+            residual_asym=residual_asym,
         )
 
     @torch.inference_mode()

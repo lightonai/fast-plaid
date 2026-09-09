@@ -1,3 +1,4 @@
+pub mod asym;
 pub mod load;
 pub mod padding;
 pub mod search;

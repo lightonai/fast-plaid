@@ -1147,15 +1147,20 @@ class FastPlaid:
         decline is recorded for this loaded index and revisited on the next
         reload, when the placement or the free memory may differ.
         """
-        if not self._fused_warned:
-            warnings.warn(
-                f"fused=True cannot be honoured: {reason}. The standard pipeline "
-                "serves this instance; pass fused=False to silence this warning.",
-                UserWarning,
-                stacklevel=4,
-            )
-            self._fused_warned = True
+        self._warn_fused_once(reason)
         return self._publish_fused(generation, None, reason)
+
+    def _warn_fused_once(self, reason: str) -> None:
+        """Tell the caller once per instance that fused=True is not being served."""
+        if self._fused_warned:
+            return
+        warnings.warn(
+            f"fused=True cannot be honoured: {reason}. The standard pipeline "
+            "serves this instance; pass fused=False to silence this warning.",
+            UserWarning,
+            stacklevel=5,
+        )
+        self._fused_warned = True
 
     def _publish_fused(self, generation: int, engine: Any, reason: str | None) -> Any:
         """Record a staging outcome, unless the index moved while it ran.
@@ -1497,6 +1502,7 @@ class FastPlaid:
                     # or fail a second time on the same broken context.
                     if isinstance(error, FusedCompilationError):
                         self._retire_fused(str(error))
+                        self._warn_fused_once(str(error))
                     if gate.is_debug():
                         print(
                             f"[fast-plaid] fused path fell back: {error}",

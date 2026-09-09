@@ -1346,6 +1346,87 @@ def test_oom_halving_reassembles_the_batch_correctly(tmp_path) -> None:
     ]
 
 
+def test_defaults_never_import_the_fused_package() -> None:
+    """Upgrading must change nothing for a caller who did not opt in.
+
+    With ``fused`` left at its default the fused package -- and with it any
+    Triton dependency -- must never be imported, whatever the caller does with
+    the index. Run in a subprocess so the check sees a fresh interpreter.
+    """
+    script = (
+        "import sys, tempfile, torch;"
+        "from fast_plaid import search as fp;"
+        "F = torch.nn.functional.normalize;"
+        "docs = [F(torch.randn(8, 96), dim=-1) for _ in range(64)];"
+        "q = F(torch.randn(2, 8, 96), dim=-1);"
+        "idx = fp.FastPlaid(index=tempfile.mkdtemp(), device='cpu');"
+        "idx.create(documents_embeddings=docs);"
+        "idx.update(documents_embeddings=docs[:4]);"
+        "idx.search(queries_embeddings=q, top_k=3, show_progress=False);"
+        "idx.search(queries_embeddings=q, top_k=3, subset=[0, 1, 2], show_progress=False);"
+        "idx.search(queries_embeddings=q, top_k=3, batch_size=16, show_progress=False);"
+        "idx.delete(subset=[0]); idx.close();"
+        "assert idx.fused is False, idx.fused;"
+        "loaded = [m for m in sys.modules if m.startswith('fast_plaid.search.fused')];"
+        "assert not loaded, loaded;"
+        "print('fused package untouched')"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, result.stderr
+    assert "fused package untouched" in result.stdout
+
+
+@requires_fused
+def test_launcher_build_failure_retires_the_engine(tmp_path) -> None:
+    """A machine that cannot build Triton's launcher falls back, once, with a warning.
+
+    Triton compiles its kernel launcher with the system C compiler and writes
+    to a cache directory at first launch; a slim container has neither. Those
+    surface as OSError from inside the kernel launch, which must be treated as
+    a deterministic compilation failure: retire the engine, answer from the
+    standard pipeline, and never raise to the caller.
+    """
+    torch.manual_seed(0)
+    documents = [
+        torch.nn.functional.normalize(torch.randn(24, 96), p=2, dim=-1)
+        for _ in range(256)
+    ]
+    queries = torch.nn.functional.normalize(torch.randn(4, 16, 96), p=2, dim=-1)
+
+    engine = FastPlaid(
+        index=str(tmp_path / "index"),
+        device="cuda:0",
+        index_gpu_memory="high",
+        fused=True,
+    )
+    engine.create(documents_embeddings=documents, nbits=4)
+
+    engine.fused = False
+    expected = engine.search(queries_embeddings=queries, top_k=5, show_progress=False)
+    engine.fused = True
+    engine._invalidate_fused()
+    fused = engine._maybe_fused()
+    assert fused is not None
+
+    def no_compiler(*_args, **_kwargs):
+        raise FileNotFoundError(2, "No such file or directory", "/usr/bin/cc")
+
+    fused._search_batch = no_compiler
+    with pytest.warns(UserWarning, match="cannot be honoured"):
+        actual = engine.search(queries_embeddings=queries, top_k=5, show_progress=False)
+    assert_same_ranking(actual, expected)
+
+    status = engine.fused_status()
+    assert status["active"] is False
+    assert "compiled or launched" in status["reason"]
+    # Settled: no second warning, no second attempt.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        engine.search(queries_embeddings=queries, top_k=5, show_progress=False)
+
+
 def test_zz_report_observed_score_deltas() -> None:
     """Report the worst score deviation this suite actually produced.
 

@@ -48,8 +48,11 @@ def _compile_error_types() -> tuple[type[BaseException], ...]:
 
 
 # Compilation and resource failures are deterministic for a given shape, so
-# they retire the engine where an out-of-memory error does not.
-_COMPILE_ERRORS = _compile_error_types()
+# they retire the engine where an out-of-memory error does not. OSError is in
+# the same class: Triton builds its kernel launcher with the system C compiler
+# and writes compiled kernels to a cache directory, and a machine without a
+# compiler or without a writable cache fails the same way on every launch.
+_COMPILE_ERRORS = (*_compile_error_types(), OSError)
 
 
 class FusedEngine:
@@ -513,11 +516,11 @@ class FusedEngine:
                 chunk = max(1, chunk // 2)
                 continue
             except _COMPILE_ERRORS as error:
-                # Deterministic for this shape, so retrying or shrinking the
-                # batch cannot help. The caller retires the engine rather
-                # than paying the same failed compilation on every search.
+                # Deterministic for this shape and this machine, so retrying or
+                # shrinking the batch cannot help. The caller retires the engine
+                # rather than paying the same failure on every search.
                 raise FusedCompilationError(
-                    f"fused kernels could not run for this shape: {error}"
+                    f"fused kernels could not be compiled or launched: {error!r}"
                 ) from error
             start = stop
         return results

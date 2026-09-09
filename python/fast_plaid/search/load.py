@@ -445,20 +445,37 @@ def _construct_index_from_tensors(
         data, device, index_gpu_memory, index_memory_fraction
     )
 
+    # Moving them here, not in Rust, keeps a Python handle to the same device storage.
+    on_device = device.startswith("cuda")
+    codes_on_device = on_device and index_gpu_memory in ("medium", "high")
+    residuals_on_device = on_device and index_gpu_memory == "high"
+
     gpu_data: dict[str, Any] = {}
     for key, val in data.items():
         if val is None:
             gpu_data[key] = None
         elif isinstance(val, torch.Tensor):
-            if key in ["doc_codes", "doc_residuals", "doc_lengths"]:
-                # Tier placement happens on the Rust side; hand these over on CPU.
+            if key == "doc_lengths":
+                # Lengths stay on CPU here; Rust moves its own copy.
                 gpu_data[key] = val
+            elif key == "doc_codes":
+                gpu_data[key] = val.to(device) if codes_on_device else val
+            elif key == "doc_residuals":
+                gpu_data[key] = val.to(device) if residuals_on_device else val
+            elif key == "ivf" and on_device and data.get("ivf_lengths") is not None:
+                # Pre-padded so Rust reuses it instead of allocating a padded copy.
+                lengths = data["ivf_lengths"]
+                pad = int(lengths.max()) if lengths.numel() else 0
+                ivf = val.to(device)
+                gpu_data[key] = torch.cat(
+                    [ivf, torch.zeros(pad, dtype=ivf.dtype, device=ivf.device)]
+                )
             else:
                 gpu_data[key] = val.to(device, non_blocking=True)
         else:
             gpu_data[key] = val
 
-    return fast_plaid_rust.construct_index(
+    index = fast_plaid_rust.construct_index(
         nbits=gpu_data["nbits"],
         centroids=gpu_data["centroids"],
         avg_residual=gpu_data["avg_residual"],
@@ -472,6 +489,28 @@ def _construct_index_from_tensors(
         device=device,
         index_gpu_memory=index_gpu_memory,
     )
+
+    # Attach the tensors to the index so they live exactly as long as it does.
+    try:
+        index._device_tensors = {  # noqa: SLF001
+            key: gpu_data[key]
+            for key in (
+                "nbits",
+                "centroids",
+                "bucket_weights",
+                "ivf",
+                "ivf_lengths",
+                "doc_lengths",
+                "doc_codes",
+                "doc_residuals",
+            )
+        }
+        index._device_tensors["index_gpu_memory"] = index_gpu_memory  # noqa: SLF001
+    except AttributeError:
+        # Older extension without an instance dict: the fused path will simply decline.
+        pass
+
+    return index
 
 
 def _reload_index(

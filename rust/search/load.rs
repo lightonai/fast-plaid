@@ -63,7 +63,9 @@ unsafe impl Sync for LoadedIndex {}
 /// This wrapper allows the Python runtime to manage the lifetime of the
 /// underlying Rust index structure. When the Python object is garbage collected,
 /// the Rust memory is freed.
-#[pyclass]
+///
+/// `dict` lets Python attach the device tensors it handed over, for the fused path to read in place.
+#[pyclass(dict)]
 pub struct PyLoadedIndex {
     pub inner: LoadedIndex,
 }

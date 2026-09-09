@@ -15,6 +15,9 @@ test:
 evaluate:
 	uv run python docs/benchmark/benchmark.py
 	rm -rf *.dat
+
+evaluate-fused:
+	uv run python docs/benchmark/fused_ab.py --dataset scifact
 	
 evaluate-test:
 	mprof run --include-children uv run python test.py && mprof plot -o chart_test.png

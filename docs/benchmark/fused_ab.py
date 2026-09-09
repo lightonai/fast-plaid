@@ -45,6 +45,7 @@ import itertools
 import statistics
 import time
 
+import numpy as np
 import torch
 from fast_plaid.search import FastPlaid
 
@@ -74,8 +75,8 @@ def build_beir_index(dataset: str, index_dir: str, device: str) -> str:
         torch.tensor(e)
         for e in model.encode([d["text"] for d in documents], is_query=False)
     ]
-    queries_embeddings = torch.tensor(
-        model.encode(list(queries.values()), is_query=True)
+    queries_embeddings = torch.from_numpy(
+        np.stack(model.encode(list(queries.values()), is_query=True))
     )
 
     os.makedirs(index_dir, exist_ok=True)

@@ -79,6 +79,32 @@ class TestAsymEquivalence:
                     compared += 1
         assert compared > 0, "no shared documents to compare"
 
+    @pytest.mark.parametrize("n_full_scores", [8, 64, 4096])
+    def test_pruning_depth_does_not_change_agreement(
+        self, test_index_path, n_full_scores
+    ):
+        """Candidate generation is exact, so pruning harder cannot diverge.
+
+        Only the reranking scores are quantized. If the approximate stage had
+        drifted, a shallow `n_full_scores` would prune a different candidate
+        set and the two paths would disagree about documents, not just about
+        the last decimal of a score -- so the shallow settings are the ones
+        that would catch it.
+        """
+        index = build_index(test_index_path)
+        qs = queries()
+
+        floats = index.search(qs, top_k=5, n_full_scores=n_full_scores, n_processes=1)
+        asyms = index.search(
+            qs, top_k=5, n_full_scores=n_full_scores, residual_asym=True, n_processes=1
+        )
+
+        overlap = sum(
+            len({doc for doc, _ in a} & {doc for doc, _ in f})
+            for f, a in zip(floats, asyms)
+        )
+        assert overlap / sum(len(result) for result in floats) >= 0.8
+
     def test_top_results_mostly_agree(self, test_index_path):
         """The two paths retrieve substantially the same documents."""
         index = build_index(test_index_path)

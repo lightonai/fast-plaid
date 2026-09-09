@@ -1,24 +1,28 @@
-//! Asymmetric int8-query x fused-LUT MaxSim over stored residual codes.
+//! Scoring candidates from the index's stored codes, read in place.
 //!
-//! The float exact-scoring path reconstructs every candidate token to `f32`,
-//! pads the batch to a rectangle and runs a GEMM against the query. Most of
-//! that work is spent producing bytes that are read once: on SciFact the
-//! reconstruction alone is ~60% of a CPU search.
+//! Both scoring stages of a search gather their candidates into a padded
+//! `[docs, max_doc_len, ...]` rectangle and reduce it. The rectangle is the
+//! expensive part and it is read exactly once: on SciFact the approximate
+//! stage's gather and the exact stage's `f32` reconstruction are together ~70%
+//! of a CPU search, to produce one number per candidate.
 //!
-//! This path scores the *stored* codes instead. Each packed byte expands to
-//! its bucket weights through an in-register table lookup, the dot runs on
-//! integer MACs, and the centroid term is the query-by-centroid product the
-//! candidate-generation stage has already computed. Nothing is decompressed
-//! and nothing is padded.
+//! This module computes the same two reductions by walking each candidate's
+//! own rows where the index already holds them. Nothing is gathered and
+//! nothing is padded.
 //!
-//! It serves whenever the codes and the residuals both live in host memory --
-//! the CPU device, and the `low` placement tier, which exists to keep those
-//! bytes off the GPU -- so they are read where they already are. Under
-//! `medium` the codes are device-resident, and under `high` so are the
-//! residuals; both decline here and the float path serves them unchanged.
+//! * The approximate stage keeps a running per-query-token maximum over the
+//!   centroid scores the search has already computed. It is exact: identical
+//!   results to the padded path.
+//! * The exact stage hands the packed rows to `maxsim-lut`, which expands each
+//!   byte to its bucket weights by an in-register table lookup and dots it
+//!   against an int8-quantized query on integer MACs. The reconstruction never
+//!   happens, so scores are quantized rather than equal to the float path's --
+//!   `tests/test_asym.py` pins the agreement.
 //!
-//! Scoring is quantized, so scores are close to the float path's rather than
-//! equal to them; see `tests/test_asym.py` for the measured agreement.
+//! Both need the codes and the residuals in host memory, which the CPU device
+//! and the `low` placement tier give. Under `medium` the codes are
+//! device-resident, and under `high` so are the residuals; both decline here
+//! and the float path serves them unchanged.
 
 use anyhow::{anyhow, Result};
 use maxsim_lut::{Codes, DocView, Lut, PreparedQuery, Scorer, MAX_DIM};
@@ -64,9 +68,9 @@ impl AsymIndex {
         doc_residuals: &StridedTensor,
         nbits: i64,
     ) -> Result<Self> {
-        // The scorer reads both of these in place, so both must be on the
-        // host. Under the `medium` tier the codes are device-resident while
-        // the residuals are not, which is a decline rather than an error: the
+        // Both stages read these two in place, so both must be on the host.
+        // Under the `medium` tier the codes are device-resident while the
+        // residuals are not, which is a decline rather than an error: the
         // float path serves that placement exactly as before.
         for (name, tensor) in [
             ("codes", &doc_codes.underlying_data),
@@ -119,39 +123,97 @@ impl AsymIndex {
         })
     }
 
-    /// Exact scores for `passage_ids`, in that order.
+    /// Quantizes the query and takes a host copy of the centroid scores, once
+    /// for both stages.
     ///
     /// `query_centroid_scores` is the `[num_centroids, query_tokens]` product
-    /// the candidate stage already computed; the kernels read it as the
-    /// centroid term rather than recomputing it.
-    pub fn score(
+    /// the search already computed; row-major, that is exactly the
+    /// centroid-major layout both stages want.
+    pub fn prepare(
         &self,
-        passage_ids: &Tensor,
         query_embeddings: &Tensor,
         query_centroid_scores: &Tensor,
-        doc_residuals: &StridedTensor,
-        doc_codes: &StridedTensor,
-        device: Device,
-    ) -> Result<Tensor> {
-        let n_query_tokens = query_embeddings.size()[0];
+    ) -> Result<QueryTables> {
+        let n_query_tokens = query_embeddings.size()[0] as usize;
         let query: Vec<f32> = query_embeddings
             .to_kind(Kind::Float)
             .to_device(Device::Cpu)
             .contiguous()
             .reshape([-1])
             .try_into()?;
-        let prepared = PreparedQuery::new(&self.lut, &query, n_query_tokens as usize, self.dim)
+        let prepared = PreparedQuery::new(&self.lut, &query, n_query_tokens, self.dim)
             .map_err(|error| anyhow!("query preparation failed: {error}"))?;
 
-        let centroid_scores: Vec<f32> = query_centroid_scores
-            .to_kind(Kind::Float)
-            .to_device(Device::Cpu)
-            .contiguous()
-            .reshape([-1])
-            .try_into()?;
-        let num_centroids = query_centroid_scores.size()[0] as usize;
-        let scorer = Scorer::new(&self.lut, &prepared)
-            .with_centroid_term(&centroid_scores, num_centroids)
+        Ok(QueryTables {
+            prepared,
+            centroid_scores: query_centroid_scores
+                .to_kind(Kind::Float)
+                .to_device(Device::Cpu)
+                .contiguous()
+                .reshape([-1])
+                .try_into()?,
+            num_centroids: query_centroid_scores.size()[0] as usize,
+            n_query_tokens,
+        })
+    }
+
+    /// Approximate scores for `passage_ids`, from centroid identity alone.
+    ///
+    /// The float path gathers one `[query_tokens]` row per candidate token
+    /// into a `[docs, max_doc_len, query_tokens]` rectangle and reduces that.
+    /// The rows are read straight out of the centroid-score matrix here, so
+    /// nothing is gathered and nothing is padded; the running maximum is the
+    /// only state, and it is `query_tokens` wide.
+    pub fn approximate_scores(
+        &self,
+        tables: &QueryTables,
+        passage_ids: &Tensor,
+        doc_codes: &StridedTensor,
+        device: Device,
+    ) -> Result<Tensor> {
+        let nq = tables.n_query_tokens;
+        let cdot = &tables.centroid_scores;
+        let ids: Vec<i64> = (&passage_ids.to_device(Device::Cpu)).try_into()?;
+        let codes = as_slice::<i64>(&doc_codes.underlying_data, Kind::Int64)?;
+
+        let scores: Vec<f32> = ids
+            .par_iter()
+            .map_init(
+                || vec![f32::NEG_INFINITY; nq],
+                |best, &id| {
+                    let start = self.offsets[id as usize] as usize;
+                    let len = self.lengths[id as usize] as usize;
+                    if len == 0 {
+                        return 0.0;
+                    }
+                    best.fill(f32::NEG_INFINITY);
+                    for &code in &codes[start..start + len] {
+                        let row = &cdot[code as usize * nq..][..nq];
+                        for (slot, &value) in best.iter_mut().zip(row) {
+                            if value > *slot {
+                                *slot = value;
+                            }
+                        }
+                    }
+                    best.iter().sum()
+                },
+            )
+            .collect();
+
+        Ok(Tensor::from_slice(&scores).to_device(device))
+    }
+
+    /// Exact scores for `passage_ids`, in that order.
+    pub fn exact_scores(
+        &self,
+        tables: &QueryTables,
+        passage_ids: &Tensor,
+        doc_residuals: &StridedTensor,
+        doc_codes: &StridedTensor,
+        device: Device,
+    ) -> Result<Tensor> {
+        let scorer = Scorer::new(&self.lut, &tables.prepared)
+            .with_centroid_term(&tables.centroid_scores, tables.num_centroids)
             .map_err(|error| anyhow!("centroid term rejected: {error}"))?;
 
         let ids: Vec<i64> = (&passage_ids.to_device(Device::Cpu)).try_into()?;
@@ -180,6 +242,18 @@ impl AsymIndex {
 
         Ok(Tensor::from_slice(&scores).to_device(device))
     }
+}
+
+/// The per-query state both scoring stages read: the int8-quantized query and
+/// a host copy of the query-by-centroid scores.
+///
+/// Built once per search rather than once per stage, because the centroid
+/// matrix is the larger of the two and both stages want the same copy of it.
+pub struct QueryTables {
+    prepared: PreparedQuery,
+    centroid_scores: Vec<f32>,
+    num_centroids: usize,
+    n_query_tokens: usize,
 }
 
 /// Reconstructs the index once to record `1 / ||token||` per token.

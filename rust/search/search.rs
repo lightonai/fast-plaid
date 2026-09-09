@@ -435,12 +435,12 @@ pub struct SearchParameters {
     /// Per-device scoring workspace budget in bytes. 0 = a conservative default.
     #[pyo3(get, set)]
     pub memory_budget_bytes: usize,
-    /// Score exact candidates from their stored codes with the asymmetric
-    /// int8-query kernels instead of reconstructing them to floats.
+    /// Score candidates from the index's stored codes, read in place, instead
+    /// of gathering them into padded rectangles and reconstructing them.
     ///
-    /// Only honoured where the codes and residuals are already in host
-    /// memory: the CPU device, and the `low` placement tier. Scores are
-    /// quantized rather than equal to the float path's.
+    /// Only honoured where the codes and residuals are already in host memory:
+    /// the CPU device and the `low` placement tier. The exact stage's scores
+    /// are quantized rather than equal to the float path's.
     #[pyo3(get, set)]
     pub residual_asym: bool,
 }
@@ -832,6 +832,12 @@ pub fn search(
         // Manual chunking preserves the input order; auto mode sorts candidates by doc length.
         let sort_enabled = batch_size <= 0;
 
+        // Quantizing the query and copying the centroid scores to the host is
+        // per-search work, so both stages share one preparation.
+        let asym_tables = asym
+            .map(|asym| asym.prepare(query_embeddings, &query_centroid_scores))
+            .transpose()?;
+
         // Select IVF cells to probe
         let flat_cells_to_probe = if let Some(subset_tensor) = subset {
             // Subset optimization: restrict to centroids containing subset documents
@@ -919,17 +925,22 @@ pub fn search(
             Ok(colbert_score_reduce(padded_approx_scores, &mask))
         };
 
-        let approx_scores = run_scoring_stage_with_oom_retry(
-            &unique_passage_ids,
-            &candidate_lengths_cpu,
-            approx_bytes_per_cell(q_tokens),
-            stage_budget,
-            batch_size,
-            doc_codes_strided,
-            device,
-            sort_enabled,
-            &mut approx_chunk_fn,
-        )?;
+        let approx_scores = match (asym, asym_tables.as_ref()) {
+            (Some(asym), Some(tables)) => {
+                asym.approximate_scores(tables, &unique_passage_ids, doc_codes_strided, device)?
+            },
+            _ => run_scoring_stage_with_oom_retry(
+                &unique_passage_ids,
+                &candidate_lengths_cpu,
+                approx_bytes_per_cell(q_tokens),
+                stage_budget,
+                batch_size,
+                doc_codes_strided,
+                device,
+                sort_enabled,
+                &mut approx_chunk_fn,
+            )?,
+        };
 
         if approx_scores.size().get(0) != Some(&unique_passage_ids.size()[0]) {
             return Err(anyhow!(
@@ -1011,16 +1022,15 @@ pub fn search(
         // The asymmetric kernels read the stored codes in place, so they need
         // neither the chunk planner nor its out-of-memory retries: the only
         // allocation is the score vector itself.
-        let reduced_scores = match asym {
-            Some(asym) => asym.score(
+        let reduced_scores = match (asym, asym_tables.as_ref()) {
+            (Some(asym), Some(tables)) => asym.exact_scores(
+                tables,
                 &passage_ids_to_rerank,
-                query_embeddings,
-                &query_centroid_scores,
                 doc_residuals_strided,
                 doc_codes_strided,
                 device,
             )?,
-            None => run_scoring_stage_with_oom_retry(
+            _ => run_scoring_stage_with_oom_retry(
                 &passage_ids_to_rerank,
                 &rerank_lengths_cpu,
                 exact_bytes_per_cell(q_tokens),

@@ -299,8 +299,8 @@ def search_on_device(
     subset:
         Optional subset of document IDs to search within.
     residual_asym:
-        Score exact candidates from their stored codes instead of
-        reconstructing them to floats.
+        Score candidates from the index's stored codes, read in place,
+        instead of gathering and reconstructing them.
 
     """
     # Guard clause to prevent the TypeError in Rust binding
@@ -1056,8 +1056,8 @@ class FastPlaid:
             Number of jobs for CPU parallelism via joblib.
             Ignored on GPU. Defaults to 1.
         residual_asym:
-            Score exact candidates from their stored codes instead of
-            reconstructing them to floats.
+            Score candidates from the index's stored codes, read in place,
+            instead of gathering and reconstructing them.
 
         """
         num_queries = len(query_lengths)
@@ -1219,13 +1219,14 @@ class FastPlaid:
             Number of jobs to use for CPU search via joblib.
             Ignored if running on GPU(s). Defaults to 1.
         residual_asym:
-            Score the exact-reranking candidates straight from their stored
-            codes, with asymmetric int8-query kernels, instead of
+            Score candidates from the index's stored codes, read where they
+            already sit, instead of gathering them into padded rectangles and
             reconstructing them to floats. Honoured only where the codes and
             residuals already live in host memory -- the CPU device and
-            `index_gpu_memory="low"` -- and ignored elsewhere.
-            Scores are quantized rather than equal to the float path's, so
-            rankings agree closely rather than exactly.
+            `index_gpu_memory="low"` -- and ignored elsewhere. Candidate
+            generation stays exact; the reranking scores are quantized rather
+            than equal to the float path's, so rankings agree closely rather
+            than exactly.
 
         """
         search_indices, packed_queries, query_lengths, subset = self._prepare_search(

@@ -2276,3 +2276,164 @@ def test():
 
     index.close()
     shutil.rmtree(index_name, ignore_errors=True)
+
+
+# --- Batched gather behind index lookups ------------------------------------
+#
+# The gather returns one packed run of rows per requested element. Its failure
+# modes are quiet ones -- a shifted offset, a dropped last row, padding left in
+# the output, elements returned in storage order rather than the requested one
+# -- and each of them still produces a plausibly-shaped tensor. These tests pin
+# the identity of the rows, not just their count.
+
+DIM = 32
+
+# Distinct lengths, including a single-token document and a long one: a gather
+# that mixes up offsets shows up as content from a neighbouring document, and
+# uniform lengths would hide that.
+LENGTHS = [1, 4, 9, 17, 2, 28, 6, 41, 11, 3, 22, 7, 35, 13, 5, 19, 8, 30, 15, 2]
+
+
+def build_index(index_path, lengths=LENGTHS, seed=0):
+    """Build a CPU index whose documents have exactly the given token counts."""
+    torch.manual_seed(seed)
+    documents = [torch.randn(n, DIM, device="cpu") for n in lengths]
+    index = search.FastPlaid(index=index_path, device="cpu")
+    index.create(documents_embeddings=documents, kmeans_niters=4, nbits=4)
+    return index, [torch.nn.functional.normalize(d, dim=-1) for d in documents]
+
+
+def agreement(reconstructed, original):
+    """Mean per-token cosine similarity between two same-length token runs."""
+    n = min(reconstructed.shape[0], original.shape[0])
+    return float(
+        torch.nn.functional.cosine_similarity(
+            reconstructed[:n].float(), original[:n].float(), dim=-1
+        ).mean()
+    )
+
+
+class TestGatherFidelity:
+    """Each element's rows come back, in order, from its own offset."""
+
+    def test_token_counts_survive_the_round_trip(self, test_index_path):
+        """A gather that over- or under-runs an element changes its length."""
+        index, documents = build_index(test_index_path)
+
+        got = index.get_embeddings(subset=list(range(len(documents))))
+
+        assert [t.shape[0] for t in got] == LENGTHS
+
+    def test_each_document_reconstructs_to_itself(self, test_index_path):
+        """Rows must come from the requested element's own offset.
+
+        Quantization costs some fidelity, so this compares agreement rather
+        than equality: every document must match its own tokens far better
+        than it matches its neighbours'. An offset shifted by even one
+        element inverts that comparison, which a length check alone misses.
+        """
+        index, documents = build_index(test_index_path)
+
+        got = index.get_embeddings(subset=list(range(len(documents))))
+
+        for i, (reconstructed, original) in enumerate(zip(got, documents)):
+            own = agreement(reconstructed, original)
+            others = [
+                agreement(reconstructed, documents[j])
+                for j in (i - 1, i + 1)
+                if 0 <= j < len(documents) and j != i
+            ]
+            assert own > 0.8, f"document {i} does not match its own tokens: {own}"
+            assert all(own > other + 0.3 for other in others), (
+                f"document {i} matches a neighbour as well as itself: "
+                f"own={own}, neighbours={others}"
+            )
+
+    def test_rows_follow_the_requested_order(self, test_index_path):
+        """Results are ordered by the request, not by position in storage."""
+        index, documents = build_index(test_index_path)
+        requested = [7, 0, 15, 3, 19, 11]
+
+        got = index.get_embeddings(subset=requested)
+
+        assert [t.shape[0] for t in got] == [LENGTHS[i] for i in requested]
+        for reconstructed, doc_id in zip(got, requested):
+            assert agreement(reconstructed, documents[doc_id]) > 0.8
+
+    def test_repeated_ids_are_gathered_once_each(self, test_index_path):
+        """The same element asked for twice yields it twice, identically."""
+        index, _ = build_index(test_index_path)
+
+        got = index.get_embeddings(subset=[5, 5, 12])
+
+        assert [t.shape[0] for t in got] == [LENGTHS[5], LENGTHS[5], LENGTHS[12]]
+        assert torch.equal(got[0], got[1])
+
+    def test_single_element_selection(self, test_index_path):
+        """A one-element gather is the degenerate case of the batched one."""
+        index, documents = build_index(test_index_path)
+
+        for doc_id in (0, 7, len(documents) - 1):
+            (got,) = index.get_embeddings(subset=[doc_id])
+            assert got.shape == (LENGTHS[doc_id], DIM)
+            assert agreement(got, documents[doc_id]) > 0.8
+
+    def test_empty_selection(self, test_index_path):
+        """Selecting nothing returns nothing rather than raising."""
+        index, _ = build_index(test_index_path)
+
+        assert index.get_embeddings(subset=[]) == []
+
+
+class TestGatherInSearch:
+    """The same gather feeds scoring, where errors surface as wrong rankings."""
+
+    def test_subset_search_agrees_with_full_search(self, test_index_path):
+        """Restricting to a subset must not change those documents' scores.
+
+        The subset path gathers a different, smaller candidate set through the
+        same code, so disagreement here means the gather depends on which
+        elements were asked for.
+
+        Both searches probe the whole index: with the default probe count the
+        two candidate sets differ for reasons that have nothing to do with the
+        gather, and a document missing from one side would be read as a
+        disagreement.
+        """
+        index, _ = build_index(test_index_path)
+        torch.manual_seed(1)
+        queries = [torch.randn(6, DIM, device="cpu") for _ in range(4)]
+        subset = [2, 5, 8, 11, 14, 17]
+        probe = {"n_ivf_probe": 64, "n_full_scores": 4096, "n_processes": 1}
+
+        full = index.search(queries, top_k=len(LENGTHS), **probe)
+        restricted = index.search(queries, top_k=len(subset), subset=subset, **probe)
+
+        compared = 0
+        for whole, part in zip(full, restricted):
+            whole_scores = dict(whole)
+            for doc, score in part:
+                assert doc in subset
+                assert score == pytest.approx(whole_scores[doc], abs=1e-4)
+                compared += 1
+        assert compared == len(queries) * len(subset)
+
+    def test_documents_of_every_length_are_scored(self, test_index_path):
+        """A search that reaches the whole index must return the whole index.
+
+        A gather that drops an element's last row, or skips a one-token
+        element, tends to drop it from the results entirely.
+        """
+        index, _ = build_index(test_index_path)
+        torch.manual_seed(2)
+        queries = [torch.randn(6, DIM, device="cpu")]
+
+        (results,) = index.search(
+            queries,
+            top_k=len(LENGTHS),
+            n_full_scores=4096,
+            n_ivf_probe=64,
+            n_processes=1,
+        )
+
+        assert {doc for doc, _ in results} == set(range(len(LENGTHS)))

@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+
+use rayon::prelude::*;
 use tch::{Device, Kind, Tensor};
 
 /// Computes a single quantile for a 1D tensor using `kthvalue`.
@@ -296,6 +298,77 @@ impl StridedTensor {
         }
     }
 
+    /// An empty `[0, ...inner_dims]` tensor of the stored data's kind.
+    fn empty_data(&self, device: Device) -> Tensor {
+        let mut shape = vec![0];
+        shape.extend_from_slice(&self.inner_dims);
+        Tensor::empty(&shape, (self.underlying_data.kind(), device))
+    }
+
+    /// Bytes occupied by one row of `underlying_data`.
+    fn row_bytes(&self) -> usize {
+        let cells: i64 = self.inner_dims.iter().product();
+        cells.max(1) as usize * self.underlying_data.kind().elt_size_in_bytes()
+    }
+
+    /// Copies the requested elements' rows into a packed buffer.
+    ///
+    /// An element's rows are contiguous in storage and contiguous in the
+    /// output, so each element moves as a single block. That is the whole
+    /// difference from the strided path, which writes every byte once as
+    /// padding and reads it back to compact it. Copying blocks also avoids a
+    /// per-row index, which for narrow rows would cost as much as the rows.
+    ///
+    /// Returns `None` if the storage cannot be addressed as flat bytes, which
+    /// leaves the caller on the strided path.
+    fn gather_packed(&self, offsets: &[i64], lengths: &[i64], total: i64) -> Option<Tensor> {
+        if !self.underlying_data.is_contiguous() {
+            return None;
+        }
+        if total == 0 {
+            return Some(self.empty_data(Device::Cpu));
+        }
+
+        let row_bytes = self.row_bytes();
+        let mut shape = vec![total];
+        shape.extend_from_slice(&self.inner_dims);
+        let output = Tensor::empty(&shape, (self.underlying_data.kind(), Device::Cpu));
+
+        // SAFETY: both tensors are contiguous, on the host and of a single
+        // kind, so each holds exactly `rows * row_bytes` addressable bytes.
+        // `output` was allocated here and is unaliased; `underlying_data` is
+        // immutable for as long as the index is loaded. Neither borrow leaves
+        // this function.
+        let source = unsafe {
+            std::slice::from_raw_parts(
+                self.underlying_data.data_ptr() as *const u8,
+                self.underlying_data.size()[0] as usize * row_bytes,
+            )
+        };
+        let mut remaining = unsafe {
+            std::slice::from_raw_parts_mut(output.data_ptr() as *mut u8, total as usize * row_bytes)
+        };
+
+        // Hand every element its own disjoint slice of the output up front, so
+        // the copies are independent and may run in any order.
+        let mut blocks = Vec::with_capacity(lengths.len());
+        for &length in lengths {
+            let (block, rest) = remaining.split_at_mut(length as usize * row_bytes);
+            blocks.push(block);
+            remaining = rest;
+        }
+
+        blocks
+            .into_par_iter()
+            .zip(offsets.par_iter())
+            .for_each(|(block, &offset)| {
+                let start = offset as usize * row_bytes;
+                block.copy_from_slice(&source[start..start + block.len()]);
+            });
+
+        Some(output)
+    }
+
     /// Retrieves a batch of elements specified by their indices.
     ///
     /// This method efficiently looks up elements by selecting an optimal precomputed
@@ -320,16 +393,37 @@ impl StridedTensor {
         let indices_local = indices.to_device(lengths_device).to_kind(Kind::Int64);
 
         if indices_local.numel() == 0 {
-            let mut empty_shape = vec![0];
-            empty_shape.extend_from_slice(&self.inner_dims);
             return (
-                Tensor::empty(&empty_shape, (self.underlying_data.kind(), target_device)),
+                self.empty_data(target_device),
                 Tensor::empty(&[0], (self.element_lengths.kind(), target_device)),
             );
         }
 
         let selected_lengths = self.element_lengths.index_select(0, &indices_local);
         let selected_offsets = self.cumulative_lengths.index_select(0, &indices_local);
+
+        // Host storage reads its rows where they already sit. The strided path
+        // below builds a `[elements, stride, ...]` rectangle and then compacts
+        // it with a boolean mask, so every byte is written once as padding and
+        // read twice; the packed gather selects the same bytes in one pass. It
+        // also never needs the widest selected length, so the scalar sync that
+        // chooses a stride goes with it.
+        if storage_device == Device::Cpu {
+            let lengths_host = selected_lengths.to_device(Device::Cpu);
+            let offsets_host = selected_offsets.to_device(Device::Cpu);
+            if let (Ok(lengths), Ok(offsets)) = (
+                Vec::<i64>::try_from(&lengths_host),
+                Vec::<i64>::try_from(&offsets_host),
+            ) {
+                let total: i64 = lengths.iter().sum();
+                if let Some(data) = self.gather_packed(&offsets, &lengths, total) {
+                    return (
+                        data.to_device(target_device),
+                        selected_lengths.to_device(target_device),
+                    );
+                }
+            }
+        }
 
         let max_selected_len = if selected_lengths.numel() > 0 {
             selected_lengths.max().int64_value(&[])
@@ -345,10 +439,8 @@ impl StridedTensor {
             .unwrap_or(self.max_element_len);
 
         if chosen_stride == 0 {
-            let mut empty_shape = vec![0];
-            empty_shape.extend_from_slice(&self.inner_dims);
             return (
-                Tensor::empty(&empty_shape, (self.underlying_data.kind(), target_device)),
+                self.empty_data(target_device),
                 selected_lengths.to_device(target_device),
             );
         }

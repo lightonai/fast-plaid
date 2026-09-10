@@ -193,12 +193,39 @@ def compute_kmeans(
     ).half()
 
 
+# Host scoring workspace per search, when `batch_size` is 'auto'.
+#
+# On a GPU the chunk planner's budget is a capacity limit -- VRAM is scarce and
+# exceeding it raises. Host memory is not scarce, so there is nothing to fit
+# into, and passing 0 here used to fall back to a 4 GiB device-shaped default:
+# large enough that a typical CPU search never chunked at all.
+#
+# The budget is still worth setting, because it is also a throughput knob. The
+# planner reads each padded cell exactly once, so a workspace far larger than
+# the caches buys no speed while every byte of it counts toward resident
+# memory. On SciFact, chunks beyond ~100k padded cells score no faster, while
+# peak RSS keeps climbing with the budget.
+#
+# Set so that even the widest cell the exact stage builds -- ~2 KiB, at the
+# longest queries -- still clears 100k cells per chunk.
+#
+# Sized in cells rather than documents on purpose: what the kernels care about
+# is how much padded work a chunk holds, which is the same question whether an
+# index has many short documents or few long ones.
+CPU_STAGE_WORKSPACE_BYTES = 256 * (1 << 20)
+
+
 def device_memory_budget(device: str, search_memory_fraction: float) -> int:
-    """Scoring budget in bytes: `search_memory_fraction` of free VRAM; 0 on CPU."""
+    """Scoring budget in bytes: `search_memory_fraction` of free VRAM on CUDA.
+
+    On the host the budget is a throughput target rather than a capacity limit,
+    so `search_memory_fraction` -- a fraction *of free VRAM* -- does not apply
+    and `CPU_STAGE_WORKSPACE_BYTES` is used instead.
+    """
     if device.startswith("cuda") and torch.cuda.is_available():
         free, _ = torch.cuda.mem_get_info(torch.device(device))
         return int(free * search_memory_fraction)
-    return 0
+    return CPU_STAGE_WORKSPACE_BYTES
 
 
 def _resolve_batch_size(batch_size: int | Literal["auto"]) -> int:
@@ -288,7 +315,8 @@ def search_on_device(
     n_ivf_probe:
         The number of IVF clusters to probe.
     search_memory_fraction:
-        Fraction of free VRAM the scoring stages may use.
+        Fraction of free VRAM the scoring stages may use. CUDA only; host
+        searches use `CPU_STAGE_WORKSPACE_BYTES`.
     index_object:
         The loaded index object for the specific device.
     show_progress:
@@ -364,7 +392,8 @@ def search_on_device_with_token_scores(
     n_ivf_probe:
         The number of IVF clusters to probe.
     search_memory_fraction:
-        Fraction of free VRAM the scoring stages may use.
+        Fraction of free VRAM the scoring stages may use. CUDA only; host
+        searches use `CPU_STAGE_WORKSPACE_BYTES`.
     index_object:
         The loaded index object for the specific device.
     show_progress:
@@ -440,7 +469,8 @@ class FastPlaid:
             Fraction of device memory 'auto' index placement may fill.
         search_memory_fraction:
             Fraction of free VRAM the scoring stages may use when batch_size
-            is 'auto'.
+            is 'auto'. CUDA only; host searches size their scoring workspace
+            for throughput instead, see `CPU_STAGE_WORKSPACE_BYTES`.
         kwargs:
             Additional keyword arguments. Unknown keywords are ignored, so call
             sites written against older versions keep working.

@@ -1,3 +1,5 @@
+use std::sync::OnceLock;
+
 use anyhow::Result;
 use serde::Deserialize;
 use tch::{Device, Kind, Tensor};
@@ -6,6 +8,8 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3_tch::PyTensor;
 
+use crate::search::asym::AsymIndex;
+use crate::search::search::catch_stage_panic;
 use crate::search::tensor::StridedTensor;
 use crate::utils::errors::anyhow_to_pyerr;
 use crate::utils::residual_codec::ResidualCodec;
@@ -53,6 +57,44 @@ pub struct LoadedIndex {
     pub doc_codes_strided: StridedTensor,
     pub doc_residuals_strided: StridedTensor,
     pub nbits: i64,
+    /// Asymmetric scoring tables, built on first use. The inner `None` records
+    /// that this index cannot use them, so an ineligible index is examined once
+    /// rather than on every search.
+    asym: OnceLock<Option<AsymIndex>>,
+}
+
+impl LoadedIndex {
+    /// The asymmetric scoring tables, building them if this is the first ask.
+    ///
+    /// Returns `None` when the index is not eligible -- residuals held on the
+    /// GPU, an unsupported code width, or a dimension past the kernels' ceiling
+    /// -- in which case the float path serves.
+    pub fn asym(&self) -> Option<&AsymIndex> {
+        self.asym
+            .get_or_init(|| {
+                // tch panics rather than erring on a device or shape mismatch, and
+                // an opt-in accelerator that cannot be built must step aside, not
+                // take the search down with it.
+                let built = catch_stage_panic(|| {
+                    AsymIndex::build(
+                        &self.codec,
+                        &self.doc_codes_strided,
+                        &self.doc_residuals_strided,
+                        self.nbits,
+                    )
+                });
+                match built {
+                    Ok(index) => Some(index),
+                    Err(reason) => {
+                        if std::env::var("FAST_PLAID_ASYM_DEBUG").is_ok_and(|v| v != "0") {
+                            eprintln!("fast-plaid: asymmetric scoring declined: {reason}");
+                        }
+                        None
+                    },
+                }
+            })
+            .as_ref()
+    }
 }
 
 unsafe impl Send for LoadedIndex {}
@@ -196,6 +238,7 @@ pub fn construct_index(
         doc_codes_strided,
         doc_residuals_strided,
         nbits,
+        asym: OnceLock::new(),
     };
 
     Ok(PyLoadedIndex {

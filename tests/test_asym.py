@@ -131,6 +131,52 @@ class TestAsymEquivalence:
         assert all(math.isfinite(score) for result in results for _, score in result)
 
 
+class TestRepeatedCodes:
+    """The approximate stage reads each centroid once per document."""
+
+    def test_heavy_code_repetition_still_agrees(self, test_index_path):
+        """Documents built from a small pool of vectors repeat codes hard.
+
+        The approximate stage takes a maximum over the rows a document's codes
+        select, and a maximum does not count, so it visits each distinct code
+        once. Documents drawn from a pool of 8 vectors drive the repetition to
+        an extreme the ordinary fixture never reaches -- if dropping repeats
+        were not exact, the flood would rank differently here first.
+        """
+        torch.manual_seed(3)
+        pool = torch.randn(8, 128, device="cpu")
+        documents = [pool[torch.randint(0, 8, (90 + 5 * (i % 7),))] for i in range(48)]
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+        index.create(documents_embeddings=documents, kmeans_niters=4, nbits=4)
+        qs = queries(n=6)
+
+        floats = index.search(qs, top_k=5, n_processes=1)
+        asyms = index.search(qs, top_k=5, residual_asym=True, n_processes=1)
+
+        overlap = sum(
+            len({doc for doc, _ in a} & {doc for doc, _ in f})
+            for f, a in zip(floats, asyms)
+        )
+        assert overlap / sum(len(result) for result in floats) >= 0.8
+        assert all(math.isfinite(score) for result in asyms for _, score in result)
+
+    def test_single_token_documents(self, test_index_path):
+        """A document of one token has one code, so dedup is a no-op on it.
+
+        The offsets are built per document, so the degenerate lengths are the
+        ones that would expose an off-by-one in them.
+        """
+        torch.manual_seed(4)
+        documents = [torch.randn(1 + (i % 3), 128, device="cpu") for i in range(40)]
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+        index.create(documents_embeddings=documents, kmeans_niters=4, nbits=4)
+
+        results = index.search(queries(n=4), top_k=5, residual_asym=True, n_processes=1)
+
+        assert all(len(result) == 5 for result in results)
+        assert all(math.isfinite(score) for result in results for _, score in result)
+
+
 class TestAsymDefaults:
     """The flag is opt-in, reachable, and never changes the default path."""
 

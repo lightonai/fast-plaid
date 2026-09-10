@@ -40,9 +40,10 @@ const NORM_CHUNK_TOKENS: i64 = 65_536;
 /// Per-index tables for asymmetric scoring, built once and shared by every
 /// search against that index.
 ///
-/// The inverse norms are the only allocation: 4 bytes per token, against the
-/// 4 x `dim` bytes per token the float path materializes for each candidate of
-/// each query.
+/// Two allocations, both per token of the index rather than per query: the
+/// inverse norms at 4 bytes, and the distinct centroid codes at 4 bytes for
+/// roughly half the tokens. The float path materializes 4 x `dim` bytes per
+/// token for each candidate of each query.
 pub struct AsymIndex {
     lut: Lut,
     /// `1 / ||centroid[code] + bucket_weights[residual]||` per token, in the
@@ -52,6 +53,16 @@ pub struct AsymIndex {
     offsets: Vec<i64>,
     /// Token count of each document.
     lengths: Vec<i64>,
+    /// Each document's centroid codes with repeats removed, concatenated.
+    ///
+    /// The approximate stage takes a maximum over the rows these select, and a
+    /// maximum is unchanged by visiting a row twice, so the repeats are work
+    /// with no effect on the answer. Documents repeat codes heavily -- a little
+    /// under half the tokens of a typical index -- and `u32` halves the read
+    /// again against the `i64` the codes are stored as.
+    distinct_codes: Vec<u32>,
+    /// Offset of each document into `distinct_codes`, with a trailing total.
+    distinct_offsets: Vec<u32>,
     /// Packed residual bytes per token.
     row_stride: usize,
     dim: usize,
@@ -113,11 +124,20 @@ impl AsymIndex {
 
         let inv_norms = build_inverse_norms(codec, doc_codes, doc_residuals, lookup, dim, nbits)?;
 
+        let offsets: Vec<i64> =
+            (&doc_codes.cumulative_lengths.to_device(Device::Cpu)).try_into()?;
+        let lengths: Vec<i64> = (&doc_codes.element_lengths.to_device(Device::Cpu)).try_into()?;
+        let num_centroids = codec.centroids.size()[0];
+        let (distinct_codes, distinct_offsets) =
+            build_distinct_codes(doc_codes, &offsets, &lengths, num_centroids)?;
+
         Ok(Self {
             lut,
             inv_norms,
-            offsets: (&doc_codes.cumulative_lengths.to_device(Device::Cpu)).try_into()?,
-            lengths: (&doc_codes.element_lengths.to_device(Device::Cpu)).try_into()?,
+            offsets,
+            lengths,
+            distinct_codes,
+            distinct_offsets,
             row_stride: row_stride as usize,
             dim: dim as usize,
         })
@@ -164,30 +184,31 @@ impl AsymIndex {
     /// The rows are read straight out of the centroid-score matrix here, so
     /// nothing is gathered and nothing is padded; the running maximum is the
     /// only state, and it is `query_tokens` wide.
+    ///
+    /// Each row is visited once per document rather than once per token that
+    /// selects it. A maximum does not count, so dropping the repeats is exact.
     pub fn approximate_scores(
         &self,
         tables: &QueryTables,
         passage_ids: &Tensor,
-        doc_codes: &StridedTensor,
         device: Device,
     ) -> Result<Tensor> {
         let nq = tables.n_query_tokens;
         let cdot = &tables.centroid_scores;
         let ids: Vec<i64> = (&passage_ids.to_device(Device::Cpu)).try_into()?;
-        let codes = as_slice::<i64>(&doc_codes.underlying_data, Kind::Int64)?;
 
         let scores: Vec<f32> = ids
             .par_iter()
             .map_init(
                 || vec![f32::NEG_INFINITY; nq],
                 |best, &id| {
-                    let start = self.offsets[id as usize] as usize;
-                    let len = self.lengths[id as usize] as usize;
-                    if len == 0 {
+                    let start = self.distinct_offsets[id as usize] as usize;
+                    let end = self.distinct_offsets[id as usize + 1] as usize;
+                    if start == end {
                         return 0.0;
                     }
                     best.fill(f32::NEG_INFINITY);
-                    for &code in &codes[start..start + len] {
+                    for &code in &self.distinct_codes[start..end] {
                         let row = &cdot[code as usize * nq..][..nq];
                         for (slot, &value) in best.iter_mut().zip(row) {
                             if value > *slot {
@@ -254,6 +275,64 @@ pub struct QueryTables {
     centroid_scores: Vec<f32>,
     num_centroids: usize,
     n_query_tokens: usize,
+}
+
+/// Records each document's centroid codes with repeats removed.
+///
+/// One pass over the stored codes, paid at the same time as the inverse norms.
+/// Documents are handled independently, so a scratch bitmap of the centroid
+/// space dedups one document in time linear in its length -- cheaper than
+/// sorting it, and it emits the codes in the order the document first uses
+/// them, which is the order the flood reads them in.
+///
+/// Codes are narrowed to `u32` on the way out. The index stores them as `i64`
+/// because that is what `index_select` wants, but a centroid id never needs
+/// more, and the flood is bound by how many bytes it reads.
+fn build_distinct_codes(
+    doc_codes: &StridedTensor,
+    offsets: &[i64],
+    lengths: &[i64],
+    num_centroids: i64,
+) -> Result<(Vec<u32>, Vec<u32>)> {
+    let codes = as_slice::<i64>(&doc_codes.underlying_data, Kind::Int64)?;
+    let num_docs = lengths.len();
+
+    let mut distinct = Vec::with_capacity(codes.len() / 2);
+    let mut doc_offsets = Vec::with_capacity(num_docs + 1);
+    let mut seen = vec![false; num_centroids as usize];
+    let mut touched: Vec<usize> = Vec::new();
+
+    for doc in 0..num_docs {
+        doc_offsets.push(
+            u32::try_from(distinct.len()).map_err(|_| {
+                anyhow!("index has more distinct codes than a u32 offset can address")
+            })?,
+        );
+        let start = offsets[doc] as usize;
+        let len = lengths[doc] as usize;
+        for &code in &codes[start..start + len] {
+            let code = usize::try_from(code)
+                .ok()
+                .filter(|&code| code < seen.len())
+                .ok_or_else(|| anyhow!("code {code} is outside the centroid space"))?;
+            if !seen[code] {
+                seen[code] = true;
+                touched.push(code);
+                distinct.push(code as u32);
+            }
+        }
+        for &code in &touched {
+            seen[code] = false;
+        }
+        touched.clear();
+    }
+    doc_offsets.push(
+        u32::try_from(distinct.len())
+            .map_err(|_| anyhow!("index has more distinct codes than a u32 offset can address"))?,
+    );
+
+    distinct.shrink_to_fit();
+    Ok((distinct, doc_offsets))
 }
 
 /// Reconstructs the index once to record `1 / ||token||` per token.

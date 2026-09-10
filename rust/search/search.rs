@@ -927,7 +927,7 @@ pub fn search(
 
         let approx_scores = match (asym, asym_tables.as_ref()) {
             (Some(asym), Some(tables)) => {
-                asym.approximate_scores(tables, &unique_passage_ids, doc_codes_strided, device)?
+                asym.approximate_scores(tables, &unique_passage_ids, device)?
             },
             _ => run_scoring_stage_with_oom_retry(
                 &unique_passage_ids,

@@ -259,7 +259,10 @@ pub struct QueryTables {
 /// Reconstructs the index once to record `1 / ||token||` per token.
 ///
 /// The float path recomputes these for every candidate of every query; here
-/// they are paid once and kept.
+/// they are paid once and kept. Each chunk is reconstructed where the codec
+/// lives -- the search device -- since the centroids and lookup tables are
+/// there; under the `low` tier that is a one-off pass of the host-resident
+/// codes and residuals through the GPU, and on the CPU device it is a no-op.
 fn build_inverse_norms(
     codec: &ResidualCodec,
     doc_codes: &StridedTensor,
@@ -273,17 +276,24 @@ fn build_inverse_norms(
         .as_ref()
         .ok_or_else(|| anyhow!("codec has no bucket weights"))?;
     let n_tokens = doc_residuals.underlying_data.size()[0];
+    let device = codec.centroids.device();
 
     let mut inv_norms = Vec::with_capacity(n_tokens as usize);
     let mut start = 0;
     while start < n_tokens {
         let len = NORM_CHUNK_TOKENS.min(n_tokens - start);
         let embeddings = reconstruct_residuals(
-            &doc_residuals.underlying_data.narrow(0, start, len),
+            &doc_residuals
+                .underlying_data
+                .narrow(0, start, len)
+                .to_device(device),
             bucket_weights,
             &codec.byte_reversed_bits_map,
             lookup,
-            &doc_codes.underlying_data.narrow(0, start, len),
+            &doc_codes
+                .underlying_data
+                .narrow(0, start, len)
+                .to_device(device),
             &codec.centroids,
             dim,
             nbits,
@@ -291,6 +301,7 @@ fn build_inverse_norms(
         let chunk: Vec<f32> = reconstruction_norms(&embeddings)
             .reciprocal()
             .to_kind(Kind::Float)
+            .to_device(Device::Cpu)
             .reshape([-1])
             .try_into()?;
         inv_norms.extend_from_slice(&chunk);

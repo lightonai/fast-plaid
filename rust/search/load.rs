@@ -9,6 +9,7 @@ use pyo3::prelude::*;
 use pyo3_tch::PyTensor;
 
 use crate::search::asym::AsymIndex;
+use crate::search::search::catch_stage_panic;
 use crate::search::tensor::StridedTensor;
 use crate::utils::errors::anyhow_to_pyerr;
 use crate::utils::residual_codec::ResidualCodec;
@@ -71,12 +72,18 @@ impl LoadedIndex {
     pub fn asym(&self) -> Option<&AsymIndex> {
         self.asym
             .get_or_init(|| {
-                match AsymIndex::build(
-                    &self.codec,
-                    &self.doc_codes_strided,
-                    &self.doc_residuals_strided,
-                    self.nbits,
-                ) {
+                // tch panics rather than erring on a device or shape mismatch, and
+                // an opt-in accelerator that cannot be built must step aside, not
+                // take the search down with it.
+                let built = catch_stage_panic(|| {
+                    AsymIndex::build(
+                        &self.codec,
+                        &self.doc_codes_strided,
+                        &self.doc_residuals_strided,
+                        self.nbits,
+                    )
+                });
+                match built {
                     Ok(index) => Some(index),
                     Err(reason) => {
                         if std::env::var("FAST_PLAID_ASYM_DEBUG").is_ok_and(|v| v != "0") {

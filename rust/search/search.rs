@@ -34,7 +34,7 @@ fn is_oom_error(error: &anyhow::Error) -> bool {
 }
 
 /// Converts panics into errors: tch ops panic on CUDA OOM, and the retry logic needs an `Err` to inspect.
-fn catch_stage_panic(run: impl FnOnce() -> Result<Tensor>) -> Result<Tensor> {
+pub fn catch_stage_panic<T>(run: impl FnOnce() -> Result<T>) -> Result<T> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
         Ok(result) => result,
         Err(payload) => {

@@ -293,6 +293,34 @@ Long-context queries, with many tokens per query, are what the planner is for: i
 
 &nbsp;
 
+## 🪶 Asymmetric Quantization (1-bit documents)
+
+`nbits=1` stores one bit per document dimension while queries stay full
+precision — the asymmetric-quantization idea from
+[mixedbread's blog post](https://www.mixedbread.com/blog/asymmetric-quant),
+adapted to PLAID: the bit refines each token's centroid (which keeps coarse
+direction and magnitude), and the two reconstruction levels are learned from
+the residual distribution (25th/75th percentiles) rather than fixed at ±1.
+
+```python
+index.create(documents_embeddings=embeddings, nbits=1)
+```
+
+Measured with `lightonai/LateOn-multilingual` on BEIR test splits (nDCG@10,
+index size on disk; H100, defaults otherwise):
+
+| dataset | nbits=4 (default) | nbits=2 | nbits=1 |
+|---|---|---|---|
+| SciFact | 76.01 / 129 MB | 75.24 / 77 MB | 73.81 / 51 MB |
+| NFCorpus | 37.74 / 100 MB | 37.35 / 60 MB | 36.10 / 40 MB |
+| ArguAna | 60.04 / 148 MB | 58.48 / 89 MB | 56.01 / 59 MB |
+| SCIDOCS | 20.29 / 461 MB | 19.98 / 274 MB | 19.07 / 181 MB |
+| **average / total** | **48.52 / 839 MB** | 47.76 / 501 MB | 46.25 / 331 MB |
+
+Rules of thumb: `nbits=2` buys a 1.7× smaller index for −0.8 nDCG@10 on
+average; `nbits=1` buys 2.5× for −2.3. The default stays `nbits=4`. Search
+gets slightly faster as nbits shrinks (less data decompressed per candidate).
+
 ## ⚖️ Settings Trade-offs
 
 ### Initialization

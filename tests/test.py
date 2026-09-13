@@ -2146,6 +2146,62 @@ class TestSingleCopyContracts:
             writer.close()
 
 
+
+class TestAsymmetricQuantization:
+    """nbits=1: one sign bit per document dimension, full-precision queries."""
+
+    def test_nbits_1_end_to_end(self, test_index_path):
+        """Create, search, update and delete all work on a 1-bit index."""
+        torch.manual_seed(0)
+        docs = [
+            torch.nn.functional.normalize(torch.randn(60, 128), dim=-1)
+            for _ in range(1200)
+        ]
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+        try:
+            index.create(documents_embeddings=docs, nbits=1, kmeans_niters=4)
+
+            # Residuals must be dim/8 bytes per embedding: one bit per dimension.
+            # Read the npy header only — an open memmap would block the in-place
+            # resize that update() performs below on Windows.
+            import numpy as np
+
+            with open(
+                os.path.join(test_index_path, "merged_residuals.npy"), "rb"
+            ) as f:
+                np.lib.format.read_magic(f)
+                shape, _, _ = np.lib.format.read_array_header_1_0(f)
+            assert shape[1] == 128 // 8, shape
+
+            queries = [docs[i][:30] for i in (5, 42, 900)]
+            results = index.search(queries_embeddings=queries, top_k=1)
+            assert [r[0][0] for r in results] == [5, 42, 900], (
+                "1-bit index failed exact self-prefix retrieval"
+            )
+
+            index.update(
+                documents_embeddings=[torch.randn(60, 128) for _ in range(10)],
+                start_from_scratch=0,
+            )
+            index.delete(subset=[0, 1])
+            results = index.search(queries_embeddings=[docs[5]], top_k=1)
+            assert results[0][0][0] == 3, "positions must shift after delete"
+        finally:
+            index.close()
+
+    def test_invalid_nbits_rejected(self, test_index_path):
+        """An unsupported bit width fails loudly at create()."""
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+        try:
+            with pytest.raises(ValueError, match="nbits"):
+                index.create(
+                    documents_embeddings=[torch.randn(60, 128) for _ in range(10)],
+                    nbits=3,
+                )
+        finally:
+            index.close()
+
+
 class TestLegacyArguments:
     """Call sites written against pre-1.5.0 versions must keep working."""
 

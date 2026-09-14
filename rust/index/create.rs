@@ -378,9 +378,12 @@ pub fn create_index(
 
     // Save Codec
     let centroids_fpath = Path::new(index_path).join("centroids.npy");
+    // fp16 on disk: the search loader has always cast centroids to fp16, so
+    // fp32 here was precision nothing ever read.
     final_codec
         .centroids
         .to_device(Device::Cpu)
+        .to_kind(Kind::Half)
         .write_npy(&centroids_fpath)?;
     let cutoffs_fpath = Path::new(index_path).join("bucket_cutoffs.npy");
     bucket_cutoffs
@@ -546,9 +549,11 @@ pub fn create_index(
                 .context("Failed to optimize IVF")?;
 
         let opt_ivf_fpath = Path::new(index_path).join("ivf.npy");
+        // int32 halves the posting lists on disk and still addresses 2.1B
+        // documents; the loader widens to int64 in RAM either way.
         opt_ivf
             .to_device(Device::Cpu)
-            .to_kind(Kind::Int64)
+            .to_kind(Kind::Int)
             .write_npy(&opt_ivf_fpath)?;
 
         let opt_lengths_fpath = Path::new(index_path).join("ivf_lengths.npy");

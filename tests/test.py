@@ -474,6 +474,45 @@ class TestSubsetFiltering:
                     f"Query {query_idx}: Document ID {doc_id} not in subset {subsets[query_idx]}"
                 )
 
+    def test_subset_search_matches_full_search_restricted(self, test_index_path):
+        """A subset search returns the full search's results restricted to it.
+
+        Probing every IVF cell and re-ranking every candidate makes both paths
+        exhaustive, so the subset path -- which first collects the unique
+        centroids its documents use -- must find every subset document and
+        score it exactly as the full search does.
+        """
+        import numpy as np
+
+        torch.manual_seed(0)
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+        documents_embeddings = [
+            torch.randn(20 + 7 * (i % 9), 128, device="cpu") for i in range(60)
+        ]
+        index.create(documents_embeddings=documents_embeddings, kmeans_niters=4)
+
+        centroids_path = os.path.join(test_index_path, "centroids.npy")
+        num_docs = len(documents_embeddings)
+        exhaustive = {
+            "top_k": num_docs,
+            "n_ivf_probe": np.load(centroids_path).shape[0],
+            "n_full_scores": 4 * num_docs,
+        }
+
+        queries = torch.randn(4, 16, 128, device="cpu")
+        subset = list(range(1, num_docs, 3))
+        full = index.search(queries_embeddings=queries, **exhaustive)
+        restricted = index.search(
+            queries_embeddings=queries, subset=subset, **exhaustive
+        )
+
+        for full_results, subset_results in zip(full, restricted):
+            assert len(full_results) == num_docs
+            full_scores = dict(full_results)
+            assert sorted(doc for doc, _ in subset_results) == subset
+            for doc_id, score in subset_results:
+                assert score == pytest.approx(full_scores[doc_id], abs=1e-4)
+
 
 class TestMetadataFiltering:
     """Tests for metadata filtering using SQLite."""

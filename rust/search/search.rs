@@ -782,9 +782,12 @@ pub fn search(
             if subset_doc_codes.numel() == 0 {
                 Tensor::empty(&[0], (Kind::Int64, device))
             } else {
-                let (unique_subset_centroids, _, _) = subset_doc_codes
-                    .flatten(0, -1)
-                    .unique_dim(0, true, false, false);
+                // Codes are centroid ids, so marking the used centroids yields their
+                // sorted unique set in one pass over the codes, however many there are.
+                let unique_subset_centroids = Tensor::zeros(&[num_centroids], (Kind::Bool, device))
+                    .index_fill(0, &subset_doc_codes.flatten(0, -1), 1)
+                    .nonzero()
+                    .flatten(0, -1);
 
                 let subset_scores = query_centroid_scores.index_select(0, &unique_subset_centroids);
                 let available_centroids = unique_subset_centroids.size()[0];
@@ -812,8 +815,9 @@ pub fn search(
             selected_ivf_cells_indices.flatten(0, -1).contiguous()
         };
 
+        let (sorted_cells_to_probe, _) = flat_cells_to_probe.sort(0, false);
         let (unique_ivf_cells_to_probe, _, _) =
-            flat_cells_to_probe.unique_dim(-1, true, false, false);
+            sorted_cells_to_probe.unique_consecutive(false, false, 0);
 
         // Retrieve candidate documents via IVF lookup
         let (retrieved_passage_ids_ivf, _) =

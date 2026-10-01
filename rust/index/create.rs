@@ -117,7 +117,8 @@ pub fn optimize_ivf(
 
     for &len in &inverted_file_lengths_vec {
         let pids_seg = pids_in_ivf.narrow(0, ivf_offset, len);
-        let (unique_pids, _, _) = pids_seg.unique_dim(0, true, false, false);
+        let (sorted_pids, _) = pids_seg.sort(0, false);
+        let (unique_pids, _, _) = sorted_pids.unique_consecutive(false, false, 0);
         unique_pids_list.push(unique_pids.copy());
         new_inverted_file_lengths_vec.push(unique_pids.size1().unwrap_or(0));
         ivf_offset += len;

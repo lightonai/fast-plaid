@@ -245,6 +245,22 @@ for doc_id, score, token_scores in results[0]:
 
 &nbsp;
 
+## 📊 Full Score Matrix
+
+Use `search_matrix()` (alias: `matrix()`) to get a dense `(num_queries, num_documents)` score tensor ordered by input query order and document insertion order. Useful for evaluation libraries such as MTEB that need the complete score matrix rather than a top-k list.
+
+```python
+scores = fast_plaid.search_matrix(
+    queries_embeddings=torch.randn(2, 50, embedding_dim),
+)
+# scores.shape == (2, num_documents)
+# scores[i, j] is the MaxSim score of query i for document j
+```
+
+`search_matrix` reuses the PLAID search path with coverage-safe defaults: it sets `top_k` to the corpus size and raises `n_full_scores` / `n_ivf_probe` so every document receives an exact score. An optional `subset` keeps non-selected columns at `-inf`.
+
+&nbsp;
+
 ## 🚀 GPU Memory Tuning
 
 On GPU, FastPlaid sizes itself to the available VRAM: `index_gpu_memory="auto"` decides where the index lives, and `search(batch_size="auto")` plans the scoring chunk sizes at query time. The defaults are good starting points, and the knobs below let you force a specific trade-off. None of them have any effect when `device="cpu"`.
@@ -640,6 +656,52 @@ subset: list[list[int]] | list[int] | None = None (optional)
 n_processes: int | None = None (optional)
     Number of joblib workers used for CPU search. Ignored when running on GPU(s).
     Defaults to 1.
+```
+
+### Full Score Matrix
+
+The **`search_matrix` method** (alias: **`matrix`**) returns a dense query-document score tensor.
+
+```python
+    def search_matrix(
+        self,
+        queries_embeddings: torch.Tensor | list[torch.Tensor],
+        batch_size: int | Literal["auto"] = "auto",
+        n_full_scores: int | None = None,
+        n_ivf_probe: int | None = None,
+        show_progress: bool = True,
+        subset: list[list[int]] | list[int] | None = None,
+        n_processes: int | None = None,
+    ) -> torch.Tensor:
+```
+
+```
+queries_embeddings: torch.Tensor | list[torch.Tensor]
+    Query multi-vector embeddings, same as search().
+
+batch_size: int | Literal["auto"] = "auto" (optional)
+    Documents scored per chunk; same semantics as search().
+
+n_full_scores: int | None = None (optional)
+    Exact re-ranking candidate pool. None (default) chooses at least
+    4 * num_documents so every document is exact-scored. An explicit int is
+    still raised to that minimum.
+
+n_ivf_probe: int | None = None (optional)
+    IVF probes. None (default) probes every partition for full coverage.
+    An explicit int is still raised to num_partitions.
+
+show_progress: bool = True (optional)
+    Display a progress bar during search.
+
+subset: list[list[int]] | list[int] | None = None (optional)
+    Optional document-ID filter. Non-selected columns are filled with -inf.
+
+n_processes: int | None = None (optional)
+    Joblib workers for CPU search. Ignored on GPU(s).
+
+Returns:
+    float32 tensor of shape (num_queries, num_documents).
 ```
 
 ### Deleting from the Index

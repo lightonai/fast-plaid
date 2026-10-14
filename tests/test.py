@@ -198,6 +198,138 @@ class TestSearchTokenScores:
                 )
 
 
+
+class TestSearchMatrix:
+    """Tests for search_matrix / matrix full score-matrix API (#3)."""
+
+    def test_search_matrix_shape_and_finite(self, test_index_path):
+        """Matrix is Q x D with a finite score in every cell."""
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+        num_docs = 40
+        num_queries = 3
+        documents_embeddings = [
+            torch.randn(40, 64, device="cpu") for _ in range(num_docs)
+        ]
+        queries_embeddings = torch.randn(num_queries, 15, 64, device="cpu")
+
+        index.create(documents_embeddings=documents_embeddings, kmeans_niters=2)
+        scores = index.search_matrix(
+            queries_embeddings=queries_embeddings, show_progress=False
+        )
+
+        assert isinstance(scores, torch.Tensor)
+        assert scores.shape == (num_queries, num_docs)
+        assert scores.dtype == torch.float32
+        assert torch.isfinite(scores).all(), "Expected finite scores for every doc"
+
+    def test_matrix_alias(self, test_index_path):
+        """matrix() is an alias for search_matrix()."""
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+        documents_embeddings = [torch.randn(30, 64, device="cpu") for _ in range(20)]
+        queries_embeddings = torch.randn(2, 10, 64, device="cpu")
+        index.create(documents_embeddings=documents_embeddings, kmeans_niters=2)
+
+        a = index.search_matrix(
+            queries_embeddings=queries_embeddings, show_progress=False
+        )
+        b = index.matrix(queries_embeddings=queries_embeddings, show_progress=False)
+        assert torch.equal(a, b)
+
+    def test_search_matrix_order_matches_document_ids(self, test_index_path):
+        """Column j holds the score for document id j (insertion order)."""
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+        num_docs = 30
+        documents_embeddings = [
+            torch.randn(35, 64, device="cpu") for _ in range(num_docs)
+        ]
+        queries_embeddings = torch.randn(2, 12, 64, device="cpu")
+        index.create(documents_embeddings=documents_embeddings, kmeans_niters=2)
+
+        scores = index.search_matrix(
+            queries_embeddings=queries_embeddings, show_progress=False
+        )
+        search_results = index.search(
+            queries_embeddings=queries_embeddings,
+            top_k=num_docs,
+            n_full_scores=4 * num_docs,
+            n_ivf_probe=index._read_index_metadata()["num_partitions"],
+            show_progress=False,
+        )
+
+        for q_idx, query_results in enumerate(search_results):
+            for doc_id, score in query_results:
+                matrix_score = scores[q_idx, doc_id].item()
+                assert abs(matrix_score - score) < 1e-3, (
+                    f"Query {q_idx} doc {doc_id}: "
+                    f"matrix={matrix_score} search={score}"
+                )
+
+    def test_search_matrix_top_k_parity(self, test_index_path):
+        """Top-k from the matrix matches search(top_k=...)."""
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+        num_docs = 50
+        documents_embeddings = [
+            torch.randn(40, 128, device="cpu") for _ in range(num_docs)
+        ]
+        queries_embeddings = torch.randn(3, 20, 128, device="cpu")
+        index.create(documents_embeddings=documents_embeddings, kmeans_niters=4)
+
+        top_k = 10
+        search_results = index.search(
+            queries_embeddings=queries_embeddings, top_k=top_k, show_progress=False
+        )
+        scores = index.search_matrix(
+            queries_embeddings=queries_embeddings, show_progress=False
+        )
+
+        for q_idx, query_results in enumerate(search_results):
+            # Compare as a set of (doc_id, approx score): ranking from matrix
+            # via topk should match search when scores uniquely identify docs.
+            matrix_top = torch.topk(scores[q_idx], k=top_k)
+            matrix_ids = set(matrix_top.indices.tolist())
+            search_ids = {doc_id for doc_id, _ in query_results}
+            assert matrix_ids == search_ids, (
+                f"Query {q_idx}: matrix top-{top_k}={sorted(matrix_ids)} "
+                f"search={sorted(search_ids)}"
+            )
+            for doc_id, score in query_results:
+                assert abs(scores[q_idx, doc_id].item() - score) < 1e-3
+
+    def test_search_matrix_with_subset(self, test_index_path):
+        """Subset fills only selected columns; others stay -inf."""
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+        num_docs = 25
+        documents_embeddings = [
+            torch.randn(30, 64, device="cpu") for _ in range(num_docs)
+        ]
+        queries_embeddings = torch.randn(2, 10, 64, device="cpu")
+        index.create(documents_embeddings=documents_embeddings, kmeans_niters=2)
+
+        subset = [0, 2, 5, 7, 11]
+        scores = index.search_matrix(
+            queries_embeddings=queries_embeddings,
+            subset=subset,
+            show_progress=False,
+        )
+
+        assert scores.shape == (2, num_docs)
+        for doc_id in range(num_docs):
+            col = scores[:, doc_id]
+            if doc_id in subset:
+                assert torch.isfinite(col).all(), f"doc {doc_id} should be scored"
+            else:
+                assert torch.isneginf(col).all(), f"doc {doc_id} should be -inf"
+
+    def test_search_matrix_empty_queries(self, test_index_path):
+        """Empty query list yields a (0, D) tensor."""
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+        documents_embeddings = [torch.randn(20, 64, device="cpu") for _ in range(10)]
+        index.create(documents_embeddings=documents_embeddings, kmeans_niters=2)
+
+        scores = index.search_matrix(queries_embeddings=[], show_progress=False)
+        assert scores.shape == (0, 10)
+
+
 class TestUpdate:
     """Tests for index update functionality."""
 

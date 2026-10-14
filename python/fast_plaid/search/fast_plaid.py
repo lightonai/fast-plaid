@@ -1311,6 +1311,166 @@ class FastPlaid:
             n_processes=n_processes,
         )
 
+
+    def _read_index_metadata(self) -> dict[str, Any]:
+        """Load ``metadata.json`` for the current index, or raise if missing."""
+        meta_path = os.path.join(self.index, "metadata.json")
+        if not os.path.exists(meta_path):
+            error = f"""
+            Index metadata not found in '{self.index}'.
+            Please create the index before searching.
+            """
+            raise FileNotFoundError(error)
+        with open(meta_path) as f:
+            return json.load(f)
+
+    @torch.inference_mode()
+    def search_matrix(
+        self,
+        queries_embeddings: torch.Tensor | list[torch.Tensor],
+        batch_size: int | Literal["auto"] = "auto",
+        n_full_scores: int | None = None,
+        n_ivf_probe: int | None = None,
+        show_progress: bool = True,
+        subset: list[list[int]] | list[int] | None = None,
+        n_processes: int | None = None,
+    ) -> torch.Tensor:
+        """Return the full query-document score matrix.
+
+        Computes MaxSim scores for every query against every indexed document
+        (or against ``subset`` when provided) and returns them as a dense
+        ``(num_queries, num_documents)`` tensor. Rows follow the input query
+        order; columns follow document insertion order (IDs ``0 .. D-1``).
+
+        This is the API requested in lightonai/fast-plaid#3 for evaluation
+        libraries such as MTEB that need a complete score matrix rather than
+        a top-k list. Internally it reuses ``search`` with ``top_k`` set to the
+        corpus size, and raises ``n_full_scores`` / ``n_ivf_probe`` as needed
+        so every target document receives an exact score (PLAID only
+        decompresses ``n_full_scores // 4`` candidates).
+
+        Args:
+        ----
+        queries_embeddings:
+            A tensor of shape ``(num_queries, n_tokens, embedding_dim)`` or a
+            list of tensors.
+        batch_size:
+            Documents per scoring chunk; ``'auto'`` plans chunks from the
+            device memory budget.
+        n_full_scores:
+            Candidate pool for exact re-ranking. ``None`` (default) chooses
+            at least ``4 * num_target_documents`` so every document is
+            exact-scored. Pass an int to override (still raised to the
+            minimum required for full coverage).
+        n_ivf_probe:
+            Number of IVF clusters to probe. ``None`` (default) probes every
+            partition so the candidate set can cover the full corpus. Pass an
+            int to override (still raised to ``num_partitions``).
+        show_progress:
+            Whether to display a progress bar during search.
+        subset:
+            Optional per-query (or shared) document-ID filter. Columns outside
+            the filter are filled with ``-inf``; filtered documents keep their
+            insertion-order column index.
+        n_processes:
+            Number of jobs for CPU search via joblib. Ignored on GPU(s).
+
+        Returns:
+        -------
+        A float32 tensor of shape ``(num_queries, num_documents)``. Entries for
+        documents that were excluded by ``subset`` (or that the search failed
+        to return despite full-coverage settings) are ``-inf``.
+
+        """
+        meta = self._read_index_metadata()
+        num_documents = int(meta.get("num_documents", 0))
+        num_partitions = int(meta.get("num_partitions", 0))
+
+        packed_preview, query_lengths_preview = pack_queries(queries_embeddings)
+        num_queries = len(query_lengths_preview)
+        del packed_preview
+
+        if num_queries == 0:
+            return torch.empty((0, num_documents), dtype=torch.float32)
+
+        if num_documents == 0:
+            return torch.empty((num_queries, 0), dtype=torch.float32)
+
+        # How many documents must receive an exact score for this call.
+        if subset is None:
+            num_target_docs = num_documents
+        else:
+            if isinstance(subset, int):
+                subset_ids = {subset}
+            elif subset and isinstance(subset[0], int):
+                subset_ids = set(subset)  # type: ignore[arg-type]
+            else:
+                subset_ids = {
+                    doc_id for per_query in subset for doc_id in per_query  # type: ignore[union-attr]
+                }
+            num_target_docs = len(subset_ids) if subset_ids else num_documents
+
+        # PLAID decompresses only n_full_scores // 4 candidates (see Rust
+        # search). Raise to 4 * targets so every target can be exact-scored.
+        min_full_scores = max(4 * num_target_docs, 1)
+        effective_n_full_scores = (
+            min_full_scores
+            if n_full_scores is None
+            else max(int(n_full_scores), min_full_scores)
+        )
+
+        # Probe every IVF partition so candidates can include the full corpus.
+        min_ivf_probe = max(num_partitions, 1)
+        effective_n_ivf_probe = (
+            min_ivf_probe
+            if n_ivf_probe is None
+            else max(int(n_ivf_probe), min_ivf_probe)
+        )
+
+        results = self.search(
+            queries_embeddings=queries_embeddings,
+            top_k=num_documents,
+            batch_size=batch_size,
+            n_full_scores=effective_n_full_scores,
+            n_ivf_probe=effective_n_ivf_probe,
+            show_progress=show_progress,
+            subset=subset,
+            n_processes=n_processes,
+        )
+
+        scores = torch.full(
+            (num_queries, num_documents),
+            float("-inf"),
+            dtype=torch.float32,
+        )
+        for query_idx, query_results in enumerate(results):
+            for doc_id, score in query_results:
+                if 0 <= doc_id < num_documents:
+                    scores[query_idx, doc_id] = float(score)
+
+        return scores
+
+    def matrix(
+        self,
+        queries_embeddings: torch.Tensor | list[torch.Tensor],
+        batch_size: int | Literal["auto"] = "auto",
+        n_full_scores: int | None = None,
+        n_ivf_probe: int | None = None,
+        show_progress: bool = True,
+        subset: list[list[int]] | list[int] | None = None,
+        n_processes: int | None = None,
+    ) -> torch.Tensor:
+        """Alias for :meth:`search_matrix` (full ``Q x D`` score matrix)."""
+        return self.search_matrix(
+            queries_embeddings=queries_embeddings,
+            batch_size=batch_size,
+            n_full_scores=n_full_scores,
+            n_ivf_probe=n_ivf_probe,
+            show_progress=show_progress,
+            subset=subset,
+            n_processes=n_processes,
+        )
+
     @torch.inference_mode()
     def delete(  # noqa: PLR0912
         self,

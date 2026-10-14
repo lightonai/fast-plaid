@@ -248,11 +248,18 @@ class TestSearchMatrix:
         scores = index.search_matrix(
             queries_embeddings=queries_embeddings, show_progress=False
         )
+        import numpy as np
+
+        num_centroids = int(
+            np.load(os.path.join(test_index_path, "centroids.npy"), mmap_mode="r").shape[
+                0
+            ]
+        )
         search_results = index.search(
             queries_embeddings=queries_embeddings,
             top_k=num_docs,
             n_full_scores=4 * num_docs,
-            n_ivf_probe=index._read_index_metadata()["num_partitions"],
+            n_ivf_probe=num_centroids,
             show_progress=False,
         )
 
@@ -328,6 +335,28 @@ class TestSearchMatrix:
 
         scores = index.search_matrix(queries_embeddings=[], show_progress=False)
         assert scores.shape == (0, 10)
+
+    def test_search_matrix_clamps_oversized_n_ivf_probe(self, test_index_path):
+        """Oversized n_ivf_probe is clamped to real centroid count (no crash)."""
+        import numpy as np
+
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+        documents_embeddings = [torch.randn(40, 64, device="cpu") for _ in range(30)]
+        queries_embeddings = torch.randn(2, 12, 64, device="cpu")
+        index.create(documents_embeddings=documents_embeddings, kmeans_niters=2)
+        num_centroids = int(
+            np.load(os.path.join(test_index_path, "centroids.npy"), mmap_mode="r").shape[
+                0
+            ]
+        )
+        assert num_centroids < 10_000
+        scores = index.search_matrix(
+            queries_embeddings=queries_embeddings,
+            n_ivf_probe=10_000,
+            show_progress=False,
+        )
+        assert scores.shape == (2, 30)
+        assert torch.isfinite(scores).all()
 
 
 class TestUpdate:

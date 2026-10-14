@@ -1363,8 +1363,9 @@ class FastPlaid:
             minimum required for full coverage).
         n_ivf_probe:
             Number of IVF clusters to probe. ``None`` (default) probes every
-            partition so the candidate set can cover the full corpus. Pass an
-            int to override (still raised to ``num_partitions``).
+            centroid so the candidate set can cover the full corpus. Pass an
+            int to override; values are clamped to the real centroid count
+            (asking for more than that makes Rust ``topk`` fail).
         show_progress:
             Whether to display a progress bar during search.
         subset:
@@ -1383,7 +1384,12 @@ class FastPlaid:
         """
         meta = self._read_index_metadata()
         num_documents = int(meta.get("num_documents", 0))
-        num_partitions = int(meta.get("num_partitions", 0))
+        # metadata.json "num_partitions" is a planning estimate and can diverge
+        # from the real centroid count written to centroids.npy (create clamps
+        # k to total tokens / sample). Rust topk(n_ivf_probe) has no clamp on
+        # the non-subset path, so always use the real count.
+        centroids_path = os.path.join(self.index, "centroids.npy")
+        num_centroids = int(np.load(centroids_path, mmap_mode="r").shape[0])
 
         if isinstance(queries_embeddings, torch.Tensor):
             if queries_embeddings.dim() == 2:
@@ -1399,16 +1405,6 @@ class FastPlaid:
         if num_documents == 0:
             return torch.empty((num_queries, 0), dtype=torch.float32)
 
-        # Full-matrix search probes every IVF cell and exact-scores every
-        # target document; warn when that may be expensive.
-        if num_documents > 16_384 and subset is None:
-            warnings.warn(
-                f"search_matrix will exact-score all {num_documents} documents. "
-                "For large corpora prefer search(top_k=...) or pass subset=...",
-                UserWarning,
-                stacklevel=2,
-            )
-
         # How many documents must receive an exact score for this call.
         if subset is None:
             num_target_docs = num_documents
@@ -1423,6 +1419,18 @@ class FastPlaid:
                 }
             num_target_docs = len(subset_ids) if subset_ids else num_documents
 
+        # Full-matrix search materializes Q×D scores (and an intermediate
+        # list of tuples); warn when that may be expensive.
+        matrix_cells = num_queries * num_target_docs
+        if matrix_cells > 16_384 and subset is None:
+            warnings.warn(
+                f"search_matrix will exact-score {num_queries}×{num_target_docs} "
+                f"({matrix_cells}) query-document pairs. "
+                "For large corpora prefer search(top_k=...) or pass subset=...",
+                UserWarning,
+                stacklevel=2,
+            )
+
         # PLAID decompresses only n_full_scores // 4 candidates (see Rust
         # search). Raise to 4 * targets so every target can be exact-scored.
         min_full_scores = max(4 * num_target_docs, 1)
@@ -1432,13 +1440,11 @@ class FastPlaid:
             else max(int(n_full_scores), min_full_scores)
         )
 
-        # Probe every IVF partition so candidates can include the full corpus.
-        min_ivf_probe = max(num_partitions, 1)
-        effective_n_ivf_probe = (
-            min_ivf_probe
-            if n_ivf_probe is None
-            else max(int(n_ivf_probe), min_ivf_probe)
-        )
+        # Probe every IVF cell for full coverage; never exceed real centroids.
+        if n_ivf_probe is None:
+            effective_n_ivf_probe = max(num_centroids, 1)
+        else:
+            effective_n_ivf_probe = max(min(int(n_ivf_probe), num_centroids), 1)
 
         results = self.search(
             queries_embeddings=queries_embeddings,
@@ -1457,9 +1463,12 @@ class FastPlaid:
             dtype=torch.float32,
         )
         for query_idx, query_results in enumerate(results):
-            for doc_id, score in query_results:
-                if 0 <= doc_id < num_documents:
-                    scores[query_idx, doc_id] = float(score)
+            if not query_results:
+                continue
+            doc_ids, score_vals = zip(*query_results, strict=True)
+            scores[query_idx, torch.as_tensor(doc_ids, dtype=torch.long)] = (
+                torch.as_tensor(score_vals, dtype=torch.float32)
+            )
 
         return scores
 

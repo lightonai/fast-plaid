@@ -1342,12 +1342,11 @@ class FastPlaid:
         ``(num_queries, num_documents)`` tensor. Rows follow the input query
         order; columns follow document insertion order (IDs ``0 .. D-1``).
 
-        This is the API requested in lightonai/fast-plaid#3 for evaluation
-        libraries such as MTEB that need a complete score matrix rather than
-        a top-k list. Internally it reuses ``search`` with ``top_k`` set to the
-        corpus size, and raises ``n_full_scores`` / ``n_ivf_probe`` as needed
-        so every target document receives an exact score (PLAID only
-        decompresses ``n_full_scores // 4`` candidates).
+        Designed for evaluation libraries such as MTEB that need a complete
+        score matrix rather than a top-k list. Internally it reuses ``search``
+        with ``top_k`` set to the corpus size, and raises ``n_full_scores`` /
+        ``n_ivf_probe`` as needed so every target document receives an exact
+        score (PLAID only decompresses ``n_full_scores // 4`` candidates).
 
         Args:
         ----
@@ -1386,15 +1385,29 @@ class FastPlaid:
         num_documents = int(meta.get("num_documents", 0))
         num_partitions = int(meta.get("num_partitions", 0))
 
-        packed_preview, query_lengths_preview = pack_queries(queries_embeddings)
-        num_queries = len(query_lengths_preview)
-        del packed_preview
+        if isinstance(queries_embeddings, torch.Tensor):
+            if queries_embeddings.dim() == 2:
+                num_queries = 1 if queries_embeddings.numel() else 0
+            else:
+                num_queries = int(queries_embeddings.shape[0])
+        else:
+            num_queries = len(queries_embeddings)
 
         if num_queries == 0:
             return torch.empty((0, num_documents), dtype=torch.float32)
 
         if num_documents == 0:
             return torch.empty((num_queries, 0), dtype=torch.float32)
+
+        # Full-matrix search probes every IVF cell and exact-scores every
+        # target document; warn when that may be expensive.
+        if num_documents > 16_384 and subset is None:
+            warnings.warn(
+                f"search_matrix will exact-score all {num_documents} documents. "
+                "For large corpora prefer search(top_k=...) or pass subset=...",
+                UserWarning,
+                stacklevel=2,
+            )
 
         # How many documents must receive an exact score for this call.
         if subset is None:

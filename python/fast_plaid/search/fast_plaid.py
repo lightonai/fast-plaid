@@ -1364,8 +1364,10 @@ class FastPlaid:
         n_ivf_probe:
             Number of IVF clusters to probe. ``None`` (default) probes every
             centroid so the candidate set can cover the full corpus. Pass an
-            int to override; values are clamped to the real centroid count
-            (asking for more than that makes Rust ``topk`` fail).
+            int to override; undersized values are raised to the real centroid
+            count for full coverage (same as the default path), and oversized
+            values are clamped (asking for more than that makes Rust ``topk``
+            fail).
         show_progress:
             Whether to display a progress bar during search.
         subset:
@@ -1441,10 +1443,16 @@ class FastPlaid:
         )
 
         # Probe every IVF cell for full coverage; never exceed real centroids.
-        if n_ivf_probe is None:
-            effective_n_ivf_probe = max(num_centroids, 1)
-        else:
-            effective_n_ivf_probe = max(min(int(n_ivf_probe), num_centroids), 1)
+        # Undersized explicit probes are raised (like n_full_scores; README
+        # promises coverage); oversized ones are clamped so Rust topk does
+        # not fail. Both constraints collapse to the real centroid count.
+        min_ivf_probe = max(num_centroids, 1)
+        effective_n_ivf_probe = (
+            min_ivf_probe
+            if n_ivf_probe is None
+            else max(int(n_ivf_probe), min_ivf_probe)
+        )
+        effective_n_ivf_probe = min(effective_n_ivf_probe, min_ivf_probe)
 
         results = self.search(
             queries_embeddings=queries_embeddings,

@@ -358,6 +358,49 @@ class TestSearchMatrix:
         assert scores.shape == (2, 30)
         assert torch.isfinite(scores).all()
 
+    def test_search_matrix_raises_small_n_ivf_probe(self, test_index_path):
+        """Undersized n_ivf_probe is raised to all centroids (no silent -inf)."""
+        import numpy as np
+
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+        num_docs = 40
+        documents_embeddings = [
+            torch.randn(40, 64, device="cpu") for _ in range(num_docs)
+        ]
+        queries_embeddings = torch.randn(2, 12, 64, device="cpu")
+        index.create(documents_embeddings=documents_embeddings, kmeans_niters=2)
+        num_centroids = int(
+            np.load(os.path.join(test_index_path, "centroids.npy"), mmap_mode="r").shape[
+                0
+            ]
+        )
+        assert num_centroids > 1, "need >1 centroids so n_ivf_probe=1 is undersized"
+
+        scores = index.search_matrix(
+            queries_embeddings=queries_embeddings,
+            n_ivf_probe=1,
+            show_progress=False,
+        )
+        assert scores.shape == (2, num_docs)
+        assert torch.isfinite(scores).all(), (
+            "Explicit small n_ivf_probe must still yield finite scores for every doc"
+        )
+
+        subset = [0, 3, 5, 11]
+        scores_sub = index.search_matrix(
+            queries_embeddings=queries_embeddings,
+            n_ivf_probe=1,
+            subset=subset,
+            show_progress=False,
+        )
+        assert scores_sub.shape == (2, num_docs)
+        for doc_id in range(num_docs):
+            col = scores_sub[:, doc_id]
+            if doc_id in subset:
+                assert torch.isfinite(col).all(), f"doc {doc_id} should be scored"
+            else:
+                assert torch.isneginf(col).all(), f"doc {doc_id} should be -inf"
+
 
 class TestUpdate:
     """Tests for index update functionality."""

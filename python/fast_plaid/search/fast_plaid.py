@@ -20,7 +20,7 @@ import torch
 from fast_plaid import fast_plaid_rust
 from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
-from joblib import Parallel, delayed
+from joblib import Parallel, delayed, effective_n_jobs
 
 from ..filtering import create, delete
 from . import storage
@@ -1071,8 +1071,10 @@ class FastPlaid:
         show_progress:
             Whether to display a progress bar during search.
         n_processes:
-            Number of jobs for CPU parallelism via joblib.
-            Ignored on GPU. Defaults to 1.
+            Number of worker threads for CPU search via joblib. Follows joblib's
+            n_jobs convention (-1 = all CPUs, -2 = all but one; 0 is invalid).
+            If None, uses one worker per 10 queries, capped at the CPU count.
+            Ignored on GPU.
 
         """
         num_queries = len(query_lengths)
@@ -1092,15 +1094,15 @@ class FastPlaid:
 
         # Joblib parallelism for CPU-only bulk search
         is_cpu_only = self.devices[0] == "cpu"
-        use_joblib = (is_cpu_only and (num_queries > 10) and n_processes != 1) or (
-            is_cpu_only
-            and n_processes is not None
-            and n_processes != 1
-            and num_queries > 1
+        # Explicit values follow joblib n_jobs semantics: -1 = all CPUs,
+        # -2 = all but one, 0 raises.
+        n_processes = (
+            min(num_queries // 10, os.cpu_count() or 1)
+            if n_processes is None
+            else effective_n_jobs(n_processes)
         )
 
-        if n_processes is None:
-            n_processes = min(num_queries // 10, os.cpu_count() or 1)
+        use_joblib = is_cpu_only and n_processes > 1 and num_queries > 1
 
         if use_joblib:
             num_workers = n_processes
@@ -1227,8 +1229,10 @@ class FastPlaid:
             query, or a single list applied to all queries. If None, searches
             the entire index.
         n_processes:
-            Number of jobs to use for CPU search via joblib.
-            Ignored if running on GPU(s). Defaults to 1.
+            Number of worker threads for CPU search via joblib. Follows joblib's
+            n_jobs convention (-1 = all CPUs, -2 = all but one; 0 is invalid).
+            If None, uses one worker per 10 queries, capped at the CPU count.
+            Ignored if running on GPU(s).
 
         """
         search_indices, packed_queries, query_lengths, subset = self._prepare_search(
@@ -1289,8 +1293,10 @@ class FastPlaid:
             query, or a single list applied to all queries. If None, searches
             the entire index.
         n_processes:
-            Number of jobs to use for CPU search via joblib.
-            Ignored if running on GPU(s). Defaults to 1.
+            Number of worker threads for CPU search via joblib. Follows joblib's
+            n_jobs convention (-1 = all CPUs, -2 = all but one; 0 is invalid).
+            If None, uses one worker per 10 queries, capped at the CPU count.
+            Ignored if running on GPU(s).
 
         """
         search_indices, packed_queries, query_lengths, subset = self._prepare_search(

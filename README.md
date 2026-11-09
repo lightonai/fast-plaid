@@ -639,7 +639,8 @@ subset: list[list[int]] | list[int] | None = None (optional)
 
 n_processes: int | None = None (optional)
     Number of joblib workers used for CPU search. Ignored when running on GPU(s).
-    Defaults to 1.
+    Follows joblib's n_jobs convention: -1 uses all CPUs, -2 all but one; 0 is invalid.
+    If None (default), uses one worker per 10 queries, capped at the CPU count.
 ```
 
 ### Deleting from the Index

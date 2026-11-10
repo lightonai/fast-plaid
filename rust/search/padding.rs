@@ -10,7 +10,7 @@ use tch::{Device, Kind, Tensor};
 /// * `device` - The `Device` where the tensor should be allocated (e.g., CPU or CUDA).
 /// * `kind` - The data type of the tensor (e.g., `Kind::Float`).
 /// * `min_shape` - The minimum required shape of the tensor, e.g., `[batch, seq_len, features]`.
-/// * `pad_value` - The value used to fill the tensor when it is first created or resized.
+/// * `pad_value` - The value used to fill the newly allocated tensor.
 ///
 /// # Returns
 ///
@@ -39,7 +39,6 @@ impl MaxValueExt for Tensor {
 /// into a single dense 3D tensor and generates a corresponding boolean attention mask.
 ///
 /// # Key Optimizations
-/// - **Scratch Buffer**: Uses `PAD_CACHE` to avoid expensive `malloc` on the GPU.
 /// - **Asynchronous Operations**: Calculates `max_len` on the device to avoid host-device sync.
 /// - **Scatter-based Copy**: Instead of iterating through rows (slow in Python/loops),
 ///   it calculates global indices via the mask and copies all data in one
@@ -83,8 +82,6 @@ pub fn direct_pad_sequences(
         &[batch_size, max_len, feature_dim],
         pad_value,
     );
-
-    let _ = padded_sequences.fill_(pad_value);
 
     // Generate attention mask via broadcasting
     let range_row = Tensor::arange(max_len, (Kind::Int64, device));

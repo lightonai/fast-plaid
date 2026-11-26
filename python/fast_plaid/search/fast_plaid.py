@@ -1337,9 +1337,13 @@ class FastPlaid:
             # Stage exactly those files from the merged copy.
             meta_path = os.path.join(self.index, "metadata.json")
             num_chunks = 0
+            # Read before the Rust delete rewrites it: `subset` holds pre-deletion ids.
+            num_documents = 0
             if os.path.exists(meta_path):
                 with open(meta_path) as f:
-                    num_chunks = json.load(f).get("num_chunks", 0)
+                    meta = json.load(f)
+                    num_chunks = meta.get("num_chunks", 0)
+                    num_documents = meta.get("num_documents", 0)
             if num_chunks > 0:
                 delete_set = set(subset)
                 first_affected = num_chunks
@@ -1370,14 +1374,6 @@ class FastPlaid:
             metadata_db_path = os.path.join(self.index, "metadata.db")
             if os.path.exists(metadata_db_path) and _delete_metadata:
                 delete(index=self.index, subset=subset)
-
-            # Get metadata to determine document counts
-            meta_path = os.path.join(self.index, "metadata.json")
-            num_documents = 0
-            if os.path.exists(meta_path):
-                with open(meta_path) as f:
-                    meta = json.load(f)
-                    num_documents = meta.get("num_documents", 0)
 
             # Determine buffer size if buffer exists
             buffer_path = os.path.join(self.index, "buffer.npy")
@@ -1415,7 +1411,7 @@ class FastPlaid:
                         os.remove(embeddings_path)
 
             # Update buffer.npy if it exists and contains documents to delete
-            if os.path.exists(buffer_path) and num_buffer_docs > 0:
+            if _delete_buffer and os.path.exists(buffer_path) and num_buffer_docs > 0:
                 # Calculate which subset indices fall within the buffer range
                 buffer_indices_to_delete = {
                     idx - buffer_start_idx

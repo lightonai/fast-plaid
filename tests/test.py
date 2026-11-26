@@ -428,6 +428,34 @@ class TestDelete:
                     f"Document ID {doc_id} out of expected range (0-25)"
                 )
 
+    def test_delete_buffered_document(self, test_index_path):
+        """Test deleting a document that is still in the update buffer."""
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+
+        # No embeddings.npy, so updates go through buffer.npy.
+        documents_embeddings = [torch.randn(20, 128, device="cpu") for _ in range(50)]
+        index.create(
+            documents_embeddings=documents_embeddings,
+            kmeans_niters=2,
+            start_from_scratch=0,
+        )
+
+        # Documents are told apart by their token count.
+        buffered = [torch.randn(n, 128, device="cpu") for n in (11, 12, 13)]
+        index.update(documents_embeddings=buffered, buffer_size=4)
+
+        # Delete the middle buffered document (12 tokens).
+        index.delete(subset=[51])
+
+        # Reaches buffer_size, so the buffer is flushed into the index.
+        new_docs = [torch.randn(30, 128, device="cpu") for _ in range(2)]
+        index.update(documents_embeddings=new_docs, buffer_size=4)
+
+        lengths = [emb.shape[0] for emb in index.get_embeddings(subset=list(range(54)))]
+        assert lengths == [20] * 50 + [11, 13, 30, 30], (
+            f"Unexpected document lengths after flush: {lengths[48:]}"
+        )
+
 
 class TestSubsetFiltering:
     """Tests for subset filtering during search."""

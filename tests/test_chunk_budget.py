@@ -75,3 +75,27 @@ class TestHostBudget:
         one_chunk = index.search(queries, top_k=10, batch_size=10_000, n_processes=1)
 
         assert planned == one_chunk
+
+    def test_int_batch_size_is_capped_by_the_budget(self, test_index_path, monkeypatch):
+        """An int batch_size is a cap, so a small budget must not change the answer.
+
+        The budget cuts an oversized manual chunk into smaller ones. Chunking
+        is score-preserving, so the result has to match the planned search.
+        """
+        torch.manual_seed(0)
+        documents = [
+            torch.randn(150 + 13 * (i % 17), 128, device="cpu") for i in range(1500)
+        ]
+        index = search.FastPlaid(index=test_index_path, device="cpu")
+        index.create(documents_embeddings=documents, kmeans_niters=4, nbits=4)
+
+        torch.manual_seed(1)
+        queries = [torch.randn(32, 128, device="cpu") for _ in range(3)]
+
+        monkeypatch.setattr(
+            "fast_plaid.search.fast_plaid.CPU_STAGE_WORKSPACE_BYTES", 1 << 20
+        )
+        planned = index.search(queries, top_k=10, n_processes=1)
+        capped = index.search(queries, top_k=10, batch_size=1 << 18, n_processes=1)
+
+        assert planned == capped

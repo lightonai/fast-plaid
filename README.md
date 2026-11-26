@@ -279,7 +279,7 @@ Upgrading from an earlier version: `index_gpu_memory` replaces the old `low_memo
 
 ### Scoring chunks: `batch_size`
 
-`search(batch_size=...)` sets how many documents are scored per chunk, in both the approximate scoring and the exact rerank stages. With `"auto"` (default), chunk sizes are planned from `search_memory_fraction` (default `0.5`) of the free VRAM sampled at query time, and chunking only kicks in when a query actually needs it, so short queries keep a full-speed single-chunk path. On CUDA OOM the stage retries with the budget halved. Passing an int forces fixed-size chunks instead.
+`search(batch_size=...)` sets how many documents are scored per chunk, in both the approximate scoring and the exact rerank stages. With `"auto"` (default), chunk sizes are planned from `search_memory_fraction` (default `0.5`) of the free VRAM sampled at query time, and chunking only kicks in when a query actually needs it, so short queries keep a full-speed single-chunk path. On CUDA OOM the stage retries with the budget halved. Passing an int caps the documents per chunk; the memory budget still applies, so chunks can be smaller than the int but never larger.
 
 ```python
 # Default, chunks planned from the memory budget

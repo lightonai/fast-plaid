@@ -307,7 +307,8 @@ def search_on_device(
         A packed 2D tensor (total_query_tokens, embedding_dim) holding all
         queries concatenated without padding.
     batch_size:
-        Documents per scoring chunk; 'auto' plans chunks from the memory budget.
+        Maximum documents per scoring chunk, within the memory budget; 'auto'
+        plans chunks from the budget alone.
     n_full_scores:
         The number of full scores to compute per query.
     top_k:
@@ -384,7 +385,8 @@ def search_on_device_with_token_scores(
     queries_embeddings:
         The query embeddings to search for.
     batch_size:
-        Documents per scoring chunk; 'auto' plans chunks from the memory budget.
+        Maximum documents per scoring chunk, within the memory budget; 'auto'
+        plans chunks from the budget alone.
     n_full_scores:
         The number of full scores to compute per query.
     top_k:
@@ -1061,7 +1063,8 @@ class FastPlaid:
         subset:
             Optional per-query document ID filters.
         batch_size:
-            Documents per scoring chunk; 'auto' plans chunks from the memory budget.
+            Maximum documents per scoring chunk, within the memory budget; 'auto'
+        plans chunks from the budget alone.
         n_full_scores:
             The number of full scores to compute per query.
         top_k:

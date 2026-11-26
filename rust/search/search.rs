@@ -117,8 +117,8 @@ fn plan_chunk_ranges(
     ranges
 }
 
-/// Scores candidates chunk-by-chunk within a memory budget, or in fixed `manual_docs`-sized
-/// chunks when positive. Returned scores are always aligned with the input `ids` order.
+/// Scores candidates chunk-by-chunk within a memory budget; a positive `manual_docs` caps the
+/// docs per chunk. Returned scores are always aligned with the input `ids` order.
 #[allow(clippy::too_many_arguments)]
 fn run_scoring_stage(
     ids: &Tensor,
@@ -156,9 +156,12 @@ fn run_scoring_stage(
     };
 
     let ranges: Vec<(i64, i64)> = if manual_docs > 0 {
+        // A manual chunk size is a cap: the budget can shrink chunks, never grow them.
+        let budget_docs = (budget_bytes / (max_len * bytes_per_cell)).max(1);
+        let docs_per_chunk = manual_docs.min(budget_docs);
         (0..n)
-            .step_by(manual_docs as usize)
-            .map(|start| (start, manual_docs.min(n - start)))
+            .step_by(docs_per_chunk as usize)
+            .map(|start| (start, docs_per_chunk.min(n - start)))
             .collect()
     } else {
         let mut planned_lengths = lengths_cpu.to_vec();
@@ -181,8 +184,7 @@ fn run_scoring_stage(
     Ok(scores)
 }
 
-/// Runs a scoring stage, halving the budget and retrying on CUDA OOM; manual chunk sizes
-/// are respected verbatim, so their OOM errors propagate.
+/// Runs a scoring stage, halving the budget and retrying on CUDA OOM.
 #[allow(clippy::too_many_arguments)]
 fn run_scoring_stage_with_oom_retry(
     ids: &Tensor,
@@ -212,9 +214,7 @@ fn run_scoring_stage_with_oom_retry(
         });
         match attempt {
             Ok(scores) => return Ok(scores),
-            Err(error)
-                if manual_docs <= 0 && is_oom_error(&error) && budget > MIN_STAGE_BUDGET_BYTES =>
-            {
+            Err(error) if is_oom_error(&error) && budget > MIN_STAGE_BUDGET_BYTES => {
                 budget = (budget / 2).max(MIN_STAGE_BUDGET_BYTES);
                 eprintln!(
                     "fast-plaid: scoring stage hit CUDA OOM; retrying with chunk budget {} MiB",
@@ -386,7 +386,7 @@ impl QueryResultWithTokenScores {
 #[pyclass]
 #[derive(Clone, Debug)]
 pub struct SearchParameters {
-    /// Manual docs per scoring chunk; 0 plans chunks from the memory budget.
+    /// Maximum docs per scoring chunk; 0 plans chunks from the memory budget alone.
     #[pyo3(get, set)]
     pub batch_size: usize,
     /// Number of documents to re-rank with exact scores.
@@ -714,8 +714,8 @@ fn filter_passage_ids_with_subset(passage_ids: &Tensor, subset: &Tensor, device:
 /// 3.  **Re-ranking**: Filters the candidates based on approximate scores, then decompresses the residuals for a smaller subset and computes exact scores.
 /// 4.  **Top-K Selection**: Returns the highest-scoring documents.
 ///
-/// Both scoring stages run in chunks planned from `memory_budget_bytes`, or in fixed
-/// `batch_size`-doc chunks when `batch_size` > 0; chunking is score-preserving
+/// Both scoring stages run in chunks planned from `memory_budget_bytes`, of at most
+/// `batch_size` docs when `batch_size` > 0; chunking is score-preserving
 /// (candidate set, `n_full_scores`, `n_ivf_probe` and `top_k` are unchanged).
 ///
 /// # Arguments
@@ -733,7 +733,7 @@ fn filter_passage_ids_with_subset(passage_ids: &Tensor, subset: &Tensor, device:
 /// * `device` - The `tch::Device` (e.g., `Device::Cuda(0)`) on which to perform computations.
 /// * `subset` - An optional tensor of document IDs to restrict the search to.
 /// * `return_token_scores` - If true, also returns per-document token similarity matrices.
-/// * `batch_size` - Manual docs per scoring chunk; 0 plans chunks from the memory budget.
+/// * `batch_size` - Maximum docs per scoring chunk; 0 plans chunks from the memory budget alone.
 /// * `memory_budget_bytes` - Per-device scoring workspace budget.
 ///
 /// # Returns
